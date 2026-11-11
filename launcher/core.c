@@ -38,7 +38,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 2
+#define BUILD_FORMAT 3
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
                               "porbr", "rusru", "spaar", "spaes", "thath", "zhocn", "zhotw"};
@@ -513,12 +513,18 @@ static buf dcx_read(const char *game_dir, buf d) {
     return out;
 }
 
-// Write a zlib DCX using stored (uncompressed) deflate blocks. The game accepts zlib DCX.
-// ponytail: no compression, files grow to their raw size (about 1-5 MB each); add real deflate if
-// disk use ever matters.
+// Zig's standard library, see zstd.zig. Both return 0 on error.
+size_t nr_zstd_decompress(const u8 *src, size_t n, u8 *dst, size_t cap);  // cap: content size + 128 KB
+size_t nr_zlib_compress(const u8 *src, size_t n, u8 *dst, size_t cap);
+
+// Write a zlib DCX, which the game accepts. (Really compressed: the game loads small files made of
+// stored deflate blocks, but crashed on a 26 MB texture file written that way.)
 static buf dcx_write(buf raw) {
-    size_t blocks = raw.n / 65535 + 1, zlen = 2 + blocks * 5 + raw.n + 4;
-    buf out = {xalloc(0x4C + zlen), 0x4C + zlen};
+    size_t cap = raw.n + raw.n / 8 + 1024;
+    buf out = {xalloc(0x4C + cap), 0};
+    size_t zlen = nr_zlib_compress(raw.p, raw.n, out.p + 0x4C, cap);
+    if (!zlen) { logf_("compression failed"); exit(1); }
+    out.n = 0x4C + zlen;
     u8 *h = out.p;
     memcpy(h, "DCX\0", 4);
     wbe32(h + 4, 0x11000); wbe32(h + 8, 0x18); wbe32(h + 12, 0x24); wbe32(h + 16, 0x44); wbe32(h + 20, 0x4C);
@@ -530,19 +536,6 @@ static buf dcx_write(buf raw) {
     wbe32(h + 0x40, 0x00010100);
     memcpy(h + 0x44, "DCA\0", 4);
     wbe32(h + 0x48, 8);
-    u8 *z = h + 0x4C;
-    *z++ = 0x78; *z++ = 0x01;
-    u32 a = 1, b = 0;
-    for (size_t pos = 0, i = 0; i < blocks; i++) {
-        size_t n = raw.n - pos > 65535 ? 65535 : raw.n - pos;
-        *z++ = i == blocks - 1;
-        *z++ = (u8)n; *z++ = (u8)(n >> 8); *z++ = (u8)~n; *z++ = (u8)(~n >> 8);
-        memcpy(z, raw.p + pos, n);
-        for (size_t k = 0; k < n; k++) { a = (a + raw.p[pos + k]) % 65521; b = (b + a) % 65521; }
-        z += n;
-        pos += n;
-    }
-    wbe32(z, b << 16 | a);
     return out;
 }
 
@@ -697,9 +690,6 @@ static size_t utf8_to_utf16(const char *s, u8 *out) {
 // --- finding the game and the save ----------------------------------------------------------------------------
 
 // --- regulation.bin: the game's params, AES-256-CBC around a zstd DCX around a BND4 ----------------------------
-
-// Zig's standard library, see zstd.zig. cap must be the content size plus 128 KB; returns 0 on error.
-size_t nr_zstd_decompress(const u8 *src, size_t n, u8 *dst, size_t cap);
 
 // The regulation key is public knowledge (Smithbox).
 static const u8 REGULATION_KEY[32] = {
@@ -1347,7 +1337,7 @@ int core_selftest(void) {
 
     // DCX writer: header fields and adler of a known string ("Wikipedia" -> 0x11E60398).
     buf raw = {(u8 *)"Wikipedia", 9}, d = dcx_write(raw);
-    if (be32(d.p + 0x1C) != 9 || be32(d.p + d.n - 4) != 0x11E60398 || memcmp(d.p + 0x4C + 7, "Wikipedia", 9)) {
+    if (be32(d.p + 0x1C) != 9 || be32(d.p + 0x20) != d.n - 0x4C || be32(d.p + d.n - 4) != 0x11E60398) {
         ok = 0;
         logf_("selftest: DCX failed");
     }
