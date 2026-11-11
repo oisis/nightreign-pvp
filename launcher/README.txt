@@ -2,9 +2,9 @@ Nightreign Invasions - test build
 =================================
 
 What this is
-  An experimental mod for ELDEN RING NIGHTREIGN (PC, Steam). This build adds a menu to the
-  Roundtable table and prepares the ground for player invasions. Invasions themselves do not
-  work yet.
+  An experimental mod for ELDEN RING NIGHTREIGN (PC, Steam). This build only installs the mod's
+  loader and client and checks that they run on your system. Invasions do not work yet and the
+  game looks unchanged.
 
 How to start
   Windows: run NightreignInvasions.exe
@@ -38,4 +38,5 @@ Po polsku
   ./nightreign-invasions (Linux), przy wlaczonym Steamie, i kliknij "Graj z modem". Launcher
   znajdzie gre, zrobi kopie zapisu w work/backups/, zbuduje pliki moda z Twoich plikow gry i
   uruchomi gre offline z osobnym plikiem zapisu. Folder gry nie jest zmieniany.
-  "Odinstaluj" usuwa zbudowane pliki i osobny zapis moda. Inwazje jeszcze nie dzialaja.
+  "Odinstaluj" usuwa zbudowane pliki i osobny zapis moda. Inwazje jeszcze nie dzialaja, a gra
+  wyglada na razie bez zmian.

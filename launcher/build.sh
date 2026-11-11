@@ -15,6 +15,7 @@ gcc -O2 -Wall -Wextra -o "$D/linux/cli" "$L/cli.c" "$L/core.c"
 "$ZIG" cc -target x86_64-windows-gnu -O2 -o "$D/windows/cli.exe" "$L/cli.c" "$L/core.c" -ladvapi32
 find "$D" -maxdepth 3 \( -name '*.pdb' -o -name '*.lib' \) -delete
 
-for d in linux windows; do cp "$W/build/t600001000.delta" "$W/build/native/invasion.dll" "$D/$d/data/"; done
+# The packaged DLL is the one without the Target list hook (see mod/build.sh).
+for d in linux windows; do rm -f "$D/$d/data/t600001000.delta"; cp "$W/build/package-dll/invasion.dll" "$D/$d/data/"; done
 cp "$W/build/unkrak.exe" "$D/linux/data/"
 echo "launcher built in $D/linux and $D/windows"

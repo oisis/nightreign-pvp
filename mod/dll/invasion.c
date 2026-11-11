@@ -1,40 +1,42 @@
 // Nightreign invasion mod, client DLL.
-// Step 1: notice that "Invade" was chosen at the Roundtable table.
-// Step 2 (debug): log the session state and the join data of our own session.
-// Step 3 (experiment, only with -DTRY_CREATE): choosing "Invade" opens a session on this client.
 //
-// The table's talk script (mod/talk/t600001000.py) sets event flag INVADE_FLAG. This DLL polls that
-// flag through the game's own flag functions, logs the choice and clears the flag.
+// What it does today:
+//   - logs the session manager's state (lobby state, player count, join data) whenever it changes,
+//     and how many invaders the current squad would allow;
+//   - with -DTARGET_MENU: adds an "Invasion" entry to the expedition menu's Target list. The entry is
+//     row 101 of NightBossMenuParam, which must exist in regulation.bin (mod/build_regulation.py).
 //
 // ponytail: addresses are hard-coded for nightreign.exe 1.3.3 (PE timestamp below) and the DLL does
 // nothing on any other build. Replace with signature scans when a second game version has to work.
 #include <windows.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <string.h>
 
-#define GAME_TIMESTAMP   0x69e0dc2a  // nightreign.exe 1.3.3, Steam build 22818764
-#define RVA_FLAG_MAN_PTR 0x3c115a8   // CSEventFlagMan* (starts with its CSFD4VirtualMemoryFlag)
-#define RVA_GET_FLAG     0x60ce40    // bool get(CSFD4VirtualMemoryFlag*, uint flag)
-#define RVA_SET_FLAG     0x60d330    // void set(CSFD4VirtualMemoryFlag*, uint flag, int state)
-#define INVADE_FLAG      10002590
+#define GAME_TIMESTAMP 0x69e0dc2a  // nightreign.exe 1.3.3, Steam build 22818764
+
 // Session manager (same first fields as Elden Ring's CSSessionManager).
 #define RVA_SESSION_MAN_PTR 0x3c21ec8  // CSSessionManager*
 #define RVA_SESSION_IMPL    0x257db50  // impl* get(CSSessionManager + 0x60)
-#define SM_HANDLE      0x08   // u32 session handle
-#define SM_LOBBY_STATE 0x0c   // u32: 0 none, 1 creating, 3 host, 4 joining, 6 client, ...
-#define SM_IMPL        0x60
-#define SM_PLAYER_LIMIT 0x170 // u32, 3 in vanilla
-#define SM_PLAYERS_BEGIN 0x78 // players vector: begin, end (+0x80); entries are 0xF0 bytes
-#define SM_PLAYER_SIZE 0xF0
-#define SM_CIPHER_KEY  0x728  // DLSerialCipherKey*, then AES encrypter* (+0x730), decrypter* (+0x738)
+#define SM_HANDLE        0x08   // u32 session handle
+#define SM_LOBBY_STATE   0x0c   // u32: 0 none, 1 creating, 3 host, 4 joining, 6 client, 7 leaving
+#define SM_IMPL          0x60
+#define SM_PLAYERS_BEGIN 0x78   // players vector: begin, end (+0x80); entries are 0xF0 bytes
+#define SM_PLAYER_SIZE   0xF0
+#define SM_PLAYER_LIMIT  0x170  // u32, 3 in vanilla
 #define IMPL_VT_EXPORT_JOIN_DATA 0x40  // bool (impl*, u32 handle, void *buf, u32 *size)
-#define RVA_CREATE_SESSION  0xdefbd0   // bool (CSSessionManager*, u8 multiplay_type, u8 *one)
-#define MULTIPLAY_WHITE_SUMMON 0       // index into the game's multiplay type table (same order as ER)
 
-typedef char (*get_flag_fn)(void *, unsigned);
-typedef void (*set_flag_fn)(void *, unsigned, int);
+// Expedition menu, Target list (CS::MatchingBossSelectDialog::_CreateBossList and helpers).
+#define RVA_CREATE_BOSS_LIST_CALL 0x9e7fd3  // "call _CreateBossList", the only call site
+#define RVA_CREATE_BOSS_LIST      0x9e9330  // void (dialog*)
+#define RVA_BOSS_ITEM_CTOR        0x8dac40  // item* (buf*, int row, u8 enhanced, u8)
+#define RVA_BOSS_ITEM_PUSH        0x9e77c0  // void (dialog + 0x19a0, item*)
+#define RVA_BOSS_ITEM_DTOR        0x8dad70  // void (buf*)
+#define DIALOG_BOSS_LIST          0x19a0
+#define INVASION_ROW              101       // our row in NightBossMenuParam
 
 static char log_path[MAX_PATH];
+static char *g_base;
 
 static void logf(const char *fmt, ...) {
     FILE *f = fopen(log_path, "a");
@@ -50,28 +52,31 @@ static void logf(const char *fmt, ...) {
     fclose(f);
 }
 
-// The session implementation behind the session manager (static object inside the network library),
-// or NULL. Its counter at +0x10 must be non-zero before a session can be created.
-static void **session_impl(char *base, char *sm) {
+// --- session observer -----------------------------------------------------------------------------
+
+// The session implementation behind the session manager (object inside the network library), or
+// NULL. Its counter at +0x10 must be non-zero before a session can be created.
+static void **session_impl(char *sm) {
     if (!*(void **)(sm + SM_IMPL)) return NULL;  // the accessor dereferences this
-    void **impl = ((void **(*)(void *))(base + RVA_SESSION_IMPL))(sm + SM_IMPL);
+    void **impl = ((void **(*)(void *))(g_base + RVA_SESSION_IMPL))(sm + SM_IMPL);
     return impl && *impl ? impl : NULL;
 }
 
-// Debug: log the session manager's state whenever it changes: lobby state, session handle, player
-// limit, whether the network layer is started, and the join data (Steam lobby id) of our session.
 // How many invaders a squad of this size may get. Design rule: 1:1, 2:1, 3:2, 4:2.
 static unsigned invaders_allowed(unsigned squad) {
     static const unsigned table[] = {0, 1, 1, 2, 2};
     return squad < sizeof table / sizeof *table ? table[squad] : 2;
 }
 
-static void watch_session(char *base) {
+// Log the session manager's state whenever it changes.
+// ponytail: polled from our own thread, not the game's update thread. Fine for reading a few
+// fields; move onto a game-thread hook before doing anything heavier.
+static void watch_session(void) {
     static unsigned last_state = 0xffffffff, last_handle = 0xffffffff, last_started = 0xffffffff;
     static unsigned last_players = 0xffffffff;
-    char *sm = *(char **)(base + RVA_SESSION_MAN_PTR);
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
     if (!sm) return;
-    void **impl = session_impl(base, sm);
+    void **impl = session_impl(sm);
     unsigned state = *(unsigned *)(sm + SM_LOBBY_STATE), handle = *(unsigned *)(sm + SM_HANDLE);
     unsigned started = impl ? *(unsigned *)((char *)impl + 0x10) : 0;
     char *begin = *(char **)(sm + SM_PLAYERS_BEGIN), *end = *(char **)(sm + SM_PLAYERS_BEGIN + 8);
@@ -102,51 +107,74 @@ static void watch_session(char *base) {
     logf("session: join data, %u bytes: %s (as u64: %llu)", size, hex, *(unsigned long long *)buf);
 }
 
+// --- Target list entry ----------------------------------------------------------------------------
+
+#ifdef TARGET_MENU
+// Runs in place of the game's call to _CreateBossList: let the game build its list (Nightlords from
+// fixed row numbers), then append our row the same way the game appends its own.
+static void create_boss_list_hook(void *dialog) {
+    ((void (*)(void *))(g_base + RVA_CREATE_BOSS_LIST))(dialog);
+    _Alignas(16) char item[0x40];  // a MatchingNightBossViewItem is 0x28 bytes
+    ((void *(*)(void *, int, unsigned char, unsigned char))(g_base + RVA_BOSS_ITEM_CTOR))(item, INVASION_ROW, 0, 0);
+    ((void (*)(void *, void *))(g_base + RVA_BOSS_ITEM_PUSH))((char *)dialog + DIALOG_BOSS_LIST, item);
+    ((void (*)(void *))(g_base + RVA_BOSS_ITEM_DTOR))(item);
+    logf("target list: Invasion entry added");
+}
+
+// Point the game's one "call _CreateBossList" at our function. A rel32 call only reaches +-2 GB, so
+// it goes through a 12-byte stub allocated near the game image: mov rax, hook; jmp rax.
+static void hook_target_list(void) {
+    unsigned char *site = (unsigned char *)g_base + RVA_CREATE_BOSS_LIST_CALL;
+    int expected = (int)(RVA_CREATE_BOSS_LIST - (RVA_CREATE_BOSS_LIST_CALL + 5));
+    if (site[0] != 0xE8 || memcmp(site + 1, &expected, 4)) {
+        logf("target list: call site does not look as expected, not hooking");
+        return;
+    }
+    unsigned char *stub = NULL;
+    for (int i = 1; i < 0x4000 && !stub; i++)
+        stub = VirtualAlloc(g_base - (SIZE_T)i * 0x10000, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!stub) {
+        logf("target list: no memory near the game image for the stub");
+        return;
+    }
+    void *hook = (void *)create_boss_list_hook;
+    stub[0] = 0x48; stub[1] = 0xB8;
+    memcpy(stub + 2, &hook, 8);
+    stub[10] = 0xFF; stub[11] = 0xE0;
+    int rel = (int)(stub - (site + 5));
+    DWORD old;
+    if (!VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &old)) {
+        logf("target list: cannot make the call site writable");
+        return;
+    }
+    memcpy(site + 1, &rel, 4);
+    VirtualProtect(site, 5, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), site, 5);
+    logf("target list: hooked (stub at %p)", (void *)stub);
+}
+#endif
+
+// --- entry -----------------------------------------------------------------------------------------
+
 static DWORD WINAPI run(LPVOID self) {
     // Log next to the DLL, so it is easy to find from outside the game.
     GetModuleFileNameA((HMODULE)self, log_path, MAX_PATH);
     char *dot = strrchr(log_path, '.');
     if (dot) strcpy(dot, ".log");
 
-    char *base = (char *)GetModuleHandleA(NULL);
-    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+    g_base = (char *)GetModuleHandleA(NULL);
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew);
     if (nt->FileHeader.TimeDateStamp != GAME_TIMESTAMP) {
         logf("unsupported game build (timestamp %08lx), doing nothing", nt->FileHeader.TimeDateStamp);
         return 0;
     }
-    logf("loaded, game base %p", base);
-
-    get_flag_fn get_flag = (get_flag_fn)(base + RVA_GET_FLAG);
-    set_flag_fn set_flag = (set_flag_fn)(base + RVA_SET_FLAG);
-    int announced = 0;
+    logf("loaded, game base %p", g_base);
+#ifdef TARGET_MENU
+    hook_target_list();
+#endif
     for (;;) {
         Sleep(250);
-        watch_session(base);
-        void *flags = *(void **)(base + RVA_FLAG_MAN_PTR);
-        if (!flags) continue;  // not created yet (still in the title screen / loading)
-        if (!announced) {
-            logf("event flag manager ready at %p", flags);
-            announced = 1;
-        }
-        // ponytail: called from our own thread, not the game's update thread. Fine for one flag;
-        // move onto a game-thread hook before doing anything heavier than this.
-        if (get_flag(flags, INVADE_FLAG)) {
-            logf("INVADE selected at the Roundtable table");
-            set_flag(flags, INVADE_FLAG, 0);
-#ifdef TRY_CREATE
-            // Experiment (host side): open a session ourselves. Fails in an offline game because the
-            // network session layer is not started (see analysis/04-nr-session-join.md).
-            // ponytail: runs on our thread, see above; this call does real work in the game.
-            char *sm = *(char **)(base + RVA_SESSION_MAN_PTR);
-            unsigned st = sm ? *(unsigned *)(sm + SM_LOBBY_STATE) : 99;
-            if (st == 0 || st == 2 || st == 5) {  // the states the game itself accepts
-                unsigned char one = 1;
-                char ok = ((char (*)(void *, unsigned char, unsigned char *))(base + RVA_CREATE_SESSION))(
-                    sm, MULTIPLAY_WHITE_SUMMON, &one);
-                logf("create session -> %d, create_handle=%u", ok, *(unsigned *)(sm + 0x24));
-            }
-#endif
-        }
+        watch_session();
     }
 }
 

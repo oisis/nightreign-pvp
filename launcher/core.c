@@ -1,9 +1,8 @@
 // Nightreign invasion mod launcher core. See core.h.
 //
-// What it does when building: reads the player's own game archive (data0), takes the hub's talk
-// script bundle and the menu text bundles out of it, applies the mod's changes and writes the
-// results into work/build, which me3 then overlays on the game. Nothing in the game folder is
-// modified.
+// What it does when building: reads the player's own game archive (data0), takes the menu text
+// bundles out of it, adds the mod's lines and writes the results into work/build, which me3 then
+// overlays on the game. Nothing in the game folder is modified.
 //
 // Format knowledge and the archive's public key come from the open-source Smithbox/SoulsFormats.
 #define _FILE_OFFSET_BITS 64
@@ -38,19 +37,18 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
-#define TALK_BUNDLE "/script/talk/m10_00_00_00.talkesdbnd.dcx"
-#define TALK_SCRIPT "\\t600001000.esd"
-#define TEXT_EXPEDITION 28100001  // ids used by the table script (mod/talk/t600001000.py)
-#define TEXT_SOURCE_FMG "\\ActionButtonText.fmg"  // the game's own "Commence expedition" prompt
-#define TEXT_SOURCE_ID 1882
-#define TEXT_TARGET_FMG "\\EventTextForTalk.fmg"
+#define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
                               "porbr", "rusru", "spaar", "spaes", "thath", "zhocn", "zhotw"};
-// Our own menu lines (UTF-8). Polish for the Polish game, English for every other language.
-// Keep in sync with mod/build_msg.py.
+// Our own menu lines (UTF-8): the "Invasion" entry of the expedition menu's Target list.
+// Polish for the Polish game, English for every other language. Keep in sync with mod/build_msg.py.
+// (Adjacent string literals keep \x escapes from swallowing the letters that follow them.)
 static const struct { u32 id; const char *english, *polish; } OUR_TEXT[] = {
-    {28100002, "Invade another world", "Najed\xc5\xba inny \xc5\x9bwiat"},
+    {131160, "Invasion", "Najazd"},
+    {131161, "Enter another squad's expedition as an invader.\nDefeat its host to win.",
+             "Wejd\xc5\xba do wyprawy innej dru\xc5\xbcyny jako naje\xc5\xba" "d\xc5\xba" "ca.\n"
+             "Pokonaj hosta, aby wygra\xc4\x87."},
 };
 #define OUR_TEXT_COUNT (sizeof OUR_TEXT / sizeof *OUR_TEXT)
 
@@ -668,39 +666,6 @@ static size_t utf8_to_utf16(const char *s, u8 *out) {
     return n;
 }
 
-// --- delta for the table's talk script (format: mod/make_delta.py) ------------------------------------------
-
-static buf delta_apply(buf base, buf delta) {
-    buf out = {0};
-    if (delta.n < 28 || memcmp(delta.p, "NRD1", 4)) return logf_("bad delta file"), out;
-    if (rd32(delta.p + 4) != base.n || rd64(delta.p + 8) != fnv1a64(base.p, base.n))
-        return logf_("the game's table script is not the version this mod was made for"), out;
-    u32 out_len = rd32(delta.p + 16);
-    out.p = xalloc(out_len);
-    for (size_t pos = 28; pos < delta.n;) {
-        if (delta.p[pos] == 0) {
-            u32 off = rd32(delta.p + pos + 1), n = rd32(delta.p + pos + 5);
-            if ((u64)off + n > base.n || out.n + n > out_len) goto bad;
-            memcpy(out.p + out.n, base.p + off, n);
-            out.n += n;
-            pos += 9;
-        } else {
-            u32 n = rd32(delta.p + pos + 1);
-            if (pos + 5 + n > delta.n || out.n + n > out_len) goto bad;
-            memcpy(out.p + out.n, delta.p + pos + 5, n);
-            out.n += n;
-            pos += 5 + n;
-        }
-    }
-    if (out.n == out_len && fnv1a64(out.p, out.n) == rd64(delta.p + 20)) return out;
-bad:
-    logf_("delta did not apply cleanly");
-    free(out.p);
-    out.p = NULL;
-    out.n = 0;
-    return out;
-}
-
 // --- finding the game and the save ----------------------------------------------------------------------------
 
 int core_check_game(const char *dir) {
@@ -834,29 +799,6 @@ int core_backup_save(const char *save_dir) {
     return 1;
 }
 
-static int build_talk(const char *game_dir, buf bhd, const char *bdt) {
-    char path[1300];
-    buf dcx = archive_read(bhd, bdt, TALK_BUNDLE);
-    if (!dcx.p) return logf_("talk script bundle not found in the game archive"), 0;
-    buf bundle = dcx_read(game_dir, dcx);
-    free(dcx.p);
-    if (!bundle.p) return 0;
-    int index = bnd4_find(bundle, TALK_SCRIPT);
-    if (index < 0) return logf_("table script not found in the bundle"), 0;
-    snprintf(path, sizeof path, "%s" SEP "data" SEP "t600001000.delta", g_app);
-    buf delta = read_file(path);
-    if (!delta.p) return logf_("missing %s", path), 0;
-    buf script = delta_apply(bnd4_file(bundle, index), delta);
-    free(delta.p);
-    if (!script.p) return 0;
-    buf patched = bnd4_replace(bundle, index, script), out = dcx_write(patched);
-    snprintf(path, sizeof path, "%s" SEP "work" SEP "build" SEP "script" SEP "talk" SEP "m10_00_00_00.talkesdbnd.dcx", g_app);
-    int ok = write_file(path, out.p, out.n);
-    free(script.p); free(patched.p); free(out.p); free(bundle.p);
-    if (ok) logf_("Table menu script built");
-    return ok;
-}
-
 static int build_text(const char *game_dir, buf bhd, const char *bdt, const char *lang) {
     char path[1300];
     snprintf(path, sizeof path, "/msg/%s/menu_dlc01.msgbnd.dcx", lang);
@@ -865,22 +807,12 @@ static int build_text(const char *game_dir, buf bhd, const char *bdt, const char
     buf bundle = dcx_read(game_dir, dcx);
     free(dcx.p);
     if (!bundle.p) return 0;
-    int source = bnd4_find(bundle, TEXT_SOURCE_FMG), target = bnd4_find(bundle, TEXT_TARGET_FMG);
-    fmg src = {0}, dst = {0};
-    if (source < 0 || target < 0 || !fmg_parse(bnd4_file(bundle, source), &src) || !fmg_parse(bnd4_file(bundle, target), &dst))
+    int target = bnd4_find(bundle, TEXT_TARGET_FMG);
+    fmg dst = {0};
+    if (target < 0 || !fmg_parse(bnd4_file(bundle, target), &dst))
         return logf_("%s: unexpected text bundle layout", lang), 0;
 
-    // "Commence expedition": the game's own prompt in this language, without surrounding spaces.
-    static const u8 fallback[] = {'E', 0, 'x', 0, 'p', 0, 'e', 0, 'd', 0, 'i', 0, 't', 0, 'i', 0, 'o', 0, 'n', 0};
-    const fmg_entry *e = fmg_get(&src, TEXT_SOURCE_ID);
-    const u8 *text = e && e->text ? e->text : fallback;
-    size_t bytes = e && e->text ? e->bytes : sizeof fallback;
-    // (some languages pad it with a normal or a non-breaking space)
-    while (bytes >= 2 && (text[0] == ' ' || text[0] == 0xA0) && !text[1]) { text += 2; bytes -= 2; }
-    while (bytes >= 2 && (text[bytes - 2] == ' ' || text[bytes - 2] == 0xA0) && !text[bytes - 1]) bytes -= 2;
-    fmg_set(&dst, TEXT_EXPEDITION, text, bytes);
-
-    u8 wide[OUR_TEXT_COUNT][128];
+    u8 wide[OUR_TEXT_COUNT][512];
     for (size_t i = 0; i < OUR_TEXT_COUNT; i++) {
         const char *line = !strcmp(lang, "polpl") ? OUR_TEXT[i].polish : OUR_TEXT[i].english;
         fmg_set(&dst, OUR_TEXT[i].id, wide[i], utf8_to_utf16(line, wide[i]));
@@ -889,7 +821,7 @@ static int build_text(const char *game_dir, buf bhd, const char *bdt, const char
     buf table = fmg_write(&dst), patched = bnd4_replace(bundle, target, table), out = dcx_write(patched);
     snprintf(path, sizeof path, "%s" SEP "work" SEP "build" SEP "msg" SEP "%s" SEP "menu_dlc01.msgbnd.dcx", g_app, lang);
     int ok = write_file(path, out.p, out.n);
-    free(src.e); free(dst.e); free(table.p); free(patched.p); free(out.p); free(bundle.p);
+    free(dst.e); free(table.p); free(patched.p); free(out.p); free(bundle.p);
     return ok;
 }
 
@@ -926,17 +858,15 @@ int core_build(const char *game_dir) {
     // Nothing to do if the game archive and the mod's own files are the ones we built from last time.
     char stamp_path[1300], stamp[40];
     snprintf(stamp_path, sizeof stamp_path, "%s" SEP "work" SEP "build.stamp", g_app);
-    snprintf(from, sizeof from, "%s" SEP "data" SEP "t600001000.delta", g_app);
-    buf delta = read_file(from);
     snprintf(from, sizeof from, "%s" SEP "data" SEP "invasion.dll", g_app);
     buf dll = read_file(from);
     snprintf(stamp, sizeof stamp, "%016llx%016llx", (unsigned long long)fnv1a64(enc.p, enc.n),
-             (unsigned long long)(fnv1a64(delta.p, delta.n) ^ fnv1a64(dll.p, dll.n) * 31));
-    free(delta.p); free(dll.p);
+             (unsigned long long)fnv1a64(dll.p, dll.n));
+    free(dll.p);
     buf old_stamp = read_file(stamp_path);
     int same = old_stamp.n == 32 && !memcmp(old_stamp.p, stamp, 32);
     free(old_stamp.p);
-    snprintf(to, sizeof to, "%s" SEP "work" SEP "build" SEP "script" SEP "talk" SEP "m10_00_00_00.talkesdbnd.dcx", g_app);
+    snprintf(to, sizeof to, "%s" SEP "work" SEP "build" SEP "msg" SEP "engus" SEP "menu_dlc01.msgbnd.dcx", g_app);
     if (same && exists(to)) {
         free(enc.p);
         logf_("Mod files are up to date");
@@ -948,7 +878,7 @@ int core_build(const char *game_dir) {
     if (memcmp(bhd.p, "BHD5", 4))
         return logf_("The game archive could not be read. The game may have been updated; the mod needs an update too."), 0;
 
-    int ok = build_talk(game_dir, bhd, bdt_path), langs = 0;
+    int ok = 1, langs = 0;
     for (size_t i = 0; ok && i < sizeof LANGS / sizeof *LANGS; i++) {
         int r = build_text(game_dir, bhd, bdt_path, LANGS[i]);
         if (r == 0) ok = 0;
