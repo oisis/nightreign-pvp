@@ -1,4 +1,4 @@
-"""Target list icon for the "Invasion" entry: a group of four player outlines, in blue.
+"""Target list icon for the "Invasion" entry: a group of four player outlines, blue with a red one in front.
 
     python3 build_icon.py <sblytbnd raw> <tpf raw> <out sblytbnd.dcx> <out tpf.dcx>
     python3 build_icon.py --png <out.png>          just draw the icon
@@ -30,7 +30,7 @@ DDS_HEADER = 148         # "DDS " + header + DX10 extension
 # --- drawing -------------------------------------------------------------------------------------
 
 def draw_icon():
-    """RGBA SIZE x SIZE: dark blue medallion, four figure outlines (one in front, three behind)."""
+    """RGBA SIZE x SIZE: dark blue medallion, four figure outlines: three blue, the one in front red."""
     k = 4                                     # supersampling
     n = SIZE * k
     c = n // 2
@@ -58,14 +58,15 @@ def draw_icon():
         d.rounded_rectangle((x - w, top, x + w, top + s * 8), radius=s * 1.5, fill=255)
         return m
 
-    # back to front: (x, y, head radius, outline colour)
-    for x, y, s, colour in ((124, 62, 15, (70, 120, 210)), (66, 88, 18, (95, 155, 235)),
-                            (182, 88, 18, (95, 155, 235)), (124, 112, 24, (170, 215, 255))):
+    # back to front: (x, y, head radius, outline colour, glow colour); the one in front is the invader
+    blue, red = (40, 110, 255), (255, 40, 40)
+    for x, y, s, colour, halo in ((124, 62, 15, (70, 120, 210), blue), (66, 88, 18, (95, 155, 235), blue),
+                                  (182, 88, 18, (95, 155, 235), blue), (124, 112, 24, (255, 120, 110), red)):
         body = figure(x, y, s)
         edge = ImageChops.subtract(body, body.filter(ImageFilter.MinFilter(4 * k + 1)))
         img.paste(flat((8, 16, 40, 255)), mask=body)                          # hides the ones behind
         glow = edge.filter(ImageFilter.GaussianBlur(3 * k)).point(lambda v: min(255, v * 2))
-        img.paste(flat((40, 110, 255, 255)), mask=ImageChops.multiply(glow, body.filter(ImageFilter.MaxFilter(8 * k + 1))))
+        img.paste(flat(halo + (255,)), mask=ImageChops.multiply(glow, body.filter(ImageFilter.MaxFilter(8 * k + 1))))
         img.paste(flat(colour + (255,)), mask=edge)
 
     out = Image.new("RGBA", (n, n), (0, 0, 0, 0))
