@@ -3,6 +3,7 @@
 #   native/invasion.dll        the client DLL (with the Target list hook)
 #   regulation.bin             the game's params plus our Target list row
 #   msg/<lang>/menu_dlc01…     menu texts, for the languages extracted to analysis/gamefiles
+#   menu/21_common_dlc01_…     the DLC menu icon atlas plus our Target list icon (needs Pillow)
 #   unkrak.exe                 Oodle helper the Linux launcher ships
 # Also builds $W/build/package-dll/invasion.dll: the DLL without the Target list hook, which is what
 # the launcher packages until the launcher can produce regulation.bin itself.
@@ -28,6 +29,16 @@ for src in "$W"/analysis/gamefiles/msg/*/menu_dlc01.msgbnd.dcx; do
   lang=$(basename "$(dirname "$src")")
   (cd "$B" && wine_run unkrak.exe "$(w "$OODLE")" "$(w "$src")" "$(w "$B/tmp/menu-$lang.bin")")
   python3 "$R/mod/build_msg.py" "$lang" "$B/tmp/menu-$lang.bin" "$B/msg/$lang/menu_dlc01.msgbnd.dcx"
+done
+
+# Our Target list icon, drawn into the DLC icon atlas (high and low resolution sets).
+unkrak() { (cd "$B" && wine_run unkrak.exe "$(w "$OODLE")" "$(w "$1")" "$(w "$2")"); }
+for q in h l; do
+  for kind in sblytbnd tpf; do
+    unkrak "$W/analysis/gamefiles/menu/21_common_dlc01_$q.$kind.dcx" "$B/tmp/icons_$q.$kind"
+  done
+  python3 "$R/mod/build_icon.py" "$B/tmp/icons_$q.sblytbnd" "$B/tmp/icons_$q.tpf" \
+    "$B/menu/21_common_dlc01_$q.sblytbnd.dcx" "$B/menu/21_common_dlc01_$q.tpf.dcx"
 done
 rm -rf "$B/tmp"
 find "$B" -maxdepth 2 \( -name '*.pdb' -o -name '*.lib' \) -delete
