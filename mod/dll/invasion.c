@@ -118,7 +118,18 @@ static void create_boss_list_hook(void *dialog) {
     ((void *(*)(void *, int, unsigned char, unsigned char))(g_base + RVA_BOSS_ITEM_CTOR))(item, INVASION_ROW, 0, 0);
     ((void (*)(void *, void *))(g_base + RVA_BOSS_ITEM_PUSH))((char *)dialog + DIALOG_BOSS_LIST, item);
     ((void (*)(void *))(g_base + RVA_BOSS_ITEM_DTOR))(item);
-    logf("target list: Invasion entry added");
+    // Diagnostics: the entry is in the list but the game does not draw it. An item whose param row
+    // pointer (+0x18) is null is drawn hidden, so log what every item of the list holds.
+    char *list = (char *)dialog + DIALOG_BOSS_LIST;
+    char *begin = *(char **)(list + 0x10), *end = *(char **)(list + 0x18);
+    unsigned count = begin && end >= begin ? (unsigned)((end - begin) / 0x28) : 0;
+    logf("target list: Invasion entry added, %u items", count);
+    for (unsigned i = 0; i < count && i < 32; i++) {
+        char *it = begin + i * 0x28;
+        logf("target list:   [%u] id=%d row=%p flags=%02x %02x %02x %02x", i, *(int *)(it + 0x10),
+             *(void **)(it + 0x18), (unsigned char)it[0x20], (unsigned char)it[0x21],
+             (unsigned char)it[0x22], (unsigned char)it[0x26]);
+    }
 }
 
 // Point the game's one "call _CreateBossList" at our function. A rel32 call only reaches +-2 GB, so
