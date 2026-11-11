@@ -3,6 +3,7 @@
 #   native/invasion.dll            the client DLL
 #   script/talk/…talkesdbnd.dcx    the hub's talk bundle with our table script
 #   msg/<lang>/menu_dlc01…         menu texts, for the languages extracted to analysis/gamefiles
+#   regulation.bin                 experiment: "Invasion" entry in the Target list
 #   t600001000.delta, unkrak.exe   what the launcher ships
 # Needs the game's own files extracted first (re/bhd_extract.py), because the table script is kept
 # in this repository only as a patch against the game's script:
@@ -37,5 +38,8 @@ for src in "$W"/analysis/gamefiles/msg/*/menu_dlc01.msgbnd.dcx; do
   unkrak "$src" "$B/talk-src/menu-$lang.bin"
   python3 "$R/mod/build_msg.py" "$lang" "$B/talk-src/menu-$lang.bin" "$B/msg/$lang/menu_dlc01.msgbnd.dcx"
 done
+# Experiment: "Invasion" entry in the expedition menu's Target list (development package only).
+uv run -q "$R/mod/build_regulation.py" "${NR_GAME:-$HOME/.local/share/Steam/steamapps/common/ELDEN RING NIGHTREIGN/Game}/regulation.bin" "$B/regulation.bin"
+
 find "$B" -maxdepth 2 \( -name '*.pdb' -o -name '*.lib' \) -delete
 echo "mod built in $B"
