@@ -14,6 +14,7 @@ from fsformats import bnd4_read, bnd4_replace, dcx_write_deflate, fmg_read, fmg_
 OUR_TEXT = {
     # Entry in the expedition menu's Target list (NightBossMenuParam row 101, mod/build_regulation.py).
     "CL_MenuText.fmg": {
+        130460: ("4 players", "4 graczy"),  # fourth "Number of Players" option, added by the DLL
         131160: ("Invasion", "Najazd"),
         131161: ("Enter another squad's expedition as an invader.\nDefeat its host to win.",
                  "Wejdź do wyprawy innej drużyny jako najeźdźca.\nPokonaj hosta, aby wygrać."),
