@@ -124,6 +124,15 @@ static void create_boss_list_hook(void *dialog) {
     char *list = (char *)dialog + DIALOG_BOSS_LIST;
     char *begin = *(char **)(list + 0x10), *end = *(char **)(list + 0x18);
     unsigned count = begin && end >= begin ? (unsigned)((end - begin) / 0x28) : 0;
+    // Experiment: the list ends with "The Deep of Night" (id 100) and then our entry, and ours is not
+    // drawn. Swap the two: if ours then shows and the Deep of Night vanishes, the view has a fixed
+    // number of places and ours simply had none.
+    if (count >= 2 && *(int *)(end - 0x28 + 0x10) == INVASION_ROW && *(int *)(end - 0x50 + 0x10) == 100) {
+        char tmp[0x28];
+        memcpy(tmp, end - 0x28, 0x28);
+        memcpy(end - 0x28, end - 0x50, 0x28);
+        memcpy(end - 0x50, tmp, 0x28);
+    }
     logf("target list: Invasion entry added, %u items", count);
     for (unsigned i = 0; i < count && i < 32; i++) {
         char *it = begin + i * 0x28;
