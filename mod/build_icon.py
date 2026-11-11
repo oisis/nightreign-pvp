@@ -2,6 +2,8 @@
 
     python3 build_icon.py <sblytbnd raw> <tpf raw> <out sblytbnd.dcx> <out tpf.dcx> [four more ...]
     python3 build_icon.py --png <out.png>          just draw the icon
+    python3 build_icon.py --blocks <out dir>       icon_<id>.bc7: each icon's encoded blocks, row by
+                                                   row, for the launcher (which has no encoder)
 
 Two sizes are added: the list icon and the large one shown in the description panel.
 
@@ -214,7 +216,14 @@ def main(bundle_path, tpf_path, out_bundle, out_tpf):
 
 
 if __name__ == "__main__":
-    if sys.argv[1] == "--png":
+    if sys.argv[1] == "--blocks":
+        for icon_id, side in ICONS.items():
+            px = draw_icon(side).load()
+            data = b"".join(bc7_block(tuple(px[bx * 4 + i % 4, by * 4 + i // 4] for i in range(16)))
+                            for by in range(side // 4) for bx in range(side // 4))
+            Path(sys.argv[2]).mkdir(parents=True, exist_ok=True)
+            Path(sys.argv[2], f"icon_{icon_id}.bc7").write_bytes(data)
+    elif sys.argv[1] == "--png":
         draw_icon(int(sys.argv[3]) if len(sys.argv) > 3 else 248).save(sys.argv[2])
     else:
         for i in range(1, len(sys.argv), 4):   # one process for all sets: encoded blocks are cached

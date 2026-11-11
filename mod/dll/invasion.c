@@ -3,9 +3,9 @@
 // What it does today:
 //   - logs the session manager's state (lobby state, player count, join data) whenever it changes,
 //     and how many invaders the current squad would allow;
-//   - with -DTARGET_MENU: adds an "Invasion" entry to the expedition menu's Target list (row 101 of
-//     NightBossMenuParam, which must exist in regulation.bin, see mod/build_regulation.py) and a
-//     fourth entry to the "Number of Players" option.
+//   - adds an "Invasion" entry to the expedition menu's Target list (row 101 of NightBossMenuParam,
+//     which must exist in regulation.bin: mod/build_regulation.py, or the launcher) and a fourth
+//     entry to the "Number of Players" option.
 //
 // ponytail: addresses are hard-coded for nightreign.exe 1.3.3 (PE timestamp below) and the DLL does
 // nothing on any other build. Replace with signature scans when a second game version has to work.
@@ -112,7 +112,6 @@ static void watch_session(void) {
 
 // --- Target list entry ----------------------------------------------------------------------------
 
-#ifdef TARGET_MENU
 // Runs in place of the game's call to _CreateBossList: let the game build its list (Nightlords from
 // fixed row numbers), then add our row the same way the game adds its own, and move it to the top.
 static void show_boss_list_hook(void *grid, char *list, void *a3, void *a4) {
@@ -247,7 +246,6 @@ static void hook_players_option(void) {
     if (patch_rel32(lea + 3, lea + 7, (unsigned char *)(vt + 1))) logf("players option: hooked (vtable at %p)", (void *)(vt + 1));
     else logf("players option: cannot patch the constructor");
 }
-#endif
 
 // --- entry -----------------------------------------------------------------------------------------
 
@@ -264,10 +262,8 @@ static DWORD WINAPI run(LPVOID self) {
         return 0;
     }
     logf("loaded, game base %p", g_base);
-#ifdef TARGET_MENU
     hook_target_list();
     hook_players_option();
-#endif
     for (;;) {
         Sleep(250);
         watch_session();

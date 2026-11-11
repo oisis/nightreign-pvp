@@ -1,12 +1,13 @@
 #!/bin/sh
 # Developer build of the mod into $W/build (see re/common.sh for R and W):
-#   native/invasion.dll        the client DLL (with the Target list hook)
+#   native/invasion.dll        the client DLL
 #   regulation.bin             the game's params plus our Target list row
 #   msg/<lang>/menu_dlc01…     menu texts, for the languages extracted to analysis/gamefiles
 #   menu/21_common_dlc01_…     the DLC menu icon atlas plus our Target list icon (needs Pillow)
 #   unkrak.exe                 Oodle helper the Linux launcher ships
-# Also builds $W/build/package-dll/invasion.dll: the DLL without the Target list hook, which is what
-# the launcher packages until the launcher can produce regulation.bin itself.
+# and $W/build-launcher-data/icon_<id>.bc7, our icons as encoded texture blocks, which the launcher
+# ships (it builds everything else from the player's own game files). That folder is kept outside
+# build/ because build/ is what me3 overlays on the game.
 # NR_GAME: the game's "Game" folder if it is not in the default Steam library.
 set -e
 . "$(dirname "$0")/../re/common.sh"
@@ -15,11 +16,10 @@ OODLE="$W/tools/esdtool/esdtool-v0.5.1/oo2core_9_win64.dll"   # the game's own D
 GAME="${NR_GAME:-$HOME/.local/share/Steam/steamapps/common/ELDEN RING NIGHTREIGN/Game}"
 B="$W/build"
 rm -rf "$B/script" "$B/talk-src" "$B/t600001000.delta"
-mkdir -p "$B/native" "$B/package-dll" "$B/tmp"
+mkdir -p "$B/native" "$B/tmp"
 
 DLL="-target x86_64-windows-gnu -shared -O2 -Wall -Wextra"
-"$ZIG" cc $DLL -DTARGET_MENU -o "$B/native/invasion.dll" "$R/mod/dll/invasion.c"
-"$ZIG" cc $DLL -o "$B/package-dll/invasion.dll" "$R/mod/dll/invasion.c"
+"$ZIG" cc $DLL -o "$B/native/invasion.dll" "$R/mod/dll/invasion.c"
 "$ZIG" cc -target x86_64-windows-gnu -O2 -o "$B/unkrak.exe" "$R/mod/tools/unkrak.c"
 
 uv run -q "$R/mod/build_regulation.py" "$GAME/regulation.bin" "$B/regulation.bin"
@@ -42,6 +42,7 @@ for q in h l; do
     "$B/menu/21_common_dlc01_$q.sblytbnd.dcx" "$B/menu/21_common_dlc01_$q.tpf.dcx"
 done
 python3 "$R/mod/build_icon.py" "$@"
+python3 "$R/mod/build_icon.py" --blocks "$W/build-launcher-data"
 rm -rf "$B/tmp"
 find "$B" -maxdepth 2 \( -name '*.pdb' -o -name '*.lib' \) -delete
 echo "mod built in $B"

@@ -1,8 +1,8 @@
 // Nightreign invasion mod launcher core. See core.h.
 //
-// What it does when building: reads the player's own game archive (data0), takes the menu text
-// bundles out of it, adds the mod's lines and writes the results into work/build, which me3 then
-// overlays on the game. Nothing in the game folder is modified.
+// What it does when building: reads the player's own game files (the data0 archive and
+// regulation.bin), adds the mod's menu lines, its Target list row and its two icons, and writes the
+// results into work/build, which me3 then overlays on the game. Nothing in the game folder is modified.
 //
 // Format knowledge and the archive's public key come from the open-source Smithbox/SoulsFormats.
 #define _FILE_OFFSET_BITS 64
@@ -38,6 +38,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
+#define BUILD_FORMAT 2
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
                               "porbr", "rusru", "spaar", "spaes", "thath", "zhocn", "zhotw"};
@@ -142,6 +143,8 @@ static int copy_file(const char *from, const char *to) {
     return ok;
 }
 
+static u32 rd16(const u8 *p) { return p[0] | p[1] << 8; }
+static void wr16(u8 *p, u32 v) { p[0] = v; p[1] = v >> 8; }
 static u32 rd32(const u8 *p) { return p[0] | p[1] << 8 | p[2] << 16 | (u32)p[3] << 24; }
 static u64 rd64(const u8 *p) { return rd32(p) | (u64)rd32(p + 4) << 32; }
 static void wr32(u8 *p, u32 v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
@@ -255,7 +258,7 @@ static buf rsa_decrypt(buf in) {
     return out;
 }
 
-// --- AES-128, decryption only (the archive stores files AES-ECB encrypted) -----------------------
+// --- AES: 128-bit keys for the archive (ECB), a 256-bit key for regulation.bin (CBC) ---------------
 
 static u8 g_sbox[256], g_inv_sbox[256];
 
@@ -284,27 +287,31 @@ static u8 gmul(u8 a, u8 b) {
     return r;
 }
 
-static void aes_expand(const u8 *key, u8 rk[176]) {
-    memcpy(rk, key, 16);
+// key_len 16 -> 10 rounds, 32 -> 14 rounds. rk holds (rounds + 1) * 16 bytes (at most 240).
+static void aes_expand(const u8 *key, int key_len, u8 *rk) {
+    int total = (key_len / 4 + 7) * 16;
+    memcpy(rk, key, key_len);
     u8 rcon = 1;
-    for (int i = 16; i < 176; i += 4) {
+    for (int i = key_len; i < total; i += 4) {
         u8 t[4];
         memcpy(t, rk + i - 4, 4);
-        if (i % 16 == 0) {
+        if (i % key_len == 0) {
             u8 first = t[0];
             t[0] = g_sbox[t[1]] ^ rcon;
             t[1] = g_sbox[t[2]];
             t[2] = g_sbox[t[3]];
             t[3] = g_sbox[first];
             rcon = (u8)(rcon << 1) ^ (rcon & 0x80 ? 0x1B : 0);
+        } else if (key_len == 32 && i % 32 == 16) {
+            for (int j = 0; j < 4; j++) t[j] = g_sbox[t[j]];
         }
-        for (int j = 0; j < 4; j++) rk[i + j] = rk[i - 16 + j] ^ t[j];
+        for (int j = 0; j < 4; j++) rk[i + j] = rk[i - key_len + j] ^ t[j];
     }
 }
 
-static void aes_decrypt_block(const u8 rk[176], u8 s[16]) {
-    for (int i = 0; i < 16; i++) s[i] ^= rk[160 + i];
-    for (int round = 9;; round--) {
+static void aes_decrypt_block(const u8 *rk, int rounds, u8 s[16]) {
+    for (int i = 0; i < 16; i++) s[i] ^= rk[rounds * 16 + i];
+    for (int round = rounds - 1;; round--) {
         u8 t[16];
         for (int c = 0; c < 4; c++)  // inverse ShiftRows + inverse SubBytes
             for (int r = 0; r < 4; r++) t[((c + r) % 4) * 4 + r] = g_inv_sbox[s[c * 4 + r]];
@@ -317,6 +324,25 @@ static void aes_decrypt_block(const u8 rk[176], u8 s[16]) {
             col[2] = gmul(a, 13) ^ gmul(b, 9) ^ gmul(d, 14) ^ gmul(e, 11);
             col[3] = gmul(a, 11) ^ gmul(b, 13) ^ gmul(d, 9) ^ gmul(e, 14);
         }
+    }
+}
+
+static void aes_encrypt_block(const u8 *rk, int rounds, u8 s[16]) {
+    for (int i = 0; i < 16; i++) s[i] ^= rk[i];
+    for (int round = 1;; round++) {
+        u8 t[16];
+        for (int c = 0; c < 4; c++)  // SubBytes + ShiftRows
+            for (int r = 0; r < 4; r++) t[c * 4 + r] = g_sbox[s[((c + r) % 4) * 4 + r]];
+        if (round < rounds)
+            for (int c = 0; c < 4; c++) {  // MixColumns
+                u8 *col = t + c * 4, a = col[0], b = col[1], d = col[2], e = col[3];
+                col[0] = gmul(a, 2) ^ gmul(b, 3) ^ d ^ e;
+                col[1] = a ^ gmul(b, 2) ^ gmul(d, 3) ^ e;
+                col[2] = a ^ b ^ gmul(d, 2) ^ gmul(e, 3);
+                col[3] = gmul(a, 3) ^ b ^ d ^ gmul(e, 2);
+            }
+        for (int i = 0; i < 16; i++) s[i] = t[i] ^ rk[round * 16 + i];
+        if (round == rounds) break;
     }
 }
 
@@ -353,13 +379,13 @@ static buf archive_read(buf bhd, const char *bdt_path, const char *path) {
         if (out.n != padded) { free(out.p); out.p = NULL; out.n = 0; return out; }
         if (aes_off) {
             u8 rk[176];
-            aes_expand(bhd.p + aes_off, rk);
+            aes_expand(bhd.p + aes_off, 16, rk);
             u32 ranges = rd32(bhd.p + aes_off + 16);
             for (u32 r = 0; r < ranges; r++) {
                 long long start = (long long)rd64(bhd.p + aes_off + 20 + r * 16);
                 long long end = (long long)rd64(bhd.p + aes_off + 28 + r * 16);
                 if (start < 0 || end < 0 || start == end || (u64)end > out.n) continue;
-                for (long long p = start; p + 16 <= end; p += 16) aes_decrypt_block(rk, out.p + p);
+                for (long long p = start; p + 16 <= end; p += 16) aes_decrypt_block(rk, 10, out.p + p);
             }
         }
         return out;
@@ -670,6 +696,283 @@ static size_t utf8_to_utf16(const char *s, u8 *out) {
 
 // --- finding the game and the save ----------------------------------------------------------------------------
 
+// --- regulation.bin: the game's params, AES-256-CBC around a zstd DCX around a BND4 ----------------------------
+
+// Zig's standard library, see zstd.zig. cap must be the content size plus 128 KB; returns 0 on error.
+size_t nr_zstd_decompress(const u8 *src, size_t n, u8 *dst, size_t cap);
+
+// The regulation key is public knowledge (Smithbox).
+static const u8 REGULATION_KEY[32] = {
+    0x9a, 0x8e, 0xe9, 0x0c, 0x4c, 0x01, 0xa4, 0x31, 0x68, 0xa1, 0x7d, 0x9d, 0x75, 0xe4, 0xa7, 0xd0,
+    0x21, 0x07, 0xeb, 0xcf, 0x43, 0xd5, 0xac, 0xb0, 0x55, 0x4f, 0x94, 0x16, 0x01, 0xb5, 0x79, 0x18};
+
+// The Target list is NightBossMenuParam. Row 100 is the game's own non-boss entry ("The Deep of
+// Night"); our row 101 is a copy of it with these fields changed. Keep in sync with
+// mod/build_regulation.py, which explains the fields.
+#define TARGET_PARAM "\\NightBossMenuParam.param"
+#define TEMPLATE_ROW 100
+#define INVASION_ROW 101
+static const int ROW_CHANGES[][2] = {{131150, 131160}, {131151, 131161}, {41812, 41813}, {300, 5}, {130, 0}};
+#define FIRST_LARGE_ICON 41820  // row 0's largeBossIconId, to find the field
+#define LARGE_ICON 41814
+
+// Offset of the only place where a row holds this 32-bit value (step: 1 or 4 bytes), -1 otherwise.
+static int find_value(const u8 *row, u32 size, int value, int step) {
+    int found = -1;
+    for (u32 o = 0; o + 4 <= size; o += step)
+        if ((int)rd32(row + o) == value) {
+            if (found >= 0) return -1;
+            found = (int)o;
+        }
+    return found;
+}
+
+// Param layout: 0x40 header, 24-byte row descriptors (id, pad, data offset, name offset), row data,
+// strings. Returns the param with our row appended, or an empty buf if it does not look as expected.
+static buf param_add_row(buf p) {
+    buf out = {0};
+    if (p.n < 0x40 + 48) return out;
+    u32 strings_off = rd32(p.p), count = rd16(p.p + 0x0A);
+    if (!(p.p[0x2D] & 4) || count < 2 || 0x40 + (size_t)count * 24 > p.n) return out;
+    u64 data_start = rd64(p.p + 0x40 + 8), size = rd64(p.p + 0x40 + 24 + 8) - data_start;
+    if (data_start != 0x40 + (u64)count * 24 || strings_off != data_start + count * size || strings_off > p.n) return out;
+    const u8 *tmpl = NULL;
+    for (u32 i = 0; i < count; i++) {
+        const u8 *d = p.p + 0x40 + i * 24;
+        if ((int)rd32(d) >= INVASION_ROW) return out;
+        if (rd32(d) == TEMPLATE_ROW) tmpl = d;
+    }
+    if (!tmpl) return out;
+
+    u32 shift = 24 + (u32)size;  // one descriptor before the data, one row before the strings
+    out.p = xalloc(p.n + shift);
+    memcpy(out.p, p.p, 0x40);
+    wr32(out.p, strings_off + shift);
+    wr16(out.p + 0x0A, count + 1);
+    wr64(out.p + 0x10, rd64(p.p + 0x10) + shift);
+    wr64(out.p + 0x30, data_start + 24);
+    u8 *d = out.p + 0x40;
+    for (u32 i = 0; i < count; i++, d += 24) {
+        const u8 *src = p.p + 0x40 + i * 24;
+        memcpy(d, src, 8);
+        wr64(d + 8, rd64(src + 8) + 24);
+        wr64(d + 16, rd64(src + 16) + shift);
+    }
+    wr32(d, INVASION_ROW);
+    wr64(d + 8, data_start + 24 + count * size);
+    wr64(d + 16, rd64(tmpl + 16) + shift);
+    d += 24;
+    memcpy(d, p.p + data_start, count * size);
+    u8 *row = d + count * size;
+    memcpy(row, p.p + rd64(tmpl + 8), size);
+    memcpy(row + size, p.p + strings_off, p.n - strings_off);
+    out.n = p.n + shift;
+
+    int ok = 1;
+    for (size_t i = 0; i < sizeof ROW_CHANGES / sizeof *ROW_CHANGES; i++) {
+        int at = find_value(row, (u32)size, ROW_CHANGES[i][0], 1);
+        if (at < 0) ok = 0;
+        else wr32(row + at, (u32)ROW_CHANGES[i][1]);
+    }
+    int large = find_value(p.p + data_start, (u32)size, FIRST_LARGE_ICON, 4);
+    if (large < 0 || (int)rd32(row + large) != -1) ok = 0;
+    else wr32(row + large, LARGE_ICON);
+    if (!ok) { free(out.p); out.p = NULL; out.n = 0; }
+    return out;
+}
+
+// A zstd frame made of raw (uncompressed) blocks, with a 64 KB window and no content size: the
+// frame shape Smithbox writes, which the game is known to load.
+// ponytail: no compression, regulation.bin grows to its raw size (about 55 MB). Add a real
+// compressor if disk use ever matters.
+static buf zstd_store(buf raw) {
+    size_t blocks = (raw.n + 65535) / 65536;
+    buf out = {xalloc(6 + blocks * 3 + raw.n), 0};
+    static const u8 head[6] = {0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x30};
+    memcpy(out.p, head, 6);
+    out.n = 6;
+    for (size_t pos = 0; pos < raw.n;) {
+        size_t n = raw.n - pos > 65536 ? 65536 : raw.n - pos;
+        u32 h = (u32)n << 3 | (pos + n == raw.n);
+        out.p[out.n++] = (u8)h; out.p[out.n++] = (u8)(h >> 8); out.p[out.n++] = (u8)(h >> 16);
+        memcpy(out.p + out.n, raw.p + pos, n);
+        out.n += n;
+        pos += n;
+    }
+    return out;
+}
+
+// game's regulation.bin -> work/build/regulation.bin with our Target list row.
+static int build_regulation(const char *game_dir) {
+    char path[1300];
+    snprintf(path, sizeof path, "%s" SEP "regulation.bin", game_dir);
+    buf enc = read_file(path);
+    if (enc.n < 16 + 0x4C || enc.n % 16) return free(enc.p), logf_("cannot read %s", path), 0;
+    u8 rk[240], iv[16];
+    aes_expand(REGULATION_KEY, 32, rk);
+    memcpy(iv, enc.p, 16);
+    for (size_t at = enc.n - 16; at >= 16; at -= 16) {  // CBC, last block first
+        aes_decrypt_block(rk, 14, enc.p + at);
+        for (int i = 0; i < 16; i++) enc.p[at + i] ^= enc.p[at - 16 + i];
+    }
+    u8 *dcx = enc.p + 16;
+    u32 usize = be32(dcx + 0x1C), csize = be32(dcx + 0x20);
+    if (memcmp(dcx, "DCX", 3) || memcmp(dcx + 0x28, "ZSTD", 4) || csize > enc.n - 16 - 0x4C)
+        return free(enc.p), logf_("regulation.bin is not in the expected format"), 0;
+    buf bundle = {xalloc((size_t)usize + (1 << 17)), usize};
+    buf patched = {0}, body = {0}, param = {0};
+    int ok = 0, index;
+    if (nr_zstd_decompress(dcx + 0x4C, csize, bundle.p, (size_t)usize + (1 << 17)) != usize) {
+        logf_("regulation.bin could not be unpacked");
+    } else if ((index = bnd4_find(bundle, TARGET_PARAM)) < 0 || !(param = param_add_row(bnd4_file(bundle, index))).p) {
+        logf_("The game's Target list looks different than expected. The game may have been updated; the mod needs an update too.");
+    } else {
+        patched = bnd4_replace(bundle, index, param);
+        body = zstd_store(patched);
+        size_t plain = 0x4C + body.n, padded = (plain + 15) / 16 * 16;
+        buf out = {xalloc(16 + padded), 16 + padded};
+        memcpy(out.p, iv, 16);
+        memcpy(out.p + 16, dcx, 0x4C);  // the game's DCX header with our sizes
+        wbe32(out.p + 16 + 0x1C, (u32)patched.n);
+        wbe32(out.p + 16 + 0x20, (u32)body.n);
+        out.p[16 + 0x30] = 15;  // compression level field, as in the developer build that is known to load
+        memcpy(out.p + 16 + 0x4C, body.p, body.n);
+        for (size_t at = 16; at < out.n; at += 16) {
+            for (int i = 0; i < 16; i++) out.p[at + i] ^= out.p[at - 16 + i];
+            aes_encrypt_block(rk, 14, out.p + at);
+        }
+        snprintf(path, sizeof path, "%s" SEP "work" SEP "build" SEP "regulation.bin", g_app);
+        ok = write_file(path, out.p, out.n);
+        free(out.p);
+    }
+    free(enc.p); free(bundle.p); free(param.p); free(patched.p); free(body.p);
+    return ok;
+}
+
+// --- menu icons ------------------------------------------------------------------------------------------------
+//
+// Menu icons are sub-rectangles of big atlas textures; a ".layout" XML file per atlas names them
+// ("MENU_MenuIcon_<id>.png"). Our two icons go into an unused corner of the DLC atlas and get one
+// layout line each, as in mod/build_icon.py, which also produces their BC7 blocks (data/icon_<id>.bc7).
+
+#define ICON_ATLAS "SB_MenuIcon_DLC01_0"
+#define DDS_HEADER 148
+static const struct { int id, side; } ICONS[] = {{41813, 248}, {41814, 460}};
+#define ICON_COUNT (sizeof ICONS / sizeof *ICONS)
+typedef struct { int x, w, y, h; } rect;
+
+// Integer value of attribute `name` (given as " name=\"") inside the tag starting at `tag`, or -1.
+static int attr_int(const char *tag, const char *name) {
+    const char *end = strchr(tag, '>'), *a = strstr(tag, name);
+    return a && end && a < end ? atoi(a + strlen(name)) : -1;
+}
+
+// Top-left corner of an unused side x side square, searched from the bottom right on the 4-pixel
+// block grid. Returns 1 if found.
+static int free_spot(const rect *used, size_t n, int side, int width, int height, int *ox, int *oy) {
+    const int pad = 4;
+    for (int y = height - side - pad; y > pad; y -= 4)
+        for (int x = width - side - pad; x > pad; x -= 4) {
+            size_t i = 0;
+            for (; i < n; i++)
+                if (!(x + side + pad <= used[i].x || used[i].x + used[i].w + pad <= x ||
+                      y + side + pad <= used[i].y || used[i].y + used[i].h + pad <= y)) break;
+            if (i == n) { *ox = x; *oy = y; return 1; }
+        }
+    return 0;
+}
+
+// quality: 'h' or 'l', the game's two texture sets. Returns 1 on success.
+static int build_icons(const char *game_dir, buf bhd, const char *bdt, char quality) {
+    char path[1300];
+    snprintf(path, sizeof path, "/menu/21_common_dlc01_%c.sblytbnd.dcx", quality);
+    buf dcx = archive_read(bhd, bdt, path);
+    buf bundle = dcx.p ? dcx_read(game_dir, dcx) : dcx;
+    free(dcx.p);
+    snprintf(path, sizeof path, "/menu/21_common_dlc01_%c.tpf.dcx", quality);
+    dcx = archive_read(bhd, bdt, path);
+    buf tpf = dcx.p ? dcx_read(game_dir, dcx) : dcx;
+    free(dcx.p);
+    char *layout = NULL, *text = NULL;
+    rect *used = NULL;
+    int ok = 0, index = bundle.p ? bnd4_find(bundle, ICON_ATLAS ".layout") : -1;
+    if (index < 0 || !tpf.p) { logf_("menu icon files not found in the game archive"); goto done; }
+
+    buf lay = bnd4_file(bundle, index);
+    layout = xalloc(lay.n + 1);
+    memcpy(layout, lay.p, lay.n);
+    const char *atlas = strstr(layout, "<TextureAtlas "), *close = strstr(layout, "</TextureAtlas>");
+    int width = atlas ? attr_int(atlas, " width=\"") : -1, height = atlas ? attr_int(atlas, " height=\"") : -1;
+    size_t n = 0, cap = 0;
+    for (const char *t = layout; (t = strstr(t, "<SubTexture ")); t++) {
+        if (n + ICON_COUNT >= cap) {
+            rect *grown = xalloc((cap = cap * 2 + 64) * sizeof *grown);
+            if (n) memcpy(grown, used, n * sizeof *grown);
+            free(used);
+            used = grown;
+        }
+        rect r = {attr_int(t, " x=\""), attr_int(t, " width=\""), attr_int(t, " y=\""), attr_int(t, " height=\"")};
+        used[n++] = r;
+    }
+
+    // The atlas texture inside the TPF: a BC7 DDS without mipmaps.
+    u8 *dds = NULL;
+    for (u32 i = 0; tpf.n >= 0x10 && i < rd32(tpf.p + 8) && 0x10 + (size_t)(i + 1) * 0x14 <= tpf.n; i++) {
+        const u8 *e = tpf.p + 0x10 + i * 0x14;
+        if (rd32(e + 0x0C) < tpf.n && name_ends_with(tpf.p + rd32(e + 0x0C), ICON_ATLAS) &&
+            (u64)rd32(e) + rd32(e + 4) <= tpf.n && rd32(e + 4) > DDS_HEADER) dds = tpf.p + rd32(e);
+    }
+    if (!atlas || !close || width < 0 || height < 0 || !dds || memcmp(dds + 84, "DX10", 4) || rd32(dds + 128) != 98 ||
+        (int)rd32(dds + 12) != height || (int)rd32(dds + 16) != width) {
+        logf_("The game's menu icon atlas looks different than expected. The game may have been updated; the mod needs an update too.");
+        goto done;
+    }
+
+    char lines[ICON_COUNT * 256];
+    size_t len = 0;
+    for (size_t i = 0; i < ICON_COUNT; i++) {
+        int side = ICONS[i].side, x, y;
+        char name[64];
+        snprintf(name, sizeof name, "MENU_MenuIcon_%d.", ICONS[i].id);
+        snprintf(path, sizeof path, "%s" SEP "data" SEP "icon_%d.bc7", g_app, ICONS[i].id);
+        buf blocks = read_file(path);
+        size_t per_row = (size_t)side / 4 * 16;
+        if (strstr(layout, name) || blocks.n != per_row * (side / 4) || !free_spot(used, n, side, width, height, &x, &y)) {
+            free(blocks.p);
+            logf_("menu icon %d cannot be added", ICONS[i].id);
+            goto done;
+        }
+        rect r = {x, side, y, side};
+        used[n++] = r;
+        for (int by = 0; by < side / 4; by++)
+            memcpy(dds + DDS_HEADER + ((size_t)(y / 4 + by) * (width / 4) + x / 4) * 16, blocks.p + by * per_row, per_row);
+        free(blocks.p);
+        len += (size_t)snprintf(lines + len, sizeof lines - len,
+                                "\t<SubTexture name=\"MENU_MenuIcon_%d.png\" x=\"%d\" width=\"%d\" y=\"%d\" height=\"%d\""
+                                " originalWidth=\"%d\" originalHeight=\"%d\" half=\"0\"/>\r\n",
+                                ICONS[i].id, x, side, y, side, side, side);
+    }
+    size_t before = (size_t)(close - layout);
+    text = xalloc(lay.n + len);
+    memcpy(text, layout, before);
+    memcpy(text + before, lines, len);
+    memcpy(text + before + len, close, lay.n - before);
+    buf new_layout = {(u8 *)text, lay.n + len};
+    buf patched = bnd4_replace(bundle, index, new_layout), out = dcx_write(patched);
+    snprintf(path, sizeof path, "%s" SEP "work" SEP "build" SEP "menu" SEP "21_common_dlc01_%c.sblytbnd.dcx", g_app, quality);
+    ok = write_file(path, out.p, out.n);
+    free(patched.p); free(out.p);
+    out = dcx_write(tpf);
+    snprintf(path, sizeof path, "%s" SEP "work" SEP "build" SEP "menu" SEP "21_common_dlc01_%c.tpf.dcx", g_app, quality);
+    ok = ok && write_file(path, out.p, out.n);
+    free(out.p);
+done:
+    free(layout); free(text); free(used); free(bundle.p); free(tpf.p);
+    return ok;
+}
+
+// --- finding the game and the save ------------------------------------------------------------------------------
+
 int core_check_game(const char *dir) {
     char a[1100], b[1100];
     snprintf(a, sizeof a, "%s" SEP "nightreign.exe", dir);
@@ -862,13 +1165,14 @@ int core_build(const char *game_dir) {
     snprintf(stamp_path, sizeof stamp_path, "%s" SEP "work" SEP "build.stamp", g_app);
     snprintf(from, sizeof from, "%s" SEP "data" SEP "invasion.dll", g_app);
     buf dll = read_file(from);
+    // BUILD_FORMAT: bump when the set of files the launcher builds changes.
     snprintf(stamp, sizeof stamp, "%016llx%016llx", (unsigned long long)fnv1a64(enc.p, enc.n),
-             (unsigned long long)fnv1a64(dll.p, dll.n));
+             (unsigned long long)(fnv1a64(dll.p, dll.n) + BUILD_FORMAT));
     free(dll.p);
     buf old_stamp = read_file(stamp_path);
     int same = old_stamp.n == 32 && !memcmp(old_stamp.p, stamp, 32);
     free(old_stamp.p);
-    snprintf(to, sizeof to, "%s" SEP "work" SEP "build" SEP "msg" SEP "engus" SEP "menu_dlc01.msgbnd.dcx", g_app);
+    snprintf(to, sizeof to, "%s" SEP "work" SEP "build" SEP "regulation.bin", g_app);
     if (same && exists(to)) {
         free(enc.p);
         logf_("Mod files are up to date");
@@ -886,9 +1190,13 @@ int core_build(const char *game_dir) {
         if (r == 0) ok = 0;
         if (r > 0) langs++;
     }
+    if (ok) logf_("Menu texts built for %d languages", langs);
+    ok = ok && build_icons(game_dir, bhd, bdt_path, 'h') && build_icons(game_dir, bhd, bdt_path, 'l');
     free(bhd.p);
     if (!ok) return 0;
-    logf_("Menu texts built for %d languages", langs);
+    logf_("Menu icons added");
+    if (!build_regulation(game_dir)) return 0;
+    logf_("Target list entry added");
 
     snprintf(from, sizeof from, "%s" SEP "data" SEP "invasion.dll", g_app);
     snprintf(to, sizeof to, "%s" SEP "work" SEP "native" SEP "invasion.dll", g_app);
@@ -990,12 +1298,32 @@ int core_selftest(void) {
     // AES-128, FIPS-197 appendix C.1.
     aes_init();
     u8 key[16], block[16] = {0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4, 0xc5, 0x5a};
-    u8 rk[176];
+    u8 rk[240];
     for (int i = 0; i < 16; i++) key[i] = (u8)i;
-    aes_expand(key, rk);
-    aes_decrypt_block(rk, block);
+    aes_expand(key, 16, rk);
+    aes_decrypt_block(rk, 10, block);
+    for (int i = 0; i < 16; i++) if (block[i] != (u8)(i * 0x11)) ok = 0;
+    // AES-256, FIPS-197 appendix C.3, both directions.
+    static const u8 c3[16] = {0x8e, 0xa2, 0xb7, 0xca, 0x51, 0x67, 0x45, 0xbf, 0xea, 0xfc, 0x49, 0x90, 0x4b, 0x49, 0x60, 0x89};
+    u8 key256[32];
+    for (int i = 0; i < 32; i++) key256[i] = (u8)i;
+    aes_expand(key256, 32, rk);
+    aes_encrypt_block(rk, 14, block);
+    if (memcmp(block, c3, 16)) ok = 0;
+    aes_decrypt_block(rk, 14, block);
     for (int i = 0; i < 16; i++) if (block[i] != (u8)(i * 0x11)) ok = 0;
     if (!ok) logf_("selftest: AES failed");
+
+    // zstd: our stored frame must come back through the real decoder (two blocks).
+    buf big = {xalloc(70000), 70000};
+    for (size_t i = 0; i < big.n; i++) big.p[i] = (u8)(i * 31 + i / 251);
+    buf frame = zstd_store(big);
+    u8 *back = xalloc(big.n + (1 << 17));
+    if (nr_zstd_decompress(frame.p, frame.n, back, big.n + (1 << 17)) != big.n || memcmp(back, big.p, big.n)) {
+        ok = 0;
+        logf_("selftest: zstd failed");
+    }
+    free(big.p); free(frame.p); free(back);
 
     // RSA: (m^e mod n) for m = 2 must equal 2^e reduced the slow way; check m = 1 and Montgomery identity.
     rsa_init();

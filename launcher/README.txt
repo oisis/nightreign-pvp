@@ -2,9 +2,11 @@ Nightreign Invasions - test build
 =================================
 
 What this is
-  An experimental mod for ELDEN RING NIGHTREIGN (PC, Steam). This build only installs the mod's
-  loader and client and checks that they run on your system. Invasions do not work yet and the
-  game looks unchanged.
+  An experimental mod for ELDEN RING NIGHTREIGN (PC, Steam). This build installs the mod's loader
+  and client and changes the expedition menu: "Invasion" is the first entry of the Target list
+  (with its own icon and description) and "Number of Players" has a fourth option.
+  Invasions do not work yet: choosing "Invasion" does nothing special, and "4 players" still
+  behaves like 3.
 
 How to start
   Windows: run NightreignInvasions.exe
@@ -38,5 +40,6 @@ Po polsku
   ./nightreign-invasions (Linux), przy wlaczonym Steamie, i kliknij "Graj z modem". Launcher
   znajdzie gre, zrobi kopie zapisu w work/backups/, zbuduje pliki moda z Twoich plikow gry i
   uruchomi gre offline z osobnym plikiem zapisu. Folder gry nie jest zmieniany.
-  "Odinstaluj" usuwa zbudowane pliki i osobny zapis moda. Inwazje jeszcze nie dzialaja, a gra
-  wyglada na razie bez zmian.
+  "Odinstaluj" usuwa zbudowane pliki i osobny zapis moda. W menu wyprawy jest nowa pozycja
+  "Najazd" (pierwsza na liscie "Cel") i opcja "4 graczy". Inwazje jeszcze nie dzialaja: wybranie
+  "Najazd" nic nie uruchamia, a "4 graczy" dziala jak 3.
