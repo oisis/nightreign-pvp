@@ -1,0 +1,28 @@
+image:
+  # Where you pushed the image built from site/Dockerfile.
+  repository: registry.example.com/nightreign-invasions-site
+  tag: ""  # defaults to the chart's appVersion
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+replicaCount: 1
+
+service:
+  port: 80
+
+ingress:
+  enabled: false
+  className: ""        # K3s ships Traefik: "traefik"
+  host: invasions.example.com
+  annotations: {}
+  tls:
+    enabled: false
+    secretName: ""     # existing secret, or one created by cert-manager through an annotation
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 16Mi
+  limits:
+    memory: 64Mi

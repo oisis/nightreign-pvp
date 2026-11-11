@@ -1,0 +1,1097 @@
+// Nightreign invasion mod launcher core. See core.h.
+//
+// What it does when building: reads the player's own game archive (data0), takes the hub's talk
+// script bundle and the menu text bundles out of it, applies the mod's changes and writes the
+// results into work/build, which me3 then overlays on the game. Nothing in the game folder is
+// modified.
+//
+// Format knowledge and the archive's public key come from the open-source Smithbox/SoulsFormats.
+#define _FILE_OFFSET_BITS 64
+#include "core.h"
+#include "data0_key.h"
+
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <direct.h>
+#define SEP "\\"
+#define fseek64 _fseeki64
+#else
+#include <dirent.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+extern char **environ;
+#define SEP "/"
+#define fseek64 fseeko
+#endif
+
+typedef uint8_t u8;
+typedef uint32_t u32;
+typedef uint64_t u64;
+typedef struct { u8 *p; size_t n; } buf;
+
+#define TALK_BUNDLE "/script/talk/m10_00_00_00.talkesdbnd.dcx"
+#define TALK_SCRIPT "\\t600001000.esd"
+#define TEXT_EXPEDITION 28100001  // ids used by the table script (mod/talk/t600001000.py)
+#define TEXT_SOURCE_FMG "\\ActionButtonText.fmg"  // the game's own "Commence expedition" prompt
+#define TEXT_SOURCE_ID 1882
+#define TEXT_TARGET_FMG "\\EventTextForTalk.fmg"
+
+static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
+                              "porbr", "rusru", "spaar", "spaes", "thath", "zhocn", "zhotw"};
+// Our own menu lines (UTF-8). Polish for the Polish game, English for every other language.
+// Keep in sync with mod/build_msg.py.
+static const struct { u32 id; const char *english, *polish; } OUR_TEXT[] = {
+    {28100002, "Invade another world", "Najed\xc5\xba inny \xc5\x9bwiat"},
+};
+#define OUR_TEXT_COUNT (sizeof OUR_TEXT / sizeof *OUR_TEXT)
+
+// --- small utilities ----------------------------------------------------------------------------
+
+static log_fn g_log;
+static char g_app[1024];
+
+void core_set_log(log_fn fn) { g_log = fn; }
+void core_set_app_dir(const char *dir) {  // stored as an absolute path
+#ifdef _WIN32
+    if (!GetFullPathNameA(dir, sizeof g_app, g_app, NULL)) snprintf(g_app, sizeof g_app, "%s", dir);
+#else
+    char full[4096];
+    snprintf(g_app, sizeof g_app, "%s", realpath(dir, full) ? full : dir);
+#endif
+}
+
+static void logf_(const char *fmt, ...) {
+    char line[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    if (g_log) g_log(line);
+    else fprintf(stderr, "%s\n", line);
+}
+
+static void *xalloc(size_t n) {
+    void *p = calloc(1, n ? n : 1);
+    if (!p) { logf_("out of memory"); exit(1); }
+    return p;
+}
+
+static int exists(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (f) fclose(f);
+    return f != NULL;
+}
+
+static void make_dir(const char *path) {
+#ifdef _WIN32
+    _mkdir(path);
+#else
+    mkdir(path, 0755);
+#endif
+}
+
+// Create every directory on the way to a file path.
+static void make_parents(const char *file) {
+    char tmp[1024];
+    snprintf(tmp, sizeof tmp, "%s", file);
+    for (char *c = tmp + 1; *c; c++)
+        if (*c == '/' || *c == '\\') {
+            char keep = *c;
+            *c = 0;
+            make_dir(tmp);
+            *c = keep;
+        }
+}
+
+static buf read_file(const char *path) {
+    buf b = {0};
+    FILE *f = fopen(path, "rb");
+    if (!f) return b;
+    fseek64(f, 0, SEEK_END);
+    long long n = ftell(f);
+    fseek64(f, 0, SEEK_SET);
+    b.p = xalloc(n);
+    b.n = fread(b.p, 1, n, f);
+    fclose(f);
+    return b;
+}
+
+static int write_file(const char *path, const u8 *p, size_t n) {
+    make_parents(path);
+    FILE *f = fopen(path, "wb");
+    if (!f) return logf_("cannot write %s", path), 0;
+    size_t w = fwrite(p, 1, n, f);
+    fclose(f);
+    return w == n;
+}
+
+static int copy_file(const char *from, const char *to) {
+    buf b = read_file(from);
+    if (!b.p) return 0;
+    int ok = write_file(to, b.p, b.n);
+    free(b.p);
+    return ok;
+}
+
+static u32 rd32(const u8 *p) { return p[0] | p[1] << 8 | p[2] << 16 | (u32)p[3] << 24; }
+static u64 rd64(const u8 *p) { return rd32(p) | (u64)rd32(p + 4) << 32; }
+static void wr32(u8 *p, u32 v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
+static void wr64(u8 *p, u64 v) { wr32(p, (u32)v); wr32(p + 4, (u32)(v >> 32)); }
+static u32 be32(const u8 *p) { return (u32)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
+static void wbe32(u8 *p, u32 v) { p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
+
+static u64 fnv1a64(const u8 *p, size_t n) {
+    u64 h = 0xCBF29CE484222325ull;
+    for (size_t i = 0; i < n; i++) h = (h ^ p[i]) * 0x100000001B3ull;
+    return h;
+}
+
+// --- RSA public-key operation (Montgomery, 2048 bit) for the archive header ------------------------
+
+#define LIMBS 64
+static u32 g_n0inv, g_r2[LIMBS];
+
+static void mont_mul(u32 *r, const u32 *a, const u32 *b) {
+    const u32 *n = DATA0_N;
+    u32 t[LIMBS + 2] = {0};
+    for (int i = 0; i < LIMBS; i++) {
+        u64 c = 0, s;
+        for (int j = 0; j < LIMBS; j++) {
+            s = (u64)t[j] + (u64)a[j] * b[i] + c;
+            t[j] = (u32)s;
+            c = s >> 32;
+        }
+        s = (u64)t[LIMBS] + c;
+        t[LIMBS] = (u32)s;
+        t[LIMBS + 1] = (u32)(s >> 32);
+        u32 m = t[0] * g_n0inv;
+        c = ((u64)t[0] + (u64)m * n[0]) >> 32;
+        for (int j = 1; j < LIMBS; j++) {
+            s = (u64)t[j] + (u64)m * n[j] + c;
+            t[j - 1] = (u32)s;
+            c = s >> 32;
+        }
+        s = (u64)t[LIMBS] + c;
+        t[LIMBS - 1] = (u32)s;
+        t[LIMBS] = t[LIMBS + 1] + (u32)(s >> 32);
+    }
+    int ge = t[LIMBS] != 0;
+    if (!ge) {
+        ge = 1;
+        for (int j = LIMBS - 1; j >= 0; j--)
+            if (t[j] != n[j]) { ge = t[j] > n[j]; break; }
+    }
+    if (ge) {
+        u64 borrow = 0;
+        for (int j = 0; j < LIMBS; j++) {
+            u64 d = (u64)t[j] - n[j] - borrow;
+            r[j] = (u32)d;
+            borrow = (d >> 32) & 1;
+        }
+    } else {
+        memcpy(r, t, LIMBS * 4);
+    }
+}
+
+static void rsa_init(void) {
+    u32 x = DATA0_N[0];
+    for (int i = 0; i < 5; i++) x *= 2 - DATA0_N[0] * x;  // inverse of n mod 2^32 (Newton)
+    g_n0inv = 0 - x;
+    u32 r[LIMBS] = {1};
+    for (int i = 0; i < 2 * 32 * LIMBS; i++) {  // r = 2^(2*2048) mod n by repeated doubling
+        u32 carry = 0;
+        for (int j = 0; j < LIMBS; j++) {
+            u32 next = r[j] >> 31;
+            r[j] = r[j] << 1 | carry;
+            carry = next;
+        }
+        int ge = carry;
+        if (!ge) {
+            ge = 1;
+            for (int j = LIMBS - 1; j >= 0; j--)
+                if (r[j] != DATA0_N[j]) { ge = r[j] > DATA0_N[j]; break; }
+        }
+        if (ge) {
+            u64 borrow = 0;
+            for (int j = 0; j < LIMBS; j++) {
+                u64 d = (u64)r[j] - DATA0_N[j] - borrow;
+                r[j] = (u32)d;
+                borrow = (d >> 32) & 1;
+            }
+        }
+    }
+    memcpy(g_r2, r, sizeof r);
+}
+
+// in: 256 bytes big-endian. out: 255 bytes big-endian (the value is below 2^2040 for valid data).
+static void rsa_block(const u8 *in, u8 *out) {
+    u32 c[LIMBS], cm[LIMBS], acc[LIMBS], one[LIMBS] = {1};
+    for (int i = 0; i < LIMBS; i++) c[i] = be32(in + (LIMBS - 1 - i) * 4);
+    mont_mul(cm, c, g_r2);
+    mont_mul(acc, one, g_r2);
+    for (int bit = 31; bit >= 0; bit--) {
+        mont_mul(acc, acc, acc);
+        if (DATA0_E >> bit & 1) mont_mul(acc, acc, cm);
+    }
+    mont_mul(acc, acc, one);
+    u8 full[256];
+    for (int i = 0; i < LIMBS; i++) wbe32(full + (LIMBS - 1 - i) * 4, acc[i]);
+    memcpy(out, full + 1, 255);
+}
+
+static buf rsa_decrypt(buf in) {
+    size_t blocks = in.n / 256;
+    buf out = {xalloc(blocks * 255), blocks * 255};
+    for (size_t i = 0; i < blocks; i++) rsa_block(in.p + i * 256, out.p + i * 255);
+    return out;
+}
+
+// --- AES-128, decryption only (the archive stores files AES-ECB encrypted) -----------------------
+
+static u8 g_sbox[256], g_inv_sbox[256];
+
+static void aes_init(void) {
+    u8 p = 1, q = 1;
+    do {
+        p = p ^ (u8)(p << 1) ^ (p & 0x80 ? 0x1B : 0);
+        q ^= q << 1;
+        q ^= q << 2;
+        q ^= q << 4;
+        q ^= q & 0x80 ? 0x09 : 0;
+        u8 x = q ^ (u8)(q << 1 | q >> 7) ^ (u8)(q << 2 | q >> 6) ^ (u8)(q << 3 | q >> 5) ^ (u8)(q << 4 | q >> 4);
+        g_sbox[p] = x ^ 0x63;
+    } while (p != 1);
+    g_sbox[0] = 0x63;
+    for (int i = 0; i < 256; i++) g_inv_sbox[g_sbox[i]] = (u8)i;
+}
+
+static u8 gmul(u8 a, u8 b) {
+    u8 r = 0;
+    while (b) {
+        if (b & 1) r ^= a;
+        a = (u8)(a << 1) ^ (a & 0x80 ? 0x1B : 0);
+        b >>= 1;
+    }
+    return r;
+}
+
+static void aes_expand(const u8 *key, u8 rk[176]) {
+    memcpy(rk, key, 16);
+    u8 rcon = 1;
+    for (int i = 16; i < 176; i += 4) {
+        u8 t[4];
+        memcpy(t, rk + i - 4, 4);
+        if (i % 16 == 0) {
+            u8 first = t[0];
+            t[0] = g_sbox[t[1]] ^ rcon;
+            t[1] = g_sbox[t[2]];
+            t[2] = g_sbox[t[3]];
+            t[3] = g_sbox[first];
+            rcon = (u8)(rcon << 1) ^ (rcon & 0x80 ? 0x1B : 0);
+        }
+        for (int j = 0; j < 4; j++) rk[i + j] = rk[i - 16 + j] ^ t[j];
+    }
+}
+
+static void aes_decrypt_block(const u8 rk[176], u8 s[16]) {
+    for (int i = 0; i < 16; i++) s[i] ^= rk[160 + i];
+    for (int round = 9;; round--) {
+        u8 t[16];
+        for (int c = 0; c < 4; c++)  // inverse ShiftRows + inverse SubBytes
+            for (int r = 0; r < 4; r++) t[((c + r) % 4) * 4 + r] = g_inv_sbox[s[c * 4 + r]];
+        for (int i = 0; i < 16; i++) s[i] = t[i] ^ rk[round * 16 + i];
+        if (round == 0) break;
+        for (int c = 0; c < 4; c++) {  // inverse MixColumns
+            u8 *col = s + c * 4, a = col[0], b = col[1], d = col[2], e = col[3];
+            col[0] = gmul(a, 14) ^ gmul(b, 11) ^ gmul(d, 13) ^ gmul(e, 9);
+            col[1] = gmul(a, 9) ^ gmul(b, 14) ^ gmul(d, 11) ^ gmul(e, 13);
+            col[2] = gmul(a, 13) ^ gmul(b, 9) ^ gmul(d, 14) ^ gmul(e, 11);
+            col[3] = gmul(a, 11) ^ gmul(b, 13) ^ gmul(d, 9) ^ gmul(e, 14);
+        }
+    }
+}
+
+// --- the archive: decrypted BHD5 header + BDT data file --------------------------------------------
+
+static u64 path_hash(const char *path) {
+    u64 h = 0;
+    for (; *path; path++) {
+        char c = *path == '\\' ? '/' : *path;
+        if (c >= 'A' && c <= 'Z') c += 32;
+        h = h * 0x85 + (u8)c;
+    }
+    return h;
+}
+
+// Read one file out of the archive. bhd is the decrypted header. Returns an empty buf if missing.
+static buf archive_read(buf bhd, const char *bdt_path, const char *path) {
+    buf out = {0};
+    u64 want = path_hash(path);
+    u32 buckets = rd32(bhd.p + 0x10), buckets_off = rd32(bhd.p + 0x14);
+    const u8 *bucket = bhd.p + buckets_off + (want % buckets) * 8;
+    u32 count = rd32(bucket), off = rd32(bucket + 4);
+    for (u32 i = 0; i < count; i++) {
+        const u8 *e = bhd.p + off + i * 0x28;
+        if (rd64(e) != want) continue;
+        u32 padded = rd32(e + 8);
+        u64 file_off = rd64(e + 0x10), aes_off = rd64(e + 0x20);
+        FILE *f = fopen(bdt_path, "rb");
+        if (!f) return logf_("cannot open %s", bdt_path), out;
+        out.p = xalloc(padded);
+        fseek64(f, (long long)file_off, SEEK_SET);
+        out.n = fread(out.p, 1, padded, f);
+        fclose(f);
+        if (out.n != padded) { free(out.p); out.p = NULL; out.n = 0; return out; }
+        if (aes_off) {
+            u8 rk[176];
+            aes_expand(bhd.p + aes_off, rk);
+            u32 ranges = rd32(bhd.p + aes_off + 16);
+            for (u32 r = 0; r < ranges; r++) {
+                long long start = (long long)rd64(bhd.p + aes_off + 20 + r * 16);
+                long long end = (long long)rd64(bhd.p + aes_off + 28 + r * 16);
+                if (start < 0 || end < 0 || start == end || (u64)end > out.n) continue;
+                for (long long p = start; p + 16 <= end; p += 16) aes_decrypt_block(rk, out.p + p);
+            }
+        }
+        return out;
+    }
+    return out;
+}
+
+// --- DCX ----------------------------------------------------------------------------------------------
+
+#ifdef _WIN32
+typedef long long (__cdecl *oodle_fn)(const void *, long long, void *, long long, int, int, int, void *,
+                                      long long, void *, void *, void *, long long, int);
+// Kraken, with the Oodle library that ships with the game.
+static int kraken(const char *game_dir, const u8 *src, size_t n, u8 *dst, size_t dn) {
+    static oodle_fn fn;
+    if (!fn) {
+        char dll[1024];
+        snprintf(dll, sizeof dll, "%s\\oo2core_9_win64.dll", game_dir);
+        HMODULE h = LoadLibraryA(dll);
+        fn = h ? (oodle_fn)GetProcAddress(h, "OodleLZ_Decompress") : NULL;
+        if (!fn) return logf_("cannot load %s", dll), 0;
+    }
+    return fn(src, (long long)n, dst, (long long)dn, 1, 0, 0, NULL, 0, NULL, NULL, NULL, 0, 3) == (long long)dn;
+}
+#else
+static int run(char *const argv[], const char *extra_env) {
+    char *env[256];
+    int n = 0;
+    for (char **e = environ; *e && n < 250; e++) env[n++] = *e;
+    char prefix[1100], debug[] = "WINEDEBUG=-all";
+    if (extra_env) { snprintf(prefix, sizeof prefix, "%s", extra_env); env[n++] = prefix; env[n++] = debug; }
+    env[n] = NULL;
+    pid_t pid;
+    if (posix_spawnp(&pid, argv[0], NULL, NULL, argv, env)) return -1;
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static void wine_path(char *out, size_t cap, const char *unix_path) {
+    snprintf(out, cap, "Z:%s", unix_path);
+    for (char *c = out; *c; c++) if (*c == '/') *c = '\\';
+}
+
+// First entry of `parent` whose name starts with `prefix` and which contains `inner`. Fills out.
+static int find_child(const char *parent, const char *prefix, const char *inner, char *out, size_t cap) {
+    DIR *d = opendir(parent);
+    if (!d) return 0;
+    int found = 0;
+    for (struct dirent *e; !found && (e = readdir(d));) {
+        if (e->d_name[0] == '.' || strncmp(e->d_name, prefix, strlen(prefix))) continue;
+        snprintf(out, cap, "%s/%s/%s", parent, e->d_name, inner);
+        found = exists(out);
+    }
+    closedir(d);
+    return found;
+}
+
+// A wine binary to run the Oodle helper with: Proton's own (every Linux player of the game has
+// Proton through Steam), else whatever "wine" is installed.
+static const char *find_wine(const char *game_dir) {
+    static char wine[1700];
+    if (*wine) return wine;
+    char dir[1100];
+    const char *tail = strstr(game_dir, "/steamapps/common/"), *home = getenv("HOME");
+    static const char *inner[] = {"files/bin/wine", "dist/bin/wine"};
+    static const char *roots[] = {"/.local/share/Steam", "/.steam/steam", "/.var/app/com.valvesoftware.Steam/.local/share/Steam"};
+    for (size_t i = 0; i < 2; i++) {
+        if (tail) {  // the Steam library the game is in
+            snprintf(dir, sizeof dir, "%.*s/steamapps/common", (int)(tail - game_dir), game_dir);
+            if (find_child(dir, "Proton", inner[i], wine, sizeof wine)) return wine;
+        }
+        for (size_t r = 0; home && r < sizeof roots / sizeof *roots; r++) {
+            snprintf(dir, sizeof dir, "%s%s/steamapps/common", home, roots[r]);
+            if (find_child(dir, "Proton", inner[i], wine, sizeof wine)) return wine;
+            snprintf(dir, sizeof dir, "%s%s/compatibilitytools.d", home, roots[r]);
+            if (find_child(dir, "", inner[i], wine, sizeof wine)) return wine;
+        }
+    }
+    snprintf(wine, sizeof wine, "wine");
+    return wine;
+}
+
+// Kraken on Linux: the game's Oodle library is a Windows DLL, so a tiny helper (data/unkrak.exe)
+// runs it under Proton's wine, in a private prefix (work/wineprefix) that is deleted after the build.
+static int kraken(const char *game_dir, const u8 *dcx, size_t n, u8 *dst, size_t dn) {
+    char in[1100], out[1100], exe[1100], dll[1100], win_in[1200], win_out[1200], win_dll[1200], prefix[1100];
+    snprintf(in, sizeof in, "%s/work/tmp.dcx", g_app);
+    snprintf(out, sizeof out, "%s/work/tmp.bin", g_app);
+    snprintf(exe, sizeof exe, "%s/data/unkrak.exe", g_app);
+    snprintf(dll, sizeof dll, "%s/oo2core_9_win64.dll", game_dir);
+    snprintf(prefix, sizeof prefix, "WINEPREFIX=%s/work/wineprefix", g_app);
+    if (!write_file(in, dcx, n)) return 0;
+    wine_path(win_in, sizeof win_in, in);
+    wine_path(win_out, sizeof win_out, out);
+    wine_path(win_dll, sizeof win_dll, dll);
+    char *argv[] = {(char *)find_wine(game_dir), exe, win_dll, win_in, win_out, NULL};
+    int rc = run(argv, prefix);
+    remove(in);
+    if (rc != 0) return logf_("Could not run the unpacking helper with %s (code %d). Proton or wine is needed.", argv[0], rc), 0;
+    buf b = read_file(out);
+    remove(out);
+    int ok = b.n == dn;
+    if (ok) memcpy(dst, b.p, dn);
+    free(b.p);
+    return ok;
+}
+#endif
+
+// Decompress a DCX file. Only Kraken (what the game ships) and zlib (what we write) are handled.
+static buf dcx_read(const char *game_dir, buf d) {
+    buf out = {0};
+    if (d.n < 0x4C || memcmp(d.p, "DCX", 3)) return logf_("not a DCX file"), out;
+    u32 usize = be32(d.p + 0x1C), csize = be32(d.p + 0x20);
+    if (csize > d.n - 0x4C) return logf_("truncated DCX"), out;
+    if (memcmp(d.p + 0x28, "KRAK", 4)) return logf_("unsupported DCX compression %.4s", d.p + 0x28), out;
+    out.p = xalloc(usize);
+    out.n = usize;
+#ifdef _WIN32
+    int ok = kraken(game_dir, d.p + 0x4C, csize, out.p, usize);
+#else
+    int ok = kraken(game_dir, d.p, 0x4C + csize, out.p, usize);  // the helper takes the whole DCX
+#endif
+    if (!ok) { free(out.p); out.p = NULL; out.n = 0; logf_("decompression failed"); }
+    return out;
+}
+
+// Write a zlib DCX using stored (uncompressed) deflate blocks. The game accepts zlib DCX.
+// ponytail: no compression, files grow to their raw size (about 1-5 MB each); add real deflate if
+// disk use ever matters.
+static buf dcx_write(buf raw) {
+    size_t blocks = raw.n / 65535 + 1, zlen = 2 + blocks * 5 + raw.n + 4;
+    buf out = {xalloc(0x4C + zlen), 0x4C + zlen};
+    u8 *h = out.p;
+    memcpy(h, "DCX\0", 4);
+    wbe32(h + 4, 0x11000); wbe32(h + 8, 0x18); wbe32(h + 12, 0x24); wbe32(h + 16, 0x44); wbe32(h + 20, 0x4C);
+    memcpy(h + 0x18, "DCS\0", 4);
+    wbe32(h + 0x1C, (u32)raw.n); wbe32(h + 0x20, (u32)zlen);
+    memcpy(h + 0x24, "DCP\0DFLT", 8);
+    wbe32(h + 0x2C, 0x20);
+    h[0x30] = 9;
+    wbe32(h + 0x40, 0x00010100);
+    memcpy(h + 0x44, "DCA\0", 4);
+    wbe32(h + 0x48, 8);
+    u8 *z = h + 0x4C;
+    *z++ = 0x78; *z++ = 0x01;
+    u32 a = 1, b = 0;
+    for (size_t pos = 0, i = 0; i < blocks; i++) {
+        size_t n = raw.n - pos > 65535 ? 65535 : raw.n - pos;
+        *z++ = i == blocks - 1;
+        *z++ = (u8)n; *z++ = (u8)(n >> 8); *z++ = (u8)~n; *z++ = (u8)(~n >> 8);
+        memcpy(z, raw.p + pos, n);
+        for (size_t k = 0; k < n; k++) { a = (a + raw.p[pos + k]) % 65521; b = (b + a) % 65521; }
+        z += n;
+        pos += n;
+    }
+    wbe32(z, b << 16 | a);
+    return out;
+}
+
+// --- BND4 bundles ----------------------------------------------------------------------------------------
+
+// Does the UTF-16 name at p end with the ASCII suffix (case-insensitive)?
+static int name_ends_with(const u8 *p, const char *suffix) {
+    size_t len = 0, sl = strlen(suffix);
+    while (p[len * 2] || p[len * 2 + 1]) len++;
+    if (len < sl) return 0;
+    for (size_t i = 0; i < sl; i++) {
+        char a = (char)p[(len - sl + i) * 2], b = suffix[i];
+        if (a >= 'A' && a <= 'Z') a += 32;
+        if (b >= 'A' && b <= 'Z') b += 32;
+        if (a != b || p[(len - sl + i) * 2 + 1]) return 0;
+    }
+    return 1;
+}
+
+static int bnd4_find(buf b, const char *suffix) {
+    if (b.n < 0x40 || memcmp(b.p, "BND4", 4) || rd64(b.p + 0x20) != 0x24) return -1;
+    u32 count = rd32(b.p + 0x0C);
+    for (u32 i = 0; i < count; i++)
+        if (name_ends_with(b.p + rd32(b.p + 0x40 + i * 0x24 + 0x20), suffix)) return (int)i;
+    return -1;
+}
+
+static buf bnd4_file(buf b, int i) {
+    const u8 *e = b.p + 0x40 + i * 0x24;
+    buf f = {b.p + rd32(e + 0x18), (size_t)rd64(e + 0x10)};
+    return f;
+}
+
+// Copy of the bundle with file `index` replaced. Headers and names are kept, the data area rebuilt.
+static buf bnd4_replace(buf b, int index, buf replacement) {
+    u32 count = rd32(b.p + 0x0C), data_start = 0xFFFFFFFF;
+    for (u32 i = 0; i < count; i++) {
+        u32 off = rd32(b.p + 0x40 + i * 0x24 + 0x18);
+        if (off < data_start) data_start = off;
+    }
+    buf out = {xalloc(b.n + replacement.n + count * 16), 0};
+    memcpy(out.p, b.p, data_start);
+    out.n = data_start;
+    for (u32 i = 0; i < count; i++) {
+        buf f = (int)i == index ? replacement : bnd4_file(b, (int)i);
+        while (out.n % 16) out.p[out.n++] = 0;
+        u8 *e = out.p + 0x40 + i * 0x24;
+        wr64(e + 8, f.n);
+        wr64(e + 0x10, f.n);
+        wr32(e + 0x18, (u32)out.n);
+        memcpy(out.p + out.n, f.p, f.n);
+        out.n += f.n;
+    }
+    return out;
+}
+
+// --- FMG text tables (version 2: unicode, 64-bit offsets) ---------------------------------------------------
+
+typedef struct { u32 id; const u8 *text; size_t bytes; } fmg_entry;  // text: UTF-16LE without terminator, or NULL
+typedef struct { fmg_entry *e; size_t n, cap; } fmg;
+
+static size_t utf16_bytes(const u8 *p) {
+    size_t n = 0;
+    while (p[n] || p[n + 1]) n += 2;
+    return n;
+}
+
+static int fmg_parse(buf d, fmg *out) {
+    if (d.n < 0x28 || d.p[2] != 2 || d.p[8] != 1) return 0;
+    u32 groups = rd32(d.p + 0x0C), strings = rd32(d.p + 0x10);
+    u64 offsets = rd64(d.p + 0x18);
+    out->cap = strings + 8;
+    out->e = xalloc(out->cap * sizeof *out->e);
+    out->n = 0;
+    for (u32 g = 0; g < groups; g++) {
+        const u8 *grp = d.p + 0x28 + g * 0x10;
+        u32 index = rd32(grp), first = rd32(grp + 4), last = rd32(grp + 8);
+        for (u32 j = 0; j <= last - first && out->n < strings; j++) {
+            u64 off = rd64(d.p + offsets + (u64)(index + j) * 8);
+            fmg_entry *e = &out->e[out->n++];
+            e->id = first + j;
+            e->text = off ? d.p + off : NULL;
+            e->bytes = off ? utf16_bytes(d.p + off) : 0;
+        }
+    }
+    return 1;
+}
+
+static const fmg_entry *fmg_get(const fmg *f, u32 id) {
+    for (size_t i = 0; i < f->n; i++) if (f->e[i].id == id) return &f->e[i];
+    return NULL;
+}
+
+// Insert or replace, keeping the table sorted by id. There is always room for the few lines we add.
+static void fmg_set(fmg *f, u32 id, const u8 *text, size_t bytes) {
+    size_t i = 0;
+    while (i < f->n && f->e[i].id < id) i++;
+    if (i == f->n || f->e[i].id != id) {
+        memmove(&f->e[i + 1], &f->e[i], (f->n - i) * sizeof *f->e);
+        f->n++;
+    }
+    f->e[i].id = id;
+    f->e[i].text = text;
+    f->e[i].bytes = bytes;
+}
+
+static buf fmg_write(const fmg *f) {
+    size_t groups = 0, text_bytes = 0;
+    for (size_t i = 0; i < f->n; i++) {
+        if (i == 0 || f->e[i].id != f->e[i - 1].id + 1) groups++;
+        if (f->e[i].text) text_bytes += f->e[i].bytes + 2;
+    }
+    size_t offsets = 0x28 + groups * 0x10, strings = offsets + f->n * 8;
+    size_t total = strings + text_bytes + (4 - text_bytes % 4) % 4;
+    buf out = {xalloc(total), total};
+    u8 *p = out.p;
+    p[2] = 2;
+    wr32(p + 4, (u32)total);
+    p[8] = 1;
+    wr32(p + 0x0C, (u32)groups);
+    wr32(p + 0x10, (u32)f->n);
+    wr32(p + 0x14, 0xFF);
+    wr64(p + 0x18, offsets);
+    size_t g = 0, pos = strings;
+    for (size_t i = 0; i < f->n; i++) {
+        if (i == 0 || f->e[i].id != f->e[i - 1].id + 1) {
+            u8 *grp = p + 0x28 + g++ * 0x10;
+            wr32(grp, (u32)i);
+            wr32(grp + 4, f->e[i].id);
+        }
+        wr32(p + 0x28 + (g - 1) * 0x10 + 8, f->e[i].id);  // last id of the current group
+        if (f->e[i].text) {
+            wr64(p + offsets + i * 8, pos);
+            memcpy(p + pos, f->e[i].text, f->e[i].bytes);
+            pos += f->e[i].bytes + 2;
+        }
+    }
+    return out;
+}
+
+// UTF-8 (2-byte sequences at most, enough for our own lines) to UTF-16LE. Returns byte count.
+static size_t utf8_to_utf16(const char *s, u8 *out) {
+    size_t n = 0;
+    for (const u8 *c = (const u8 *)s; *c;) {
+        u32 cp = *c < 0x80 ? *c++ : (c += 2, ((c[-2] & 0x1F) << 6) | (c[-1] & 0x3F));
+        out[n++] = (u8)cp;
+        out[n++] = (u8)(cp >> 8);
+    }
+    return n;
+}
+
+// --- delta for the table's talk script (format: mod/make_delta.py) ------------------------------------------
+
+static buf delta_apply(buf base, buf delta) {
+    buf out = {0};
+    if (delta.n < 28 || memcmp(delta.p, "NRD1", 4)) return logf_("bad delta file"), out;
+    if (rd32(delta.p + 4) != base.n || rd64(delta.p + 8) != fnv1a64(base.p, base.n))
+        return logf_("the game's table script is not the version this mod was made for"), out;
+    u32 out_len = rd32(delta.p + 16);
+    out.p = xalloc(out_len);
+    for (size_t pos = 28; pos < delta.n;) {
+        if (delta.p[pos] == 0) {
+            u32 off = rd32(delta.p + pos + 1), n = rd32(delta.p + pos + 5);
+            if ((u64)off + n > base.n || out.n + n > out_len) goto bad;
+            memcpy(out.p + out.n, base.p + off, n);
+            out.n += n;
+            pos += 9;
+        } else {
+            u32 n = rd32(delta.p + pos + 1);
+            if (pos + 5 + n > delta.n || out.n + n > out_len) goto bad;
+            memcpy(out.p + out.n, delta.p + pos + 5, n);
+            out.n += n;
+            pos += 5 + n;
+        }
+    }
+    if (out.n == out_len && fnv1a64(out.p, out.n) == rd64(delta.p + 20)) return out;
+bad:
+    logf_("delta did not apply cleanly");
+    free(out.p);
+    out.p = NULL;
+    out.n = 0;
+    return out;
+}
+
+// --- finding the game and the save ----------------------------------------------------------------------------
+
+int core_check_game(const char *dir) {
+    char a[1100], b[1100];
+    snprintf(a, sizeof a, "%s" SEP "nightreign.exe", dir);
+    snprintf(b, sizeof b, "%s" SEP "data0.bhd", dir);
+    return exists(a) && exists(b);
+}
+
+// Look through one Steam installation's library list for the game.
+static int find_in_steam(const char *steam, char *out, size_t cap) {
+    char vdf[1100];
+    snprintf(vdf, sizeof vdf, "%s" SEP "steamapps" SEP "libraryfolders.vdf", steam);
+    buf b = read_file(vdf);
+    if (!b.p) return 0;
+    int found = 0;
+    char *text = xalloc(b.n + 1);
+    memcpy(text, b.p, b.n);
+    for (char *p = text; !found && (p = strstr(p, "\"path\"")); p += 6) {
+        char *q = strchr(p + 6, '"');
+        if (!q) break;
+        char lib[900];
+        size_t n = 0;
+        for (q++; *q && *q != '"' && n < sizeof lib - 1; q++) {
+            if (*q == '\\' && q[1] == '\\') q++;  // "C:\\Games" in the file means C:\Games
+            lib[n++] = *q;
+        }
+        lib[n] = 0;
+        snprintf(out, cap, "%s" SEP "steamapps" SEP "common" SEP "ELDEN RING NIGHTREIGN" SEP "Game", lib);
+        found = core_check_game(out);
+    }
+    free(text);
+    free(b.p);
+    return found;
+}
+
+int core_find_game(char *out, size_t cap) {
+#ifdef _WIN32
+    char steam[900] = "";
+    DWORD n = sizeof steam;
+    if (RegGetValueA(HKEY_CURRENT_USER, "Software\\Valve\\Steam", "SteamPath", RRF_RT_REG_SZ, NULL, steam, &n) ==
+            ERROR_SUCCESS) {
+        for (char *c = steam; *c; c++) if (*c == '/') *c = '\\';
+        if (find_in_steam(steam, out, cap)) return 1;
+    }
+    return find_in_steam("C:\\Program Files (x86)\\Steam", out, cap);
+#else
+    const char *home = getenv("HOME"), *roots[] = {"/.local/share/Steam", "/.steam/steam",
+                                                    "/.var/app/com.valvesoftware.Steam/.local/share/Steam"};
+    for (size_t i = 0; home && i < sizeof roots / sizeof *roots; i++) {
+        char steam[900];
+        snprintf(steam, sizeof steam, "%s%s", home, roots[i]);
+        if (find_in_steam(steam, out, cap)) return 1;
+    }
+    return 0;
+#endif
+}
+
+// The save lives in <...>/Nightreign/<steam id>/NR0000.sl2; find the <steam id> folder.
+static int find_save_under(const char *parent, char *out, size_t cap) {
+    char probe[1700];
+#ifdef _WIN32
+    char pattern[1100];
+    snprintf(pattern, sizeof pattern, "%s\\*", parent);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    int found = 0;
+    do {
+        snprintf(probe, sizeof probe, "%s\\%s\\NR0000.sl2", parent, fd.cFileName);
+        if (fd.cFileName[0] != '.' && exists(probe)) {
+            snprintf(out, cap, "%s\\%s", parent, fd.cFileName);
+            found = 1;
+        }
+    } while (!found && FindNextFileA(h, &fd));
+    FindClose(h);
+    return found;
+#else
+    DIR *d = opendir(parent);
+    if (!d) return 0;
+    int found = 0;
+    for (struct dirent *e; !found && (e = readdir(d));) {
+        snprintf(probe, sizeof probe, "%s/%s/NR0000.sl2", parent, e->d_name);
+        if (e->d_name[0] != '.' && exists(probe)) {
+            snprintf(out, cap, "%s/%s", parent, e->d_name);
+            found = 1;
+        }
+    }
+    closedir(d);
+    return found;
+#endif
+}
+
+int core_find_save_dir(const char *game_dir, char *out, size_t cap) {
+    char parent[1100];
+#ifdef _WIN32
+    (void)game_dir;
+    const char *appdata = getenv("APPDATA");
+    if (!appdata) return 0;
+    snprintf(parent, sizeof parent, "%s\\Nightreign", appdata);
+#else
+    // Under Proton the save is inside the game's compatibility prefix, in the same Steam library.
+    const char *tail = strstr(game_dir, "/steamapps/common/");
+    if (!tail) return 0;
+    snprintf(parent, sizeof parent, "%.*s/steamapps/compatdata/" STEAM_APP_ID
+             "/pfx/drive_c/users/steamuser/AppData/Roaming/Nightreign", (int)(tail - game_dir), game_dir);
+#endif
+    return find_save_under(parent, out, cap);
+}
+
+// --- the four actions -------------------------------------------------------------------------------------------
+
+static void remove_tree(const char *dir);
+
+int core_backup_save(const char *save_dir) {
+    static const char *names[] = {"NR0000.sl2", "NR0000.sl2.bak", MOD_SAVE_NAME, MOD_SAVE_NAME ".bak"};
+    char stamp[32], from[1300], to[1300];
+    time_t now = time(NULL);
+    strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", localtime(&now));
+    int copied = 0;
+    for (size_t i = 0; i < sizeof names / sizeof *names; i++) {
+        snprintf(from, sizeof from, "%s" SEP "%s", save_dir, names[i]);
+        snprintf(to, sizeof to, "%s" SEP "work" SEP "backups" SEP "%s" SEP "%s", g_app, stamp, names[i]);
+        if (exists(from)) {
+            if (!copy_file(from, to)) return logf_("backup failed for %s", names[i]), 0;
+            copied++;
+        }
+    }
+    if (!copied) return logf_("no save file found in %s", save_dir), 0;
+    logf_("Save backed up (%d files) to work" SEP "backups" SEP "%s", copied, stamp);
+    return 1;
+}
+
+static int build_talk(const char *game_dir, buf bhd, const char *bdt) {
+    char path[1300];
+    buf dcx = archive_read(bhd, bdt, TALK_BUNDLE);
+    if (!dcx.p) return logf_("talk script bundle not found in the game archive"), 0;
+    buf bundle = dcx_read(game_dir, dcx);
+    free(dcx.p);
+    if (!bundle.p) return 0;
+    int index = bnd4_find(bundle, TALK_SCRIPT);
+    if (index < 0) return logf_("table script not found in the bundle"), 0;
+    snprintf(path, sizeof path, "%s" SEP "data" SEP "t600001000.delta", g_app);
+    buf delta = read_file(path);
+    if (!delta.p) return logf_("missing %s", path), 0;
+    buf script = delta_apply(bnd4_file(bundle, index), delta);
+    free(delta.p);
+    if (!script.p) return 0;
+    buf patched = bnd4_replace(bundle, index, script), out = dcx_write(patched);
+    snprintf(path, sizeof path, "%s" SEP "work" SEP "build" SEP "script" SEP "talk" SEP "m10_00_00_00.talkesdbnd.dcx", g_app);
+    int ok = write_file(path, out.p, out.n);
+    free(script.p); free(patched.p); free(out.p); free(bundle.p);
+    if (ok) logf_("Table menu script built");
+    return ok;
+}
+
+static int build_text(const char *game_dir, buf bhd, const char *bdt, const char *lang) {
+    char path[1300];
+    snprintf(path, sizeof path, "/msg/%s/menu_dlc01.msgbnd.dcx", lang);
+    buf dcx = archive_read(bhd, bdt, path);
+    if (!dcx.p) return -1;  // language not installed
+    buf bundle = dcx_read(game_dir, dcx);
+    free(dcx.p);
+    if (!bundle.p) return 0;
+    int source = bnd4_find(bundle, TEXT_SOURCE_FMG), target = bnd4_find(bundle, TEXT_TARGET_FMG);
+    fmg src = {0}, dst = {0};
+    if (source < 0 || target < 0 || !fmg_parse(bnd4_file(bundle, source), &src) || !fmg_parse(bnd4_file(bundle, target), &dst))
+        return logf_("%s: unexpected text bundle layout", lang), 0;
+
+    // "Commence expedition": the game's own prompt in this language, without surrounding spaces.
+    static const u8 fallback[] = {'E', 0, 'x', 0, 'p', 0, 'e', 0, 'd', 0, 'i', 0, 't', 0, 'i', 0, 'o', 0, 'n', 0};
+    const fmg_entry *e = fmg_get(&src, TEXT_SOURCE_ID);
+    const u8 *text = e && e->text ? e->text : fallback;
+    size_t bytes = e && e->text ? e->bytes : sizeof fallback;
+    // (some languages pad it with a normal or a non-breaking space)
+    while (bytes >= 2 && (text[0] == ' ' || text[0] == 0xA0) && !text[1]) { text += 2; bytes -= 2; }
+    while (bytes >= 2 && (text[bytes - 2] == ' ' || text[bytes - 2] == 0xA0) && !text[bytes - 1]) bytes -= 2;
+    fmg_set(&dst, TEXT_EXPEDITION, text, bytes);
+
+    u8 wide[OUR_TEXT_COUNT][128];
+    for (size_t i = 0; i < OUR_TEXT_COUNT; i++) {
+        const char *line = !strcmp(lang, "polpl") ? OUR_TEXT[i].polish : OUR_TEXT[i].english;
+        fmg_set(&dst, OUR_TEXT[i].id, wide[i], utf8_to_utf16(line, wide[i]));
+    }
+
+    buf table = fmg_write(&dst), patched = bnd4_replace(bundle, target, table), out = dcx_write(patched);
+    snprintf(path, sizeof path, "%s" SEP "work" SEP "build" SEP "msg" SEP "%s" SEP "menu_dlc01.msgbnd.dcx", g_app, lang);
+    int ok = write_file(path, out.p, out.n);
+    free(src.e); free(dst.e); free(table.p); free(patched.p); free(out.p); free(bundle.p);
+    return ok;
+}
+
+static int write_profile(void) {
+    char path[1300], seamless[1300];
+    snprintf(path, sizeof path, "%s" SEP "work" SEP "invasion.me3", g_app);
+    snprintf(seamless, sizeof seamless, "%s" SEP "SeamlessCoop" SEP "nrsc.dll", g_app);
+    make_parents(path);
+    FILE *f = fopen(path, "w");
+    if (!f) return logf_("cannot write %s", path), 0;
+    fprintf(f, "profileVersion = \"v1\"\n");
+    // Seamless Co-op keeps its own save file; without it the mod uses a save of its own.
+    if (!exists(seamless)) fprintf(f, "savefile = \"" MOD_SAVE_NAME "\"\n");
+    fprintf(f, "\n[[supports]]\ngame = \"nightreign\"\n\n[[packages]]\npath = \"build\"\n");
+    if (exists(seamless)) {
+        fprintf(f, "\n[[natives]]\npath = \"../SeamlessCoop/nrsc.dll\"\nload_early = true\n");
+        logf_("Seamless Co-op found next to the launcher: it will be loaded too");
+    }
+    fprintf(f, "\n[[natives]]\npath = \"native/invasion.dll\"\n");
+    fclose(f);
+    return 1;
+}
+
+int core_build(const char *game_dir) {
+    char bhd_path[1100], bdt_path[1100], from[1300], to[1300];
+    if (!core_check_game(game_dir)) return logf_("This is not the game's folder: %s", game_dir), 0;
+    snprintf(bhd_path, sizeof bhd_path, "%s" SEP "data0.bhd", game_dir);
+    snprintf(bdt_path, sizeof bdt_path, "%s" SEP "data0.bdt", game_dir);
+    logf_("Reading the game archive...");
+    rsa_init();
+    aes_init();
+    buf enc = read_file(bhd_path);
+    if (!enc.p) return logf_("cannot read %s", bhd_path), 0;
+    // Nothing to do if the game archive and the mod's own files are the ones we built from last time.
+    char stamp_path[1300], stamp[40];
+    snprintf(stamp_path, sizeof stamp_path, "%s" SEP "work" SEP "build.stamp", g_app);
+    snprintf(from, sizeof from, "%s" SEP "data" SEP "t600001000.delta", g_app);
+    buf delta = read_file(from);
+    snprintf(from, sizeof from, "%s" SEP "data" SEP "invasion.dll", g_app);
+    buf dll = read_file(from);
+    snprintf(stamp, sizeof stamp, "%016llx%016llx", (unsigned long long)fnv1a64(enc.p, enc.n),
+             (unsigned long long)(fnv1a64(delta.p, delta.n) ^ fnv1a64(dll.p, dll.n) * 31));
+    free(delta.p); free(dll.p);
+    buf old_stamp = read_file(stamp_path);
+    int same = old_stamp.n == 32 && !memcmp(old_stamp.p, stamp, 32);
+    free(old_stamp.p);
+    snprintf(to, sizeof to, "%s" SEP "work" SEP "build" SEP "script" SEP "talk" SEP "m10_00_00_00.talkesdbnd.dcx", g_app);
+    if (same && exists(to)) {
+        free(enc.p);
+        logf_("Mod files are up to date");
+        return write_profile();
+    }
+    remove(stamp_path);
+    buf bhd = rsa_decrypt(enc);
+    free(enc.p);
+    if (memcmp(bhd.p, "BHD5", 4))
+        return logf_("The game archive could not be read. The game may have been updated; the mod needs an update too."), 0;
+
+    int ok = build_talk(game_dir, bhd, bdt_path), langs = 0;
+    for (size_t i = 0; ok && i < sizeof LANGS / sizeof *LANGS; i++) {
+        int r = build_text(game_dir, bhd, bdt_path, LANGS[i]);
+        if (r == 0) ok = 0;
+        if (r > 0) langs++;
+    }
+    free(bhd.p);
+    if (!ok) return 0;
+    logf_("Menu texts built for %d languages", langs);
+
+    snprintf(from, sizeof from, "%s" SEP "data" SEP "invasion.dll", g_app);
+    snprintf(to, sizeof to, "%s" SEP "work" SEP "native" SEP "invasion.dll", g_app);
+    if (!copy_file(from, to)) return logf_("missing %s", from), 0;
+    if (!write_profile()) return 0;
+    write_file(stamp_path, (const u8 *)stamp, 32);
+#ifndef _WIN32
+    snprintf(to, sizeof to, "%s/work/wineprefix", g_app);  // only needed for unpacking; it is large
+    remove_tree(to);
+#endif
+    logf_("Mod files are ready");
+    return 1;
+}
+
+int core_launch(void) {
+    char profile[1300], me3[1300];
+    snprintf(profile, sizeof profile, "%s" SEP "work" SEP "invasion.me3", g_app);
+    if (!exists(profile)) return logf_("Build the mod files first"), 0;
+#ifdef _WIN32
+    char cmd[4000];
+    snprintf(me3, sizeof me3, "%s\\me3\\bin\\me3.exe", g_app);
+    if (!exists(me3)) return logf_("missing %s", me3), 0;
+    snprintf(cmd, sizeof cmd, "\"%s\" launch -g nightreign -p \"%s\"", me3, profile);
+    STARTUPINFOA si = {sizeof si};
+    PROCESS_INFORMATION pi;
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+        return logf_("could not start me3 (error %lu)", GetLastError()), 0;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+#else
+    char win64[1300];
+    snprintf(me3, sizeof me3, "%s/me3/bin/me3", g_app);
+    snprintf(win64, sizeof win64, "%s/me3/bin/win64", g_app);
+    if (!exists(me3)) return logf_("missing %s", me3), 0;
+    char *argv[] = {me3, "--windows-binaries-dir", win64, "launch", "-g", "nightreign", "-p", profile, NULL};
+    pid_t pid;
+    if (posix_spawn(&pid, me3, NULL, NULL, argv, environ)) return logf_("could not start me3"), 0;
+#endif
+    logf_("Game is starting through me3 (Steam must be running)");
+    return 1;
+}
+
+int core_uninstall(const char *save_dir) {
+    char path[1300];
+    static const char *parts[] = {"build", "native", "wineprefix"};
+    snprintf(path, sizeof path, "%s" SEP "work" SEP "build.stamp", g_app);
+    remove(path);
+    for (size_t i = 0; i < sizeof parts / sizeof *parts; i++) {
+        snprintf(path, sizeof path, "%s" SEP "work" SEP "%s", g_app, parts[i]);
+        remove_tree(path);
+    }
+    snprintf(path, sizeof path, "%s" SEP "work" SEP "invasion.me3", g_app);
+    remove(path);
+    if (save_dir && *save_dir) {
+        snprintf(path, sizeof path, "%s" SEP MOD_SAVE_NAME, save_dir);
+        remove(path);
+        snprintf(path, sizeof path, "%s" SEP MOD_SAVE_NAME ".bak", save_dir);
+        remove(path);
+    }
+    logf_("Mod files removed. Your normal save and the backups were not touched.");
+    return 1;
+}
+
+static void remove_tree(const char *dir) {
+    char path[1400];
+#ifdef _WIN32
+    char pattern[1400];
+    snprintf(pattern, sizeof pattern, "%s\\*", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+        snprintf(path, sizeof path, "%s\\%s", dir, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) remove_tree(path);
+        else DeleteFileA(path);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    RemoveDirectoryA(dir);
+#else
+    DIR *d = opendir(dir);
+    if (!d) return;
+    for (struct dirent *e; (e = readdir(d));) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+        struct stat st;
+        if (!lstat(path, &st) && S_ISDIR(st.st_mode)) remove_tree(path);
+        else unlink(path);
+    }
+    closedir(d);
+    rmdir(dir);
+#endif
+}
+
+// --- self-check ----------------------------------------------------------------------------------------------------
+
+int core_selftest(void) {
+    int ok = 1;
+    // AES-128, FIPS-197 appendix C.1.
+    aes_init();
+    u8 key[16], block[16] = {0x69, 0xc4, 0xe0, 0xd8, 0x6a, 0x7b, 0x04, 0x30, 0xd8, 0xcd, 0xb7, 0x80, 0x70, 0xb4, 0xc5, 0x5a};
+    u8 rk[176];
+    for (int i = 0; i < 16; i++) key[i] = (u8)i;
+    aes_expand(key, rk);
+    aes_decrypt_block(rk, block);
+    for (int i = 0; i < 16; i++) if (block[i] != (u8)(i * 0x11)) ok = 0;
+    if (!ok) logf_("selftest: AES failed");
+
+    // RSA: (m^e mod n) for m = 2 must equal 2^e reduced the slow way; check m = 1 and Montgomery identity.
+    rsa_init();
+    u8 one[256] = {0}, out[255];
+    one[255] = 1;
+    rsa_block(one, out);
+    for (int i = 0; i < 254; i++) if (out[i]) ok = 0;
+    if (out[254] != 1) ok = 0;
+    if (!ok) logf_("selftest: RSA failed");
+
+    // FMG: build, add, write, parse.
+    fmg f = {xalloc(8 * sizeof(fmg_entry)), 0, 8};
+    u8 a[16], b[16];
+    fmg_set(&f, 10, a, utf8_to_utf16("ten", a));
+    fmg_set(&f, 5, b, utf8_to_utf16("pi\xc4\x99\xc4\x87", b));
+    fmg_set(&f, 11, NULL, 0);
+    buf w = fmg_write(&f);
+    fmg g = {0};
+    if (!fmg_parse(w, &g) || g.n != 3 || g.e[0].id != 5 || g.e[0].bytes != 8 || g.e[1].id != 10 ||
+        memcmp(g.e[1].text, a, 6) || g.e[2].text) { ok = 0; logf_("selftest: FMG failed"); }
+
+    // DCX writer: header fields and adler of a known string ("Wikipedia" -> 0x11E60398).
+    buf raw = {(u8 *)"Wikipedia", 9}, d = dcx_write(raw);
+    if (be32(d.p + 0x1C) != 9 || be32(d.p + d.n - 4) != 0x11E60398 || memcmp(d.p + 0x4C + 7, "Wikipedia", 9)) {
+        ok = 0;
+        logf_("selftest: DCX failed");
+    }
+    free(f.e); free(g.e); free(w.p); free(d.p);
+    if (ok) logf_("selftest ok");
+    return ok;
+}
