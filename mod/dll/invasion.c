@@ -5,7 +5,9 @@
 //     and how many invaders the current squad would allow;
 //   - adds an "Invasion" entry to the expedition menu's Target list (row 101 of NightBossMenuParam,
 //     which must exist in regulation.bin: mod/build_regulation.py, or the launcher) and a fourth
-//     entry to the "Number of Players" option.
+//     entry to the "Number of Players" option;
+//   - cancels the expedition start when that Invasion entry is the chosen target (and logs what
+//     was chosen); the search for a session to invade is not implemented yet.
 //
 // ponytail: addresses are hard-coded for nightreign.exe 1.3.3 (PE timestamp below) and the DLL does
 // nothing on any other build. Replace with signature scans when a second game version has to work.
@@ -249,6 +251,85 @@ static void hook_players_option(void) {
 
 // --- entry -----------------------------------------------------------------------------------------
 
+// --- Expedition start ---------------------------------------------------------------------------
+//
+// CS::CSQuickMatchingCtrl is the step machine behind "Begin expedition". Its step table (16-byte
+// entries: function, name) sits in writable data; a step's function runs every frame while the
+// machine is in that step. We wrap the steps a start goes through first, solo and with matchmaking,
+// and when the chosen target is our Invasion row we send the machine back to its idle step instead
+// of letting an expedition begin.
+// ponytail: nothing searches for a session yet; that goes where the log line is.
+#define RVA_QM_STEP_TABLE        0x39ae9d0
+#define QM_STEP_NONE             0
+#define QM_CTRL_CONTEXT          0xa8       // CS::CSQuickMatchLobbyContext*
+#define QM_CTRL_VT_SET_STEP      4          // void (ctrl*, int step); the game calls it with 0 on failure
+#define RVA_QM_CONTEXT_VTABLE    0x2c75d20
+#define QM_CTX_PLAYERS           0x98       // u32 (meaning to be confirmed from logs)
+#define QM_CTX_TARGETS_BEGIN     0xa8       // vector of u32 NightBossMenuParam row ids: begin, end (+8)
+#define QM_CTX_TARGET_INDEX      0x178      // u32 index into that vector
+
+typedef void (*step_fn)(void *ctrl, void *time);
+static struct { int index; unsigned rva; const char *name; step_fn original; DWORD last_tick; } g_steps[] = {
+    {1, 0xb59880, "SearchRegister", NULL, 0},
+    {12, 0xb5c010, "SingleStart", NULL, 0},
+    {16, 0xb5ac50, "SingleHeroReSelect", NULL, 0},
+    {18, 0xb5b850, "SingleSetup", NULL, 0},
+};
+
+// 1 if the expedition being started has our Invasion row among its targets.
+static int invasion_chosen(char *ctrl, const char *step, int log_it) {
+    char *ctx = *(char **)(ctrl + QM_CTRL_CONTEXT);
+    if (!ctx || *(char **)ctx != g_base + RVA_QM_CONTEXT_VTABLE) {
+        if (log_it) logf("start (%s): unexpected context object, leaving the game alone", step);
+        return 0;
+    }
+    unsigned *begin = *(unsigned **)(ctx + QM_CTX_TARGETS_BEGIN), *end = *(unsigned **)(ctx + QM_CTX_TARGETS_BEGIN + 8);
+    size_t count = begin && end >= begin ? (size_t)(end - begin) : 0;
+    if (count > 64) count = 0;
+    char list[400] = "";
+    int ours = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (begin[i] == INVASION_ROW) ours = 1;
+        snprintf(list + strlen(list), sizeof list - strlen(list), "%s%u", i ? "," : "", begin[i]);
+    }
+    if (log_it)
+        logf("start (%s): targets [%s] index %u, players field %u", step, list,
+             *(unsigned *)(ctx + QM_CTX_TARGET_INDEX), *(unsigned *)(ctx + QM_CTX_PLAYERS));
+    return ours;
+}
+
+static void step_hook(int slot, void *ctrl, void *time) {
+    DWORD now = GetTickCount();
+    int entered = now - g_steps[slot].last_tick > 1000;  // first frame of this step
+    g_steps[slot].last_tick = now;
+    if (invasion_chosen(ctrl, g_steps[slot].name, entered)) {
+        if (entered) logf("invasion: chosen as the target, expedition start cancelled (search not implemented yet)");
+        void **vt = *(void ***)ctrl;
+        ((void (*)(void *, int))vt[QM_CTRL_VT_SET_STEP])(ctrl, QM_STEP_NONE);
+        return;
+    }
+    g_steps[slot].original(ctrl, time);
+}
+static void step_hook_0(void *c, void *t) { step_hook(0, c, t); }
+static void step_hook_1(void *c, void *t) { step_hook(1, c, t); }
+static void step_hook_2(void *c, void *t) { step_hook(2, c, t); }
+static void step_hook_3(void *c, void *t) { step_hook(3, c, t); }
+
+static void hook_expedition_start(void) {
+    static const step_fn hooks[] = {step_hook_0, step_hook_1, step_hook_2, step_hook_3};
+    step_fn *table = (step_fn *)(g_base + RVA_QM_STEP_TABLE);
+    for (int i = 0; i < 4; i++)
+        if (table[g_steps[i].index * 2] != (step_fn)(g_base + g_steps[i].rva)) {
+            logf("expedition start: step table does not look as expected, not hooking");
+            return;
+        }
+    for (int i = 0; i < 4; i++) {
+        g_steps[i].original = table[g_steps[i].index * 2];
+        table[g_steps[i].index * 2] = hooks[i];
+    }
+    logf("expedition start: hooked");
+}
+
 static DWORD WINAPI run(LPVOID self) {
     // Log next to the DLL, so it is easy to find from outside the game.
     GetModuleFileNameA((HMODULE)self, log_path, MAX_PATH);
@@ -264,6 +345,7 @@ static DWORD WINAPI run(LPVOID self) {
     logf("loaded, game base %p", g_base);
     hook_target_list();
     hook_players_option();
+    hook_expedition_start();
     for (;;) {
         Sleep(250);
         watch_session();
