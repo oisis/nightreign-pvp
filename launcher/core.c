@@ -38,7 +38,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 3
+#define BUILD_FORMAT 4
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
                               "porbr", "rusru", "spaar", "spaes", "thath", "zhocn", "zhotw"};
@@ -689,7 +689,7 @@ static size_t utf8_to_utf16(const char *s, u8 *out) {
 
 // --- finding the game and the save ----------------------------------------------------------------------------
 
-// --- regulation.bin: the game's params, AES-256-CBC around a zstd DCX around a BND4 ----------------------------
+// --- regulation.bin: the game's params, AES-256-CBC around a DCX (zstd in the game's file) around a BND4 -------
 
 // The regulation key is public knowledge (Smithbox).
 static const u8 REGULATION_KEY[32] = {
@@ -771,27 +771,6 @@ static buf param_add_row(buf p) {
     return out;
 }
 
-// A zstd frame made of raw (uncompressed) blocks, with a 64 KB window and no content size: the
-// frame shape Smithbox writes, which the game is known to load.
-// ponytail: no compression, regulation.bin grows to its raw size (about 55 MB). Add a real
-// compressor if disk use ever matters.
-static buf zstd_store(buf raw) {
-    size_t blocks = (raw.n + 65535) / 65536;
-    buf out = {xalloc(6 + blocks * 3 + raw.n), 0};
-    static const u8 head[6] = {0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x30};
-    memcpy(out.p, head, 6);
-    out.n = 6;
-    for (size_t pos = 0; pos < raw.n;) {
-        size_t n = raw.n - pos > 65536 ? 65536 : raw.n - pos;
-        u32 h = (u32)n << 3 | (pos + n == raw.n);
-        out.p[out.n++] = (u8)h; out.p[out.n++] = (u8)(h >> 8); out.p[out.n++] = (u8)(h >> 16);
-        memcpy(out.p + out.n, raw.p + pos, n);
-        out.n += n;
-        pos += n;
-    }
-    return out;
-}
-
 // game's regulation.bin -> work/build/regulation.bin with our Target list row.
 static int build_regulation(const char *game_dir) {
     char path[1300];
@@ -817,16 +796,16 @@ static int build_regulation(const char *game_dir) {
     } else if ((index = bnd4_find(bundle, TARGET_PARAM)) < 0 || !(param = param_add_row(bnd4_file(bundle, index))).p) {
         logf_("The game's Target list looks different than expected. The game may have been updated; the mod needs an update too.");
     } else {
+        // Written as a zlib DCX, like our other files (the launcher has no zstd compressor). It has
+        // to be compressed: the game crashes at start-up on a 55 MB regulation.bin of stored zstd
+        // blocks. ponytail: unlike the game's own file this is not zstd; if the game ever stops
+        // taking zlib here, a zstd compressor is the upgrade path.
         patched = bnd4_replace(bundle, index, param);
-        body = zstd_store(patched);
-        size_t plain = 0x4C + body.n, padded = (plain + 15) / 16 * 16;
+        body = dcx_write(patched);
+        size_t padded = (body.n + 15) / 16 * 16;
         buf out = {xalloc(16 + padded), 16 + padded};
         memcpy(out.p, iv, 16);
-        memcpy(out.p + 16, dcx, 0x4C);  // the game's DCX header with our sizes
-        wbe32(out.p + 16 + 0x1C, (u32)patched.n);
-        wbe32(out.p + 16 + 0x20, (u32)body.n);
-        out.p[16 + 0x30] = 15;  // compression level field, as in the developer build that is known to load
-        memcpy(out.p + 16 + 0x4C, body.p, body.n);
+        memcpy(out.p + 16, body.p, body.n);
         for (size_t at = 16; at < out.n; at += 16) {
             for (int i = 0; i < 16; i++) out.p[at + i] ^= out.p[at - 16 + i];
             aes_encrypt_block(rk, 14, out.p + at);
@@ -1304,16 +1283,14 @@ int core_selftest(void) {
     for (int i = 0; i < 16; i++) if (block[i] != (u8)(i * 0x11)) ok = 0;
     if (!ok) logf_("selftest: AES failed");
 
-    // zstd: our stored frame must come back through the real decoder (two blocks).
-    buf big = {xalloc(70000), 70000};
-    for (size_t i = 0; i < big.n; i++) big.p[i] = (u8)(i * 31 + i / 251);
-    buf frame = zstd_store(big);
-    u8 *back = xalloc(big.n + (1 << 17));
-    if (nr_zstd_decompress(frame.p, frame.n, back, big.n + (1 << 17)) != big.n || memcmp(back, big.p, big.n)) {
+    // zstd decoder: a frame with one raw block holding "abc".
+    static const u8 frame[] = {0x28, 0xB5, 0x2F, 0xFD, 0x20, 0x03, 0x19, 0x00, 0x00, 'a', 'b', 'c'};
+    u8 *back = xalloc(3 + (1 << 17));
+    if (nr_zstd_decompress(frame, sizeof frame, back, 3 + (1 << 17)) != 3 || memcmp(back, "abc", 3)) {
         ok = 0;
         logf_("selftest: zstd failed");
     }
-    free(big.p); free(frame.p); free(back);
+    free(back);
 
     // RSA: (m^e mod n) for m = 2 must equal 2^e reduced the slow way; check m = 1 and Montgomery identity.
     rsa_init();
