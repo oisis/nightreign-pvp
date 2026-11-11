@@ -134,6 +134,15 @@ static void create_boss_list_hook(void *dialog) {
         memcpy(end - 0x50, tmp, 0x28);
     }
     logf("target list: Invasion entry added, %u items", count);
+    // Diagnostics for the eleven-places limit: what kind of object is the list view at dialog+0xff0
+    // (its vtable, as an RVA to look up in the disassembly) and what its header fields hold.
+    char *view = (char *)dialog + 0xff0;
+    logf("target view: vtable rva=%llx", (unsigned long long)(*(char **)view - g_base));
+    for (unsigned off = 0x08; off < 0x140; off += 0x20)
+        logf("target view:   +%03x: %08x %08x %08x %08x %08x %08x %08x %08x", off,
+             *(unsigned *)(view + off), *(unsigned *)(view + off + 4), *(unsigned *)(view + off + 8),
+             *(unsigned *)(view + off + 12), *(unsigned *)(view + off + 16), *(unsigned *)(view + off + 20),
+             *(unsigned *)(view + off + 24), *(unsigned *)(view + off + 28));
     for (unsigned i = 0; i < count && i < 32; i++) {
         char *it = begin + i * 0x28;
         logf("target list:   [%u] id=%d row=%p flags=%02x %02x %02x %02x", i, *(int *)(it + 0x10),
