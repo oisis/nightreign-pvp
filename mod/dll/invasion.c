@@ -114,7 +114,7 @@ static void watch_session(void) {
 
 #ifdef TARGET_MENU
 // Runs in place of the game's call to _CreateBossList: let the game build its list (Nightlords from
-// fixed row numbers), then append our row the same way the game appends its own.
+// fixed row numbers), then add our row the same way the game adds its own, and move it to the top.
 static void create_boss_list_hook(void *dialog) {
     ((void (*)(void *))(g_base + RVA_CREATE_BOSS_LIST))(dialog);
     _Alignas(16) char item[0x40];  // a MatchingNightBossViewItem is 0x28 bytes
@@ -127,6 +127,14 @@ static void create_boss_list_hook(void *dialog) {
     char *list = (char *)dialog + DIALOG_BOSS_LIST;
     char *begin = *(char **)(list + 0x10), *end = *(char **)(list + 0x18);
     unsigned count = begin && end >= begin ? (unsigned)((end - begin) / 0x28) : 0;
+    // Our entry goes first (user's choice): it was appended last, so rotate it to the front.
+    // Items are plain data (vtable, id, flags, param row), safe to move as bytes.
+    if (count >= 2 && *(int *)(end - 0x28 + 0x10) == INVASION_ROW) {
+        char ours[0x28];
+        memcpy(ours, end - 0x28, 0x28);
+        memmove(begin + 0x28, begin, (size_t)(count - 1) * 0x28);
+        memcpy(begin, ours, 0x28);
+    }
     ((void (*)(void *, unsigned))(g_base + RVA_GRID_SET_ITEM_COUNT))((char *)dialog + DIALOG_BOSS_GRID, count);
     logf("target list: Invasion entry added, %u items", count);
 }

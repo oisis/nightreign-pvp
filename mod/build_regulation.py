@@ -26,7 +26,7 @@ TEMPLATE_ROW, NEW_ROW = 100, 101
 # field values of the template row -> ours (each must occur exactly once in the row)
 CHANGES = {131150: 131160,   # expeditionNameId
            131151: 131161,   # descriptionId
-           300: 310,         # sortId: after The Deep of Night
+           300: 5,           # sortId: before the first Nightlord (the DLL also places it first)
            130: 0}           # unlockEventFlag: always available
 
 
