@@ -38,7 +38,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 4
+#define BUILD_FORMAT 5
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
                               "porbr", "rusru", "spaar", "spaes", "thath", "zhocn", "zhotw"};
@@ -52,6 +52,8 @@ static const struct { u32 id; const char *english, *polish; } OUR_TEXT[] = {
     {131161, "Enter another squad's expedition as an invader.\nDefeat its host to win.",
              "Wejd\xc5\xba do wyprawy innej dru\xc5\xbcyny jako naje\xc5\xba" "d\xc5\xba" "ca.\n"
              "Pokonaj hosta, aby wygra\xc4\x87."},
+    {131162, "Invasion chosen.\nSearching for an expedition to invade does not work in this version of the mod yet.",
+             "Wybrano najazd.\nSzukanie wyprawy do najechania nie dzia\xc5\x82" "a jeszcze w tej wersji moda."},
 };
 #define OUR_TEXT_COUNT (sizeof OUR_TEXT / sizeof *OUR_TEXT)
 

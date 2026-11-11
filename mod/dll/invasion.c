@@ -6,8 +6,8 @@
 //   - adds an "Invasion" entry to the expedition menu's Target list (row 101 of NightBossMenuParam,
 //     which must exist in regulation.bin: mod/build_regulation.py, or the launcher) and a fourth
 //     entry to the "Number of Players" option;
-//   - cancels the expedition start when that Invasion entry is the chosen target (and logs what
-//     was chosen); the search for a session to invade is not implemented yet.
+//   - cancels the expedition start when that Invasion entry is the chosen target, logs what was
+//     chosen and shows a notice; the search for a session to invade is not implemented yet.
 //
 // ponytail: addresses are hard-coded for nightreign.exe 1.3.3 (PE timestamp below) and the DLL does
 // nothing on any other build. Replace with signature scans when a second game version has to work.
@@ -303,6 +303,19 @@ static int invasion_chosen(char *ctrl, const char *step, int log_it) {
     return g_invasion_chosen;
 }
 
+// A message box with a line of ours, the way the game reports a failed matchmaking start
+// (0x60a1c0): build the text object from its id, hand it to the dialog function.
+// The text object is never destroyed (one small leak per notice).
+#define RVA_MENU_TEXT_CTOR 0x7ac800  // text* (text *out, int id): CL_MenuText line by id
+#define RVA_SHOW_DIALOG    0x86a7a0  // handle* (handle out[2], text*)
+#define TEXT_INVASION_NOTICE 131162  // added to CL_MenuText by build_msg.py / the launcher
+static void show_notice(int text_id) {
+    _Alignas(16) char text[0x100];
+    void *handle[2];
+    void *t = ((void *(*)(void *, int))(g_base + RVA_MENU_TEXT_CTOR))(text, text_id);
+    ((void *(*)(void *, void *))(g_base + RVA_SHOW_DIALOG))(handle, t);
+}
+
 static void step_hook(int slot, void *ctrl, void *time) {
     DWORD now = GetTickCount();
     int entered = now - g_steps[slot].last_tick > 1000;  // first frame of this step
@@ -311,6 +324,7 @@ static void step_hook(int slot, void *ctrl, void *time) {
         if (entered) logf("invasion: chosen as the target, expedition start cancelled (search not implemented yet)");
         void **vt = *(void ***)ctrl;
         ((void (*)(void *, int))vt[QM_CTRL_VT_SET_STEP])(ctrl, QM_STEP_NONE);
+        if (entered) show_notice(TEXT_INVASION_NOTICE);
         return;
     }
     g_steps[slot].original(ctrl, time);
