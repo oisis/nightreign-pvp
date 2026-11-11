@@ -33,13 +33,15 @@ done
 
 # Our Target list icon, drawn into the DLC icon atlas (high and low resolution sets).
 unkrak() { (cd "$B" && wine_run unkrak.exe "$(w "$OODLE")" "$(w "$1")" "$(w "$2")"); }
+set --
 for q in h l; do
   for kind in sblytbnd tpf; do
     unkrak "$W/analysis/gamefiles/menu/21_common_dlc01_$q.$kind.dcx" "$B/tmp/icons_$q.$kind"
   done
-  python3 "$R/mod/build_icon.py" "$B/tmp/icons_$q.sblytbnd" "$B/tmp/icons_$q.tpf" \
+  set -- "$@" "$B/tmp/icons_$q.sblytbnd" "$B/tmp/icons_$q.tpf" \
     "$B/menu/21_common_dlc01_$q.sblytbnd.dcx" "$B/menu/21_common_dlc01_$q.tpf.dcx"
 done
+python3 "$R/mod/build_icon.py" "$@"
 rm -rf "$B/tmp"
 find "$B" -maxdepth 2 \( -name '*.pdb' -o -name '*.lib' \) -delete
 echo "mod built in $B"

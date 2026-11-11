@@ -1,7 +1,9 @@
 """Target list icon for the "Invasion" entry: a group of four player outlines, blue with a red one in front.
 
-    python3 build_icon.py <sblytbnd raw> <tpf raw> <out sblytbnd.dcx> <out tpf.dcx>
+    python3 build_icon.py <sblytbnd raw> <tpf raw> <out sblytbnd.dcx> <out tpf.dcx> [four more ...]
     python3 build_icon.py --png <out.png>          just draw the icon
+
+Two sizes are added: the list icon and the large one shown in the description panel.
 
 Menu icons are sub-rectangles of big atlas textures; a ".layout" XML file per atlas names them
 ("MENU_MenuIcon_<id>.png"). We draw into an unused corner of the DLC atlas SB_MenuIcon_DLC01_0 and add
@@ -16,23 +18,25 @@ from functools import lru_cache
 from itertools import combinations
 from pathlib import Path
 
-from PIL import Image, ImageChops, ImageDraw, ImageFilter
+from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter
 
 sys.path.insert(0, str(Path(__file__).parent))
 from fsformats import bnd4_read, bnd4_replace, dcx_write_deflate
 
-ICON_ID = 41813          # next free id after the game's Target icons (41800-41812)
-SIZE = 248               # same as the Nightlord icons
+ICONS = {41813: 248,     # list icon: next free id after the game's 41800-41812, Nightlord icon size
+         41814: 460}     # large icon of the description panel, same size as the Nightlords' (41820...)
 ATLAS = "SB_MenuIcon_DLC01_0"
 DDS_HEADER = 148         # "DDS " + header + DX10 extension
 
 
 # --- drawing -------------------------------------------------------------------------------------
 
-def draw_icon():
-    """RGBA SIZE x SIZE: dark blue medallion, four figure outlines: three blue, the one in front red."""
-    k = 4                                     # supersampling
-    n = SIZE * k
+@lru_cache(maxsize=None)
+def draw_master():
+    """The icon at 4x the 248-pixel design size: dark blue medallion, four figure outlines, three blue
+    and the one in front red; toned down to sit next to the game's faded Nightlord icons."""
+    k = 4
+    n = 248 * k
     c = n // 2
 
     def disc(radius, blur=0):
@@ -75,7 +79,13 @@ def draw_icon():
     out.paste(flat((58, 74, 112, 255)), mask=rim)
     inner = ImageChops.subtract(disc(r - 9 * k), disc(r - 11 * k))
     out.paste(flat((40, 80, 170, 255)), mask=inner)
-    return out.resize((SIZE, SIZE), Image.LANCZOS)
+    rgb = ImageEnhance.Brightness(ImageEnhance.Color(out.convert("RGB")).enhance(0.6)).enhance(0.72)
+    rgb.putalpha(out.getchannel("A"))
+    return rgb
+
+
+def draw_icon(size):
+    return draw_master().resize((size, size), Image.LANCZOS)
 
 
 # --- BC7 -----------------------------------------------------------------------------------------
@@ -145,14 +155,13 @@ def tpf_textures(tpf):
     return out
 
 
-def free_spot(layout, width, height):
-    """Top-left corner of an unused SIZE square in the atlas, on the 4-pixel block grid."""
-    used = [tuple(map(int, m)) for m in
-            re.findall(r'<SubTexture [^>]*x="(\d+)" width="(\d+)" y="(\d+)" height="(\d+)"', layout)]
+def free_spot(used, size, width, height):
+    """Top-left corner of an unused size x size square in the atlas, on the 4-pixel block grid.
+    used: [(x, width, y, height)]."""
     pad = 4
-    for y in range(height - SIZE - pad, pad, -4):
-        for x in range(width - SIZE - pad, pad, -4):
-            if all(x + SIZE + pad <= ux or ux + uw + pad <= x or y + SIZE + pad <= uy or uy + uh + pad <= y
+    for y in range(height - size - pad, pad, -4):
+        for x in range(width - size - pad, pad, -4):
+            if all(x + size + pad <= ux or ux + uw + pad <= x or y + size + pad <= uy or uy + uh + pad <= y
                    for ux, uw, uy, uh in used):
                 return x, y
     raise RuntimeError("no room in the atlas")
@@ -161,9 +170,9 @@ def free_spot(layout, width, height):
 def main(bundle_path, tpf_path, out_bundle, out_tpf):
     bundle = Path(bundle_path).read_bytes()
     name, layout = next((n, b.decode()) for n, b in bnd4_read(bundle) if n.endswith(ATLAS + ".layout"))
-    assert f"_{ICON_ID}." not in layout
     width, height = map(int, re.search(r'<TextureAtlas [^>]*width="(\d+)" height="(\d+)"', layout).groups())
-    x, y = free_spot(layout, width, height)
+    used = [tuple(map(int, m)) for m in
+            re.findall(r'<SubTexture [^>]*x="(\d+)" width="(\d+)" y="(\d+)" height="(\d+)"', layout)]
 
     tpf = bytearray(Path(tpf_path).read_bytes())
     off, size = tpf_textures(tpf)[ATLAS]
@@ -171,35 +180,42 @@ def main(bundle_path, tpf_path, out_bundle, out_tpf):
     assert dds[84:88] == b"DX10" and struct.unpack_from("<I", dds, 128)[0] == 98, "expected a BC7 atlas"
     assert struct.unpack_from("<II", dds, 12) == (height, width) and size == DDS_HEADER + width * height
 
-    icon = draw_icon()
-    px = icon.load()
-    for by in range(SIZE // 4):
-        for bx in range(SIZE // 4):
-            block = tuple(px[bx * 4 + i % 4, by * 4 + i // 4] for i in range(16))
-            at = off + DDS_HEADER + ((y // 4 + by) * (width // 4) + x // 4 + bx) * 16
-            tpf[at:at + 16] = bc7_block(block)
+    placed = {}
+    for icon_id, side in ICONS.items():
+        assert f"_{icon_id}." not in layout
+        x, y = placed[icon_id] = free_spot(used, side, width, height)
+        used.append((x, side, y, side))
+        px = draw_icon(side).load()
+        for by in range(side // 4):
+            for bx in range(side // 4):
+                block = tuple(px[bx * 4 + i % 4, by * 4 + i // 4] for i in range(16))
+                at = off + DDS_HEADER + ((y // 4 + by) * (width // 4) + x // 4 + bx) * 16
+                tpf[at:at + 16] = bc7_block(block)
+        line = (f'\t<SubTexture name="MENU_MenuIcon_{icon_id}.png" x="{x}" width="{side}" y="{y}" height="{side}"'
+                f' originalWidth="{side}" originalHeight="{side}" half="0"/>\r\n')
+        layout = layout.replace("</TextureAtlas>", line + "</TextureAtlas>")
 
     # Check: decode the patched atlas the way a GPU would and compare with what we drew.
     atlas = Image.open(io.BytesIO(bytes(tpf[off:off + size]))).convert("RGBA")
-    got = atlas.crop((x, y, x + SIZE, y + SIZE))
-    black = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 255))   # compare as seen on a background
-    diff = ImageChops.difference(Image.alpha_composite(black, got), Image.alpha_composite(black, icon))
-    worst = max(hi for _, hi in diff.getextrema())
-    mean = sum(n * v for v, n in enumerate(diff.convert("L").histogram())) / SIZE ** 2
-    # single pixels where the red outline crosses a blue one are the weak spot of a one-line fit
-    assert mean < 3 and worst < 128, f"BC7 encoding is off: mean {mean:.1f}, worst {worst}"
+    for icon_id, (x, y) in placed.items():
+        side = ICONS[icon_id]
+        black = Image.new("RGBA", (side, side), (0, 0, 0, 255))   # compare as seen on a background
+        diff = ImageChops.difference(Image.alpha_composite(black, atlas.crop((x, y, x + side, y + side))),
+                                     Image.alpha_composite(black, draw_icon(side)))
+        worst = max(hi for _, hi in diff.getextrema())
+        mean = sum(n * v for v, n in enumerate(diff.convert("L").histogram())) / side ** 2
+        # single pixels where the red outline crosses a blue one are the weak spot of a one-line fit
+        assert mean < 3 and worst < 128, f"BC7 encoding is off: mean {mean:.1f}, worst {worst}"
+        print(f"icon {icon_id}: {side}x{side} at ({x}, {y}) in {ATLAS}, mean error {mean:.1f}")
 
-    line = (f'\t<SubTexture name="MENU_MenuIcon_{ICON_ID}.png" x="{x}" width="{SIZE}" y="{y}" height="{SIZE}"'
-            f' originalWidth="{SIZE}" originalHeight="{SIZE}" half="0"/>\r\n')
-    layout = layout.replace("</TextureAtlas>", line + "</TextureAtlas>")
     for path, data in ((out_bundle, bnd4_replace(bundle, {name: layout.encode()})), (out_tpf, bytes(tpf))):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         Path(path).write_bytes(dcx_write_deflate(data))
-    print(f"icon {ICON_ID}: {SIZE}x{SIZE} at ({x}, {y}) in {ATLAS}, mean error {mean:.1f}")
 
 
 if __name__ == "__main__":
     if sys.argv[1] == "--png":
-        draw_icon().save(sys.argv[2])
+        draw_icon(int(sys.argv[3]) if len(sys.argv) > 3 else 248).save(sys.argv[2])
     else:
-        main(*sys.argv[1:5])
+        for i in range(1, len(sys.argv), 4):   # one process for all sets: encoded blocks are cached
+            main(*sys.argv[i:i + 4])

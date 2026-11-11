@@ -31,6 +31,9 @@ CHANGES = {131150: 131160,   # expeditionNameId
            130: 0}           # unlockEventFlag: always available
 
 
+FIRST_LARGE_ICON, LARGE_ICON = 41820, 41814   # row 0's largeBossIconId; ours (build_icon.py)
+
+
 def add_row(param):
     """Append a copy of TEMPLATE_ROW as NEW_ROW. Layout: 0x40 header, 24-byte row descriptors
     (id, pad, data offset, name offset), row data, strings."""
@@ -48,6 +51,12 @@ def add_row(param):
         hits = [o for o in range(0, size - 3) if struct.unpack_from("<i", row, o)[0] == old]
         assert len(hits) == 1, f"value {old} found {len(hits)} times in the template row"
         struct.pack_into("<i", row, hits[0], new)
+    # largeBossIconId (-1 in the template, like several other fields): find the field in the first
+    # Nightlord's row, whose value is unique there.
+    first = param[rows[0][2]:rows[0][2] + size]
+    hits = [o for o in range(0, size - 3, 4) if struct.unpack_from("<i", first, o)[0] == FIRST_LARGE_ICON]
+    assert len(hits) == 1 and struct.unpack_from("<i", row, hits[0])[0] == -1
+    struct.pack_into("<i", row, hits[0], LARGE_ICON)
 
     shift = 24 + size  # one descriptor before the data, one row before the strings
     out = bytearray(param[:0x40])
