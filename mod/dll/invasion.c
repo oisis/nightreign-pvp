@@ -258,6 +258,11 @@ static void hook_players_option(void) {
 // machine is in that step. We wrap the steps a start goes through first, solo and with matchmaking,
 // and when the chosen target is our Invasion row we send the machine back to its idle step instead
 // of letting an expedition begin.
+//
+// The chosen Target rows reach the machine's context through 0xb67cc0, which converts each menu row
+// into a boss number (two lookups by row id, then a combine) and hands the result to the context's
+// "set targets" method. Our row converts to boss 0, so by then the choice is lost; we note it at the
+// first lookup instead.
 // ponytail: nothing searches for a session yet; that goes where the log line is.
 #define RVA_QM_STEP_TABLE        0x39ae9d0
 #define QM_STEP_NONE             0
@@ -276,7 +281,10 @@ static struct { int index; unsigned rva; const char *name; step_fn original; DWO
     {18, 0xb5b850, "SingleSetup", NULL, 0},
 };
 
-// 1 if the expedition being started has our Invasion row among its targets.
+static int g_saw_invasion_row;  // our row went through the conversion since the last "set targets"
+static int g_invasion_chosen;   // the targets now in the context came from our row
+
+// Logs what is about to start. Returns 1 if it is an invasion.
 static int invasion_chosen(char *ctrl, const char *step, int log_it) {
     char *ctx = *(char **)(ctrl + QM_CTRL_CONTEXT);
     if (!ctx || *(char **)ctx != g_base + RVA_QM_CONTEXT_VTABLE) {
@@ -287,15 +295,12 @@ static int invasion_chosen(char *ctrl, const char *step, int log_it) {
     size_t count = begin && end >= begin ? (size_t)(end - begin) : 0;
     if (count > 64) count = 0;
     char list[400] = "";
-    int ours = 0;
-    for (size_t i = 0; i < count; i++) {
-        if (begin[i] == INVASION_ROW) ours = 1;
+    for (size_t i = 0; i < count; i++)
         snprintf(list + strlen(list), sizeof list - strlen(list), "%s%u", i ? "," : "", begin[i]);
-    }
     if (log_it)
-        logf("start (%s): targets [%s] index %u, players field %u", step, list,
-             *(unsigned *)(ctx + QM_CTX_TARGET_INDEX), *(unsigned *)(ctx + QM_CTX_PLAYERS));
-    return ours;
+        logf("start (%s): bosses [%s] index %u, players %u, invasion %d", step, list,
+             *(unsigned *)(ctx + QM_CTX_TARGET_INDEX), *(unsigned *)(ctx + QM_CTX_PLAYERS), g_invasion_chosen);
+    return g_invasion_chosen;
 }
 
 static void step_hook(int slot, void *ctrl, void *time) {
@@ -315,7 +320,49 @@ static void step_hook_1(void *c, void *t) { step_hook(1, c, t); }
 static void step_hook_2(void *c, void *t) { step_hook(2, c, t); }
 static void step_hook_3(void *c, void *t) { step_hook(3, c, t); }
 
+// The context's "set targets" method (vtable slot 11): void (ctx*, src*), copying the u32 vector of
+// boss numbers at src+8 (begin) / src+0x10 (end).
+#define QM_CTX_VT_SET_TARGETS  11
+#define RVA_QM_CTX_SET_TARGETS 0xb45500
+static void set_targets_hook(char *ctx, char *src) {
+    g_invasion_chosen = g_saw_invasion_row;
+    g_saw_invasion_row = 0;
+    ((void (*)(char *, char *))(g_base + RVA_QM_CTX_SET_TARGETS))(ctx, src);
+}
+
+// First lookup of the row-to-boss conversion: "call 0xe7e1a0" with the menu row id in ecx.
+#define RVA_ROW_LOOKUP_CALL 0xb67e3a  // e8 61 63 31 00
+#define RVA_ROW_LOOKUP      0xe7e1a0
+static unsigned long long row_lookup_hook(unsigned row) {
+    if (row == INVASION_ROW) g_saw_invasion_row = 1;
+    return ((unsigned long long (*)(unsigned))(g_base + RVA_ROW_LOOKUP))(row);
+}
+
 static void hook_expedition_start(void) {
+    void **slot = (void **)(g_base + RVA_QM_CONTEXT_VTABLE) + QM_CTX_VT_SET_TARGETS;
+    DWORD old;
+    if (*slot == (void *)(g_base + RVA_QM_CTX_SET_TARGETS) && VirtualProtect(slot, 8, PAGE_READWRITE, &old)) {
+        *slot = (void *)set_targets_hook;
+        VirtualProtect(slot, 8, old, &old);
+    } else {
+        logf("expedition start: set-targets slot does not look as expected, not hooking");
+        return;
+    }
+    unsigned char *site = (unsigned char *)g_base + RVA_ROW_LOOKUP_CALL, *stub = near_alloc(12);
+    int expected = (int)(RVA_ROW_LOOKUP - (RVA_ROW_LOOKUP_CALL + 5));
+    if (site[0] != 0xE8 || memcmp(site + 1, &expected, 4) || !stub) {
+        logf("expedition start: row lookup call does not look as expected, not hooking");
+        return;
+    }
+    void *hook = (void *)row_lookup_hook;
+    stub[0] = 0x48; stub[1] = 0xB8;  // mov rax, hook; jmp rax
+    memcpy(stub + 2, &hook, 8);
+    stub[10] = 0xFF; stub[11] = 0xE0;
+    if (!patch_rel32(site + 1, site + 5, stub)) {
+        logf("expedition start: cannot patch the row lookup call");
+        return;
+    }
+
     static const step_fn hooks[] = {step_hook_0, step_hook_1, step_hook_2, step_hook_3};
     step_fn *table = (step_fn *)(g_base + RVA_QM_STEP_TABLE);
     for (int i = 0; i < 4; i++)
