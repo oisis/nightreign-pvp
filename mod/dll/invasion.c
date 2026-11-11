@@ -34,6 +34,8 @@
 #define RVA_BOSS_ITEM_PUSH        0x9e77c0  // void (dialog + 0x19a0, item*)
 #define RVA_BOSS_ITEM_DTOR        0x8dad70  // void (buf*)
 #define DIALOG_BOSS_LIST          0x19a0
+#define DIALOG_BOSS_GRID          0xff0     // CS::GridControl showing that list
+#define RVA_GRID_SET_ITEM_COUNT   0x77fc10  // void (GridControl*, u32 count)
 #define INVASION_ROW              101       // our row in NightBossMenuParam
 
 static char log_path[MAX_PATH];
@@ -119,36 +121,14 @@ static void create_boss_list_hook(void *dialog) {
     ((void *(*)(void *, int, unsigned char, unsigned char))(g_base + RVA_BOSS_ITEM_CTOR))(item, INVASION_ROW, 0, 0);
     ((void (*)(void *, void *))(g_base + RVA_BOSS_ITEM_PUSH))((char *)dialog + DIALOG_BOSS_LIST, item);
     ((void (*)(void *))(g_base + RVA_BOSS_ITEM_DTOR))(item);
-    // Diagnostics: the entry is in the list but the game does not draw it. An item whose param row
-    // pointer (+0x18) is null is drawn hidden, so log what every item of the list holds.
+    // The view (a CS::GridControl at dialog+0xff0) draws as many items as it was last told to, and
+    // it was told before our entry existed. Tell it again, the way the game does after building a
+    // list: SetItemCount(grid, list count).
     char *list = (char *)dialog + DIALOG_BOSS_LIST;
     char *begin = *(char **)(list + 0x10), *end = *(char **)(list + 0x18);
     unsigned count = begin && end >= begin ? (unsigned)((end - begin) / 0x28) : 0;
-    // Experiment: the list ends with "The Deep of Night" (id 100) and then our entry, and ours is not
-    // drawn. Swap the two: if ours then shows and the Deep of Night vanishes, the view has a fixed
-    // number of places and ours simply had none.
-    if (count >= 2 && *(int *)(end - 0x28 + 0x10) == INVASION_ROW && *(int *)(end - 0x50 + 0x10) == 100) {
-        char tmp[0x28];
-        memcpy(tmp, end - 0x28, 0x28);
-        memcpy(end - 0x28, end - 0x50, 0x28);
-        memcpy(end - 0x50, tmp, 0x28);
-    }
+    ((void (*)(void *, unsigned))(g_base + RVA_GRID_SET_ITEM_COUNT))((char *)dialog + DIALOG_BOSS_GRID, count);
     logf("target list: Invasion entry added, %u items", count);
-    // Diagnostics for the eleven-places limit: what kind of object is the list view at dialog+0xff0
-    // (its vtable, as an RVA to look up in the disassembly) and what its header fields hold.
-    char *view = (char *)dialog + 0xff0;
-    logf("target view: vtable rva=%llx", (unsigned long long)(*(char **)view - g_base));
-    for (unsigned off = 0x08; off < 0x140; off += 0x20)
-        logf("target view:   +%03x: %08x %08x %08x %08x %08x %08x %08x %08x", off,
-             *(unsigned *)(view + off), *(unsigned *)(view + off + 4), *(unsigned *)(view + off + 8),
-             *(unsigned *)(view + off + 12), *(unsigned *)(view + off + 16), *(unsigned *)(view + off + 20),
-             *(unsigned *)(view + off + 24), *(unsigned *)(view + off + 28));
-    for (unsigned i = 0; i < count && i < 32; i++) {
-        char *it = begin + i * 0x28;
-        logf("target list:   [%u] id=%d row=%p flags=%02x %02x %02x %02x", i, *(int *)(it + 0x10),
-             *(void **)(it + 0x18), (unsigned char)it[0x20], (unsigned char)it[0x21],
-             (unsigned char)it[0x22], (unsigned char)it[0x26]);
-    }
 }
 
 // Executable memory within +-2 GB of the game image, so rel32 calls and rip-relative loads in the
