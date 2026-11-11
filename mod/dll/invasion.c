@@ -28,14 +28,14 @@
 #define IMPL_VT_EXPORT_JOIN_DATA 0x40  // bool (impl*, u32 handle, void *buf, u32 *size)
 
 // Expedition menu, Target list (CS::MatchingBossSelectDialog::_CreateBossList and helpers).
-#define RVA_CREATE_BOSS_LIST_CALL 0x9e7fd3  // "call _CreateBossList", the only call site
-#define RVA_CREATE_BOSS_LIST      0x9e9330  // void (dialog*)
+// _CreateBossList (0x9e9330) fills the dialog's item list and ends with a tail jump that hands the
+// list to the grid: "jmp show(grid, list, 0, 0)". We hook that jump, so the grid, the cursor and the
+// description panel only ever see the list with our entry already in place.
+#define RVA_SHOW_BOSS_LIST_JMP    0x9e9b59  // e9 12 ba ff ff
+#define RVA_SHOW_BOSS_LIST        0x9e5570  // void (GridControl*, list*, 0, 0)
 #define RVA_BOSS_ITEM_CTOR        0x8dac40  // item* (buf*, int row, u8 enhanced, u8)
 #define RVA_BOSS_ITEM_PUSH        0x9e77c0  // void (dialog + 0x19a0, item*)
 #define RVA_BOSS_ITEM_DTOR        0x8dad70  // void (buf*)
-#define DIALOG_BOSS_LIST          0x19a0
-#define DIALOG_BOSS_GRID          0xff0     // CS::GridControl showing that list
-#define RVA_GRID_SET_ITEM_COUNT   0x77fc10  // void (GridControl*, u32 count)
 #define INVASION_ROW              101       // our row in NightBossMenuParam
 
 static char log_path[MAX_PATH];
@@ -115,16 +115,11 @@ static void watch_session(void) {
 #ifdef TARGET_MENU
 // Runs in place of the game's call to _CreateBossList: let the game build its list (Nightlords from
 // fixed row numbers), then add our row the same way the game adds its own, and move it to the top.
-static void create_boss_list_hook(void *dialog) {
-    ((void (*)(void *))(g_base + RVA_CREATE_BOSS_LIST))(dialog);
+static void show_boss_list_hook(void *grid, char *list, void *a3, void *a4) {
     _Alignas(16) char item[0x40];  // a MatchingNightBossViewItem is 0x28 bytes
     ((void *(*)(void *, int, unsigned char, unsigned char))(g_base + RVA_BOSS_ITEM_CTOR))(item, INVASION_ROW, 0, 0);
-    ((void (*)(void *, void *))(g_base + RVA_BOSS_ITEM_PUSH))((char *)dialog + DIALOG_BOSS_LIST, item);
+    ((void (*)(void *, void *))(g_base + RVA_BOSS_ITEM_PUSH))(list, item);
     ((void (*)(void *))(g_base + RVA_BOSS_ITEM_DTOR))(item);
-    // The view (a CS::GridControl at dialog+0xff0) draws as many items as it was last told to, and
-    // it was told before our entry existed. Tell it again, the way the game does after building a
-    // list: SetItemCount(grid, list count).
-    char *list = (char *)dialog + DIALOG_BOSS_LIST;
     char *begin = *(char **)(list + 0x10), *end = *(char **)(list + 0x18);
     unsigned count = begin && end >= begin ? (unsigned)((end - begin) / 0x28) : 0;
     // Our entry goes first (user's choice): it was appended last, so rotate it to the front.
@@ -135,8 +130,8 @@ static void create_boss_list_hook(void *dialog) {
         memmove(begin + 0x28, begin, (size_t)(count - 1) * 0x28);
         memcpy(begin, ours, 0x28);
     }
-    ((void (*)(void *, unsigned))(g_base + RVA_GRID_SET_ITEM_COUNT))((char *)dialog + DIALOG_BOSS_GRID, count);
     logf("target list: Invasion entry added, %u items", count);
+    ((void (*)(void *, void *, void *, void *))(g_base + RVA_SHOW_BOSS_LIST))(grid, list, a3, a4);
 }
 
 // Executable memory within +-2 GB of the game image, so rel32 calls and rip-relative loads in the
@@ -167,10 +162,10 @@ static int patch_rel32(unsigned char *field, unsigned char *next, unsigned char 
 // Point the game's one "call _CreateBossList" at our function, through a 12-byte stub:
 // mov rax, hook; jmp rax.
 static void hook_target_list(void) {
-    unsigned char *site = (unsigned char *)g_base + RVA_CREATE_BOSS_LIST_CALL;
-    int expected = (int)(RVA_CREATE_BOSS_LIST - (RVA_CREATE_BOSS_LIST_CALL + 5));
-    if (site[0] != 0xE8 || memcmp(site + 1, &expected, 4)) {
-        logf("target list: call site does not look as expected, not hooking");
+    unsigned char *site = (unsigned char *)g_base + RVA_SHOW_BOSS_LIST_JMP;
+    int expected = (int)(RVA_SHOW_BOSS_LIST - (RVA_SHOW_BOSS_LIST_JMP + 5));
+    if (site[0] != 0xE9 || memcmp(site + 1, &expected, 4)) {
+        logf("target list: jump site does not look as expected, not hooking");
         return;
     }
     unsigned char *stub = near_alloc(12);
@@ -178,12 +173,12 @@ static void hook_target_list(void) {
         logf("target list: no memory near the game image for the stub");
         return;
     }
-    void *hook = (void *)create_boss_list_hook;
+    void *hook = (void *)show_boss_list_hook;
     stub[0] = 0x48; stub[1] = 0xB8;
     memcpy(stub + 2, &hook, 8);
     stub[10] = 0xFF; stub[11] = 0xE0;
     if (patch_rel32(site + 1, site + 5, stub)) logf("target list: hooked (stub at %p)", (void *)stub);
-    else logf("target list: cannot patch the call site");
+    else logf("target list: cannot patch the jump site");
 }
 
 // --- "Number of Players": a fourth option --------------------------------------------------------
