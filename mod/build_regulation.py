@@ -69,11 +69,14 @@ def main(src, dst, no_row=False):
     # --no-row: repack without changing anything, to tell packing problems from param problems.
     patched = bundle if no_row else bnd4_replace(bundle, {PARAM: add_row(param)})
 
-    # Same frame shape as the game's file: 128 MB window, no content size in the frame header.
-    params = zstandard.ZstdCompressionParameters.from_level(19, window_log=27, write_content_size=False)
+    # Compress the way Smithbox does (level 15, 64 KB window, no content size in the frame header).
+    # Frames with a larger window, even ones that are otherwise valid, crash the game at start-up.
+    level = 15
+    params = zstandard.ZstdCompressionParameters.from_level(level, window_log=16, write_content_size=False)
     body = zstandard.ZstdCompressor(compression_params=params).compress(patched)
-    header = bytearray(dcx[:0x4C])  # same DCX (ZSTD) header as the game's, with the new sizes
+    header = bytearray(dcx[:0x4C])  # the game's DCX (ZSTD) header with our sizes and level
     struct.pack_into(">II", header, 0x1C, len(patched), len(body))
+    header[0x30] = level
     plain = bytes(header) + body
     plain += bytes(-len(plain) % 16)
     enc = Cipher(algorithms.AES(bytes.fromhex(KEYS["nr"])), modes.CBC(raw[:16])).encryptor()
