@@ -3,7 +3,7 @@
 # ///
 """Development build of regulation.bin with the "Invasion" entry in the expedition menu's Target list.
 
-    uv run build_regulation.py <game's regulation.bin> <out regulation.bin>
+    uv run build_regulation.py <game's regulation.bin> <out regulation.bin> [--no-row]
 
 The Target list is NightBossMenuParam. Row 100 is the game's own non-boss entry ("The Deep of Night");
 our row 101 is a copy of it with our texts (ids in CL_MenuText, added by build_msg.py).
@@ -61,14 +61,17 @@ def add_row(param):
     return bytes(out)
 
 
-def main(src, dst):
+def main(src, dst, no_row=False):
     raw = Path(src).read_bytes()
     dcx = decrypt(raw, KEYS["nr"])
     bundle = undcx(dcx)
     param = next(b for n, b in bnd4_read(bundle) if n.endswith(PARAM))
-    patched = bnd4_replace(bundle, {PARAM: add_row(param)})
+    # --no-row: repack without changing anything, to tell packing problems from param problems.
+    patched = bundle if no_row else bnd4_replace(bundle, {PARAM: add_row(param)})
 
-    body = zstandard.ZstdCompressor(level=15).compress(patched)
+    # Same frame shape as the game's file: 128 MB window, no content size in the frame header.
+    params = zstandard.ZstdCompressionParameters.from_level(19, window_log=27, write_content_size=False)
+    body = zstandard.ZstdCompressor(compression_params=params).compress(patched)
     header = bytearray(dcx[:0x4C])  # same DCX (ZSTD) header as the game's, with the new sizes
     struct.pack_into(">II", header, 0x1C, len(patched), len(body))
     plain = bytes(header) + body
@@ -81,11 +84,11 @@ def main(src, dst):
     p = next(b for n, b in bnd4_read(check) if n.endswith(PARAM))
     count, = struct.unpack_from("<H", p, 0x0A)
     ids = [struct.unpack_from("<i", p, 0x40 + i * 24)[0] for i in range(count)]
-    assert ids[-1] == NEW_ROW and len(bnd4_read(check)) == len(bnd4_read(bundle))
+    assert (ids[-1] == NEW_ROW) != no_row and len(bnd4_read(check)) == len(bnd4_read(bundle))
     Path(dst).parent.mkdir(parents=True, exist_ok=True)
     Path(dst).write_bytes(out)
     print(f"regulation.bin: Target list rows {ids}")
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:3])
+    main(sys.argv[1], sys.argv[2], "--no-row" in sys.argv)
