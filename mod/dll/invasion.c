@@ -305,8 +305,8 @@ static void log_start(char *ctrl, int step) {
 }
 
 // Small on-screen notices: the game's "summon message" box. CS::SummonMsgQueue (in the menu manager)
-// holds the message on screen and up to four waiting ones; the box plays one message, then takes
-// the next. So the "searching" line is queued again only when the queue has run empty, which keeps
+// holds the message on screen and up to four waiting ones; the box (CS::FeSummonMessageView) fades
+// one message in three times, about six seconds in all, then takes the next or hides. So the "searching" line is queued again only when the queue has run empty, which keeps
 // it pulsing at the game's own pace without a backlog, and ending the search empties the queue.
 #define RVA_MENU_MAN_PTR    0x3c14a70 // CSMenuMan*
 #define MENU_MAN_SUMMON_QUEUE 0xd628
@@ -341,7 +341,6 @@ static void clear_notices(void) {
     ((void (*)(void *))(g_base + RVA_SMQ_CLEAR_WAITING))(q + SMQ_WAITING_LIST);
     ((void (*)(void *))(g_base + RVA_SMQ_NEXT))(q);
 }
-
 // The invasion search. Choosing Invasion starts it, choosing it again or starting an ordinary
 // expedition ends it. While it runs the "searching" notice keeps coming back.
 // ponytail: nothing is searched for yet; the matchmaking call goes where the search starts.
