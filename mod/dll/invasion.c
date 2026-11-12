@@ -208,7 +208,44 @@ static void watch_session(void) {
 
 // Runs in place of the game's call to _CreateBossList: let the game build its list (Nightlords from
 // fixed row numbers), then add our row the same way the game adds its own, and move it to the top.
+// The game remembers the chosen target as a boss number, and our row has none (it becomes boss 0),
+// so on the next visit the menu comes up without Invasion chosen. During a search the choice is put
+// back before the list is shown, so that the entry carries its tick: the chosen rows live in two u32 vectors, in the menu's settings object (dialog+0xfc0, vector
+// at +0x68) and in the dialog's start request (dialog+0xfc8, vector at +0x50); the game copies the
+// first into the second with its vector assignment (0x9e7110), which we use for both.
+// A vector here is {allocator, begin, end, capacity end}. The grid is embedded in the dialog at +0xff0.
+static int g_searching;      // defined with the search code below
+#define DIALOG_FROM_GRID   0xff0
+#define DIALOG_SETTINGS    0xfc0
+#define DIALOG_REQUEST     0xfc8
+#define RVA_VECTOR_ASSIGN  0x9e7110  // vector* (vector *dst, vector *src)
+static void rows_text(char *vector, char *out, size_t cap) {
+    out[0] = 0;
+    if (IsBadReadPtr(vector, 32)) return;
+    unsigned *begin = *(unsigned **)(vector + 8), *end = *(unsigned **)(vector + 16);
+    size_t count = begin && end >= begin ? (size_t)(end - begin) : 0;
+    if (count > 16 || IsBadReadPtr(begin, count * 4)) return;
+    for (size_t i = 0; i < count; i++) snprintf(out + strlen(out), cap - strlen(out), "%s%u", i ? "," : "", begin[i]);
+}
+static void preselect_invasion(char *grid) {
+    char *dialog = grid - DIALOG_FROM_GRID;
+    if (IsBadReadPtr(dialog + DIALOG_SETTINGS, 16)) return;
+    char *settings = *(char **)(dialog + DIALOG_SETTINGS), *request = *(char **)(dialog + DIALOG_REQUEST);
+    if (!settings || !request) return;
+    char a[120], b[120];
+    rows_text(settings + 0x68, a, sizeof a);
+    rows_text(request + 0x50, b, sizeof b);
+    int want = g_searching;
+    logf("target list: chosen rows: settings [%s], request [%s]%s", a, b, want ? "; choosing Invasion" : "");
+    if (!want || IsBadReadPtr(settings + 0x68, 32) || IsBadReadPtr(request + 0x50, 32)) return;
+    static unsigned ours[1] = {INVASION_ROW};
+    void *source[4] = {NULL, ours, ours + 1, ours + 1};
+    ((void *(*)(void *, void *))(g_base + RVA_VECTOR_ASSIGN))(settings + 0x68, source);
+    ((void *(*)(void *, void *))(g_base + RVA_VECTOR_ASSIGN))(request + 0x50, source);
+}
+
 static void show_boss_list_hook(void *grid, char *list, void *a3, void *a4) {
+    preselect_invasion(grid);
     _Alignas(16) char item[0x40];  // a MatchingNightBossViewItem is 0x28 bytes
     ((void *(*)(void *, int, unsigned char, unsigned char))(g_base + RVA_BOSS_ITEM_CTOR))(item, INVASION_ROW, 0, 0);
     ((void (*)(void *, void *))(g_base + RVA_BOSS_ITEM_PUSH))(list, item);
@@ -483,12 +520,15 @@ static void step_hook(void *ctrl, void *time, int step) {
 #define REQ_PLAYERS_CHOICE     0x49
 #define REQ_ROWS_BEGIN         0x58
 #define PLAYERS_CHOICE_FOUR    3         // value of our combo item
+static char *g_dialog;                       // defined with the start button code below
+static int cursor_on_invasion(char *dialog);
 static unsigned long long fill_context_hook(char *self, char *request) {
     unsigned *begin = *(unsigned **)(request + REQ_ROWS_BEGIN), *end = *(unsigned **)(request + REQ_ROWS_BEGIN + 8);
     size_t count = begin && end >= begin ? (size_t)(end - begin) : 0;
-    int invasion = 0;
-    for (size_t i = 0; i < count && i < 64; i++)
-        if (begin[i] == INVASION_ROW) invasion = 1;
+    // Same rule as the button's label: the entry under the cursor. If the dialog cannot be read,
+    // fall back on the chosen rows, where the game itself looks at the last one for its special row.
+    int invasion = cursor_on_invasion(g_dialog);
+    if (invasion < 0) invasion = count && count <= 64 && begin[count - 1] == INVASION_ROW;
     // Four players: let the game set everything up as for its largest squad, then correct the count.
     int four = (unsigned char)request[REQ_PLAYERS_CHOICE] == PLAYERS_CHOICE_FOUR;
     if (four) request[REQ_PLAYERS_CHOICE] = 0;
@@ -551,23 +591,31 @@ static void hook_offline_check(void) {
 
 // The start button's label. The dialog builds it from one of several CL_MenuText lines ("Begin
 // expedition", "... 1 player", "... 2 players", ...) through seven calls to the text constructor,
-// with the dialog in rbx. With Invasion as the chosen target the line is replaced: "Begin invasion",
-// or "Cancel invasion" while a search is running (pressing the button then calls the search off).
+// with the dialog in rbx. With the cursor on Invasion the line is replaced: "Begin invasion", or
+// "Cancel invasion" while a search is running (pressing the button then calls the search off).
 #define TEXT_BEGIN_INVASION  131166
 #define TEXT_CANCEL_INVASION 131164
-#define DIALOG_REQUEST       0xfc8   // the dialog's start request (same object fill_context gets)
+// Which target a press of the start button would use, as the player sees it: the entry the list
+// cursor is on (F chooses that entry and moves to the button). The dialog holds the grid at +0xff0
+// and the item list at +0x19a0 (virtual slot 5: item by index; the row id is at item+0x10).
+#define DIALOG_GRID        0xff0
+#define DIALOG_ITEM_LIST   0x19a0
+#define RVA_GRID_CURSOR    0x781a50  // int (GridControl*): index of the entry under the cursor
+static char *g_dialog;  // the dialog the label was last built for
+static int cursor_on_invasion(char *dialog) {
+    if (!dialog || IsBadReadPtr(dialog + DIALOG_ITEM_LIST, 8)) return -1;
+    char *list = dialog + DIALOG_ITEM_LIST;
+    void **vt = *(void ***)list;
+    if (IsBadReadPtr(vt, 6 * 8)) return -1;
+    int index = ((int (*)(void *))(g_base + RVA_GRID_CURSOR))(dialog + DIALOG_GRID);
+    char *begin = *(char **)(list + 0x10), *end = *(char **)(list + 0x18);
+    if (index < 0 || !begin || end < begin || index >= (end - begin) / 0x28) return -1;
+    char *item = ((char *(*)(void *, int))vt[5])(list, index);
+    return item && !IsBadReadPtr(item + 0x10, 4) ? *(int *)(item + 0x10) == INVASION_ROW : -1;
+}
 static void *button_text_hook(void *out, int id, char *dialog) {
-    char *request = dialog && !IsBadReadPtr(dialog + DIALOG_REQUEST, 8) ? *(char **)(dialog + DIALOG_REQUEST) : NULL;
-    if (request && !IsBadReadPtr(request + REQ_ROWS_BEGIN, 16)) {
-        unsigned *begin = *(unsigned **)(request + REQ_ROWS_BEGIN), *end = *(unsigned **)(request + REQ_ROWS_BEGIN + 8);
-        size_t count = begin && end >= begin ? (size_t)(end - begin) : 0;
-        if (count && count <= 64 && !IsBadReadPtr(begin, count * 4))
-            for (size_t i = 0; i < count; i++)
-                if (begin[i] == INVASION_ROW) {
-                    id = g_searching ? TEXT_CANCEL_INVASION : TEXT_BEGIN_INVASION;
-                    break;
-                }
-    }
+    g_dialog = dialog;
+    if (cursor_on_invasion(dialog) == 1) id = g_searching ? TEXT_CANCEL_INVASION : TEXT_BEGIN_INVASION;
     return ((void *(*)(void *, int))(g_base + RVA_MENU_TEXT_CTOR))(out, id);
 }
 static void hook_button_text(void) {
