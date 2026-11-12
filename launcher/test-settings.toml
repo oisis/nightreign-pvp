@@ -1,0 +1,17 @@
+# Nightreign Invasions - test settings (tester builds only). Read at every "Play with the mod".
+#
+# Host:    host-test = true
+# Invader: join-test = true
+#          enter-test = true
+#          move-test = true
+# Change the lines for your role below to true, save, then "Play with the mod".
+# PL: Host ustawia host-test = true; najeźdźca join-test, enter-test i move-test = true.
+# PL: Zmień linie swojej roli poniżej na true, zapisz i kliknij "Play with the mod".
+
+host-test = false   # your expedition opens a session other mod players can find
+join-test = false   # "Invasion" in the Roundtable Hold joins the first session it finds
+enter-test = false  # with join-test: stay after joining and log the way into the host's world
+move-test = false   # with enter-test: push the game's own map move into the host's world (may hang)
+team-test = false   # 90 s into an expedition you turn red and monsters ignore you for 180 s
+no-rain = false     # the rain outside the circle does no damage (both players the same)
+slow-time = false   # day and circle clocks run about ten times slower (the host's counts)

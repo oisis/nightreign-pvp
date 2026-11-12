@@ -63,6 +63,38 @@ static void logf(const char *fmt, ...) {
     fclose(f);
 }
 
+// Test settings: test-settings.toml next to the DLL (the launcher writes it at every start from the
+// file next to the launcher; the dev build copies $W/test-settings.toml). Read once, at load.
+#include "settings.h"
+static signed char g_settings[SETTINGS_COUNT];
+static int setting(int i) { return g_settings[i] > 0; }
+static void next_to_dll(char *path, size_t cap, const char *name) {
+    snprintf(path, cap, "%s", log_path);
+    char *a = strrchr(path, '\\'), *b = strrchr(path, '/'), *dir = a > b ? a : b;
+    if (dir) snprintf(dir + 1, cap - (size_t)(dir + 1 - path), "%s", name);
+}
+static void settings_load(void) {
+    char path[MAX_PATH], text[4096], bad[300], old[200] = "";
+    next_to_dll(path, sizeof path, "test-settings.toml");
+    FILE *f = fopen(path, "rb");
+    size_t n = f ? fread(text, 1, sizeof text, f) : 0;
+    if (f) fclose(f);
+    if (settings_parse(text, n, g_settings, bad, sizeof bad)) logf("settings: lines not used: %s", bad);
+    for (int i = 0; i < SETTINGS_COUNT; i++) {
+        logf("settings: %s = %s (%s)", SETTING_NAMES[i], g_settings[i] > 0 ? "true" : "false",
+             !f ? "no test-settings.toml next to the DLL, default" : g_settings[i] < 0 ? "not in the file, default" : path);
+        if (g_settings[i] < 0) g_settings[i] = 0;
+    }
+    for (int i = 0; i < SETTINGS_COUNT; i++)  // the empty marker files of earlier test builds
+        for (int txt = 0; txt < 2; txt++) {
+            char name[40], p[MAX_PATH];
+            snprintf(name, sizeof name, "%s%s", SETTING_NAMES[i], txt ? ".txt" : "");
+            next_to_dll(p, sizeof p, name);
+            if (GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES) snprintf(old + strlen(old), sizeof old - strlen(old), " %s", name);
+        }
+    if (old[0]) logf("settings: old marker files ignored (test-settings.toml replaces them):%s", old);
+}
+
 // --- network guard -------------------------------------------------------------------------------
 //
 // The mod must never let the game reach FromSoftware's servers, and reading code cannot prove that
@@ -323,6 +355,44 @@ static void hook_network_flow(void) {
     *entry = (void *)flow_offline_hook;
     logf("network flow: hooked");
 }
+// Every map load (both sides, always on): MoveMapStep::STEP_MsbLoad (table entry 0x39af8b0, function
+// 0xc36840) loads the map whose id is at step +0xdc; it is also what tells a joining client's world
+// sync (phase 3) that its own map load has begun. Logged once per step object and map.
+#define RVA_MSB_LOAD_ENTRY 0x39af8b0
+#define RVA_MSB_LOAD_FN    0xc36840
+static void (*g_msb_load)(void *);
+static int g_step_back_to_hub;
+static int g_move, g_join;   // defined with the join test below
+static DWORD g_move_load_tick;
+static void msb_load_hook(char *step) {
+    static char *last_step;
+    static unsigned last_map;
+    unsigned map = *(unsigned *)(step + 0xdc);
+    if (step != last_step || map != last_map) {
+        last_step = step, last_map = map;
+        char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
+        logf("map load: map %08x (+e4 %08x), lobby_state %d", map, *(unsigned *)(step + 0xe4),
+             sm ? (int)*(unsigned *)(sm + SM_LOBBY_STATE) : -1);
+        if (g_move >= 2 && g_join == 4) {
+            if (g_move == 2) g_move = 3, g_move_load_tick = GetTickCount();
+            if (map == 0x0a000000) {
+                g_step_back_to_hub = 1;
+                logf("move test: this load is the Roundtable Hold again");
+            }
+        }
+    }
+    g_msb_load(step);
+}
+static void hook_map_load(void) {
+    void **entry = (void **)(g_base + RVA_MSB_LOAD_ENTRY);
+    if (*entry != (void *)(g_base + RVA_MSB_LOAD_FN)) {
+        logf("map load: step table does not look as expected, not hooked");
+        return;
+    }
+    g_msb_load = (void (*)(void *))*entry;
+    *entry = (void *)msb_load_hook;
+    logf("map load: hooked");
+}
 // Host session: a mod player's expedition opens a session as host on the network we start, so that
 // invaders can find it later. For now only while a file named "host-test" lies next to the DLL
 // (looked for when the expedition reaches its world); without it expeditions stay as before.
@@ -410,17 +480,14 @@ static void host_test_watch(void) {
 }
 static unsigned long long g_lobby;      // Steam lobby id of our host session, once read
 static unsigned g_marked_squad;         // squad size last written to the lobby, ~0 = not yet
+static int g_someone_joining;           // Steam lobby members beyond the session's (set by lobby_mark)
 static void host_test_start(void) {
     g_lobby = 0;
+    g_someone_joining = 0;
     g_marked_squad = ~0u;
-    char path[MAX_PATH];
-    strcpy(path, log_path);
-    char *a = strrchr(path, '\\'), *b = strrchr(path, '/'), *dir = a > b ? a : b;
-    if (!dir) return;
-    strcpy(dir + 1, "host-test");
-    g_host_test = GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+    g_host_test = setting(S_HOST_TEST);
     g_host_test_tick = 0;
-    if (g_host_test) logf("host test: on (%s): this expedition opens a host session", path);
+    if (g_host_test) logf("host test: on: this expedition opens a host session");
 }
 // InGame step, every frame until called: create once the network is ready.
 static void host_test_create(void) {
@@ -479,6 +546,220 @@ static void hook_eac_begin(void) {
     stub[10] = 0xFF; stub[11] = 0xE0;
     if (patch_rel32(site + 1, site + 5, stub)) logf("EAC begin-session: hooked (host-created call site)");
     else logf("EAC begin-session: cannot patch the call site");
+}
+
+// Who may join a running expedition. A new client sends packet 0x48 (8 bytes: two ints); the host
+// answers each one in 0xdde430 with packet 0x49 (4 bytes) through 0xdf2380: 0 accepted; 1 when its
+// block list (0xdcba00) names the joiner or the manager's +0x743 is set; 2 when the host's
+// quick-match context is active (0xb67000, true during an expedition) and 0xb66fb0 does not find
+// the joiner on the context's list of expected members (ctx(+0xa8) +0x70..+0x78, 32-byte entries
+// {u64 id, ..., +0xc int a, +0x10 int b}; checked when matching (0xb4f600) or in InGame, step 0x17).
+// The same check guards the joiner's player data (packet 0x60, 0xdddc10): data of an unexpected
+// member is dropped. Our invader is never on that list (it was filled by the expedition's own
+// matchmaking), so the first two-player test got answer 2. With host-test, while our host session
+// and our network are up and the guard is intact, both calls report "expected" for a member the
+// check turned down; everything else (block list, +0x743, sessions not ours) stays as the game has
+// it. What we give up: the host no longer limits a running expedition to the players its
+// matchmaking brought in; for our sessions that is the point, and the session is ours only.
+#define RVA_EXPECTED_MEMBER     0xb66fb0  // bool (qm ctrl**, u64 *member id, int a, int b)
+#define RVA_EXPECTED_CALL_JOIN  0xdde7ad  // in 0xdde430 (answer to packet 0x48)
+#define RVA_EXPECTED_CALL_DATA  0xddddd6  // in 0xdddc10 (player data, packet 0x60)
+#define SM_REFUSE_ALL           0x743
+typedef unsigned char (*expected_fn)(void *, unsigned long long *, int, int);
+static int g_host_test, g_join;  // defined below
+static DWORD g_admit_tick;        // host: last time the join check (bit 1) / player-data check (bit 2) passed
+static int g_admit_kind;
+static unsigned char expected_check(void *qm, unsigned long long *id, int a, int b, const char *what) {
+    unsigned char ok = ((expected_fn)(g_base + RVA_EXPECTED_MEMBER))(qm, id, a, b);
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
+    int ours = (g_host_test == 2 || g_join == 4) && g_network_on && guard_intact();
+    static unsigned long long seen[2][8];
+    static int count[2];
+    int k = what[0] == 'j' ? 0 : 1, fresh = 1;
+    for (int i = 0; i < count[k]; i++) fresh &= seen[k][i] != (id ? *id : 0);
+    if (fresh && count[k] < 8) seen[k][count[k]++] = id ? *id : 0;
+    if (ok || ours) g_admit_tick = GetTickCount(), g_admit_kind |= k ? 2 : 1;
+    if (fresh || !ok)  // every refusal and every acceptance of ours is logged, not only the first per member
+        logf("host: %s check for a member (a %d, b %d): expected %u%s; manager +0x743 %u", what, a, b, ok,
+             !ok && ours ? " -> accepted (our session)" : !ok ? " -> refused (answer 2)" : "",
+             sm ? (unsigned char)sm[SM_REFUSE_ALL] : 0);
+    return ok || ours;
+}
+static unsigned char expected_join_hook(void *qm, unsigned long long *id, int a, int b) {
+    return expected_check(qm, id, a, b, "join");
+}
+static unsigned char expected_data_hook(void *qm, unsigned long long *id, int a, int b) {
+    return expected_check(qm, id, a, b, "player data");
+}
+// Joiner: the host's answer as the client reads it (0xdde8a0 at 0xdf37e3 and 0xdf3922 in the
+// session update): 0 ready, 1 -> notice 0x2789 and leave, 2 -> notice 0x27a7 and leave. The notices
+// come from NetworkMsgParam, which in Nightreign has no rows 10121 / 10151, so nothing is shown.
+#define RVA_READ_ANSWER        0xdde8a0  // bool (ctx*, int *answer, u64 *member id)
+#define RVA_READ_ANSWER_CALL1  0xdf37e3
+#define RVA_READ_ANSWER_CALL2  0xdf3922
+static unsigned char read_answer_hook(void *ctx, int *answer, unsigned long long *member) {
+    unsigned char got = ((unsigned char (*)(void *, int *, unsigned long long *))(g_base + RVA_READ_ANSWER))(ctx, answer, member);
+    if (got && answer)
+        logf("join test: answer from a member: %d (%s)", *answer,
+             *answer == 0 ? "ready" : *answer == 1 ? "refused: blocked / host closed (notice 0x2789)" :
+             *answer == 2 ? "refused: not an expected member (notice 0x27a7)" : "unknown");
+    return got;
+}
+static void hook_call(unsigned rva_site, unsigned rva_target, void *hook, const char *what) {
+    unsigned char *site = (unsigned char *)g_base + rva_site;
+    int expected = (int)(rva_target - (rva_site + 5));
+    unsigned char *stub = near_alloc(12);
+    if (site[0] != 0xE8 || memcmp(site + 1, &expected, 4) || !stub) {
+        logf("%s: call site %x does not look as expected, not hooked", what, rva_site);
+        return;
+    }
+    stub[0] = 0x48; stub[1] = 0xB8;  // mov rax, hook; jmp rax
+    memcpy(stub + 2, &hook, 8);
+    stub[10] = 0xFF; stub[11] = 0xE0;
+    if (patch_rel32(site + 1, site + 5, stub)) logf("%s: hooked (%x)", what, rva_site);
+    else logf("%s: cannot patch %x", what, rva_site);
+}
+// Host, controller step InGame (0xb58f60): as host it reads ready packets 0x21 (1 byte) from members
+// with 0xddbbc0 (marks the member's player data +0x86c ready) and, when one came, sends 0x23 with 1
+// through 0xddf930 (0xdf24d0 to the session). So a member who turns ready mid-expedition is answered
+// in InGame, nothing is kept for the expedition start only. Both calls are logged when they happen.
+#define RVA_READY_READ       0xddbbc0  // bool (void *)
+#define RVA_READY_READ_CALL  0xb58fba
+#define RVA_GO_SEND          0xddf930  // void (void *, int *value)
+#define RVA_GO_SEND_CALL     0xb58fd5
+static unsigned char ready_read_hook(void *a) {
+    unsigned char got = ((unsigned char (*)(void *))(g_base + RVA_READY_READ))(a);
+    if (got) logf("host: ready packet 0x21 from a member read (InGame)");
+    return got;
+}
+static void go_send_hook(void *a, int *value) {
+    logf("host: sending 0x23 (%d) to the session (InGame)", value ? *value : -1);
+    ((void (*)(void *, int *))(g_base + RVA_GO_SEND))(a, value);
+}
+// Player data 0x60 (0x30 bytes, sent to each member at the join by 0xde15b0 from 0xdf5ae0): the
+// receiver 0xdddc10 drops a packet whose first int equals its own value from the matchmaking manager
+// (0xafe130 on DAT_143c17248: its object's vt+0x50, 0 without one). Between our two players both are
+// 0 (no matchmaking), so every 0x60 was dropped, the player info never reached the other side, and the
+// client's world sync waited at WaitNetworkChrIns. In our sessions the value it compares with is
+// changed so the packet passes; then the expected-member check (hooked above) and the game applies
+// the info to the member's player data (0x1fe530 slot: +0xc, +0xec, +0x720, name) and 0xdf2730.
+#define RVA_MATCH_VALUE       0xafe130  // int (matching manager*)
+#define RVA_MATCH_VALUE_CALL  0xdddd37  // in 0xdddc10
+static int match_value_hook(void *mgr) {
+    int v = ((int (*)(void *))(g_base + RVA_MATCH_VALUE))(mgr);
+    if ((g_host_test == 2 || g_join == 4) && g_network_on && guard_intact()) {
+        logf("player data 0x60 received: matching value %d, compared as %d so it is applied", v, v ^ 0x55aa55aa);
+        return v ^ 0x55aa55aa;
+    }
+    return v;
+}
+// World sync requests (packet 0x51, 1 byte: the subtype). Clients send them from their sync steps
+// through 0xdf2550 (HostInitInfo 0, ProgressInfo 1, EventState 2, MapOwnerInitSync 3, MapInitState 6,
+// and the others); the host's sync step Host (0xdcdc60) reads them through 0xdf1de0 and answers a
+// member flagged +0xea (a rejoining member) for every subtype, others only for 0, 4, 5, 7, 8.
+#define RVA_SESSION_SEND   0xdf2550  // (sm, packet, data, ...)
+#define RVA_SESSION_READ   0xdf1de0  // int (sm, packet, buffer, size, u64 *sender)
+static const unsigned SYNC_SEND_SITES[] = {0xdcd60b, 0xdcdbf0, 0xdce787, 0xdcec70, 0xdceff0, 0xdcf1b3, 0xdcf530, 0xdcf6eb, 0xdd0565, 0xdd0f62};
+static void sync_send_hook(void *sm, int packet, unsigned char *data, void *a4) {
+    logf("sync: request 0x%x subtype %d sent to the host", packet, data ? data[0] : -1);
+    ((void (*)(void *, int, void *, void *))(g_base + RVA_SESSION_SEND))(sm, packet, data, a4);
+}
+static int sync_read_hook(void *sm, int packet, unsigned char *buf, int size, unsigned long long *sender) {
+    int got = ((int (*)(void *, int, void *, int, void *))(g_base + RVA_SESSION_READ))(sm, packet, buf, size, sender);
+    if (got > 0) logf("host: sync request 0x%x subtype %d from a member (%d bytes)", packet, buf ? buf[0] : -1, got);
+    return got;
+}
+// Expedition generation (both sides, always on, log only). SingleSetup's first job (0xb4b9f0) calls
+// 0x6aec40 (a jump to protected 0x7019a5) at 0xb4bce6; 0xb4cc40 calls it too, at 0xb4d937. Arguments,
+// as 0xb4b9f0 builds them: four context bytes (vt+0x198, +0x1b8, +0x1c8, +0x188: context +0xc0 ? 2 :
+// +0x17c == 7, +0x17f, +0x180, +0x17c), four vectors {allocator, begin, end, capacity} (u16 from
+// 0x1e7820, u16 player data +0xe2, u8 0x6b1010 rare map layer, u8 0x6b12e0 rare map unlock bits) and
+// the context byte vt+0x1a8 (+0x17e). Logged with the game manager's start block before and after.
+#define RVA_GENERATE        0x6aec40
+static char *g_qm_ctrl;  // the controller (set by the step hook, below)
+static const char *g_generate_where;
+static void vec_text(char *out, size_t cap, void **v, int wide) {
+    out[0] = 0;
+    if (!v || IsBadReadPtr(v, 32)) return;
+    unsigned char *b = v[1], *e = v[2];
+    for (int i = 0; b && e > b && b + (i + 1) * (wide ? 2 : 1) <= e && i < 8; i++)
+        snprintf(out + strlen(out), cap - strlen(out), "%s%d", i ? "," : "", wide ? *(short *)(b + 2 * i) : b[i]);
+}
+// Play state in the player-data manager *(0x3c078d0): +0xd8 current play mode (0 hub, 1 the hub's
+// sparring set-up when gm+0xaf0 asks for it, 2 expedition, 4 title list), +0xd9 the requested one;
+// +0xda/+0xdb (context vt+0x198), +0xdc/+0xdd (context mode: 2 multiplayer) current/requested;
+// +0xde. RequestMoveMap (0xc27870) copies requested to current when they differ (0x202160, 0x202290,
+// 0x2022b0, 0x202230). Equipment (packet 0xc) is sent only with +0xdc == 2 (0xddfca0, 0xde20e0).
+static void play_state_log(const char *who) {
+    char *pd = *(char **)(g_base + 0x3c078d0), *gm = *(char **)(g_base + 0x3c13258);
+    if (!pd) return;
+    logf("%s: play state: mode %u (req %u) +da %u (req %u) +dc %u (req %u) +de %u +df %u +e0 %u | gm+0xaf0 %u", who,
+         (unsigned char)pd[0xd8], (unsigned char)pd[0xd9], (unsigned char)pd[0xda], (unsigned char)pd[0xdb],
+         (unsigned char)pd[0xdc], (unsigned char)pd[0xdd], (unsigned char)pd[0xde], (unsigned char)pd[0xdf],
+         (unsigned char)pd[0xe0], gm ? (unsigned char)gm[0xaf0] : 0);
+}
+static void diff_log(const char *what, const unsigned *before, const unsigned *after, unsigned words, unsigned base) {
+    char text[600] = "";
+    int n = 0;
+    for (unsigned i = 0; i < words && n < 40; i++)
+        if (before[i] != after[i])
+            snprintf(text + strlen(text), sizeof text - strlen(text), " +%x:%x->%x", base + i * 4, before[i], after[i]), n++;
+    logf("generate: %s changed:%s", what, n ? text : " nothing");
+}
+static void ctx_log(const char *who) {
+    char *ctx = g_qm_ctrl && !IsBadReadPtr(g_qm_ctrl + 0xa8, 8) ? *(char **)(g_qm_ctrl + 0xa8) : NULL;
+    if (!ctx || IsBadReadPtr(ctx, 0x190)) {
+        logf("%s: context: none", who);
+        return;
+    }
+    logf("%s: context: mode %u rejoin %u expected %d +c0 %u | +17c %u +17d %u +17e %u +17f %u +180 %u", who,
+         (unsigned char)ctx[0x9d], (unsigned char)ctx[0x9c], *(int *)(ctx + 0x98), (unsigned char)ctx[0xc0],
+         (unsigned char)ctx[0x17c], (unsigned char)ctx[0x17d], (unsigned char)ctx[0x17e], (unsigned char)ctx[0x17f],
+         (unsigned char)ctx[0x180]);
+}
+static void generate_hook(unsigned long long a1, unsigned long long a2, unsigned long long a3, unsigned long long a4,
+                          void **v1, void **v2, void **v3, void **v4, unsigned long long a9) {
+    char t1[64], t2[64], t3[64], t4[64];
+    vec_text(t1, sizeof t1, v1, 1), vec_text(t2, sizeof t2, v2, 1), vec_text(t3, sizeof t3, v3, 0), vec_text(t4, sizeof t4, v4, 0);
+    char *gm = *(char **)(g_base + 0x3c13258);
+    logf("generate (%s): args %u %u %u %u | [%s] [%s] [%s] [%s] | %u; start block before %08x", g_generate_where,
+         (unsigned)(a1 & 0xff), (unsigned)(a2 & 0xff), (unsigned)(a3 & 0xff), (unsigned)(a4 & 0xff), t1, t2, t3, t4,
+         (unsigned)(a9 & 0xff), gm ? *(unsigned *)(gm + 0xa74) : 0);
+    ctx_log("generate");
+    play_state_log("generate");
+    static unsigned gm_before[0x100], pa_before[0x1c0];  // gm +0xa00..+0xe00, play area +0..+0x700
+    char *pa = *(char **)(g_base + 0x3c13158);
+    if (gm) memcpy(gm_before, gm + 0xa00, sizeof gm_before);
+    if (pa) memcpy(pa_before, pa, sizeof pa_before);
+    ((void (*)(unsigned long long, unsigned long long, unsigned long long, unsigned long long, void *, void *, void *,
+               void *, unsigned long long))(g_base + RVA_GENERATE))(a1, a2, a3, a4, v1, v2, v3, v4, a9);
+    logf("generate (%s): done; start block after %08x", g_generate_where, gm ? *(unsigned *)(gm + 0xa74) : 0);
+    if (gm) diff_log("game manager +0xa00..+0xe00", gm_before, (unsigned *)(gm + 0xa00), 0x100, 0xa00);
+    if (pa) diff_log("play area +0..+0x700", pa_before, (unsigned *)pa, 0x1c0, 0);
+}
+static void generate_hook_setup(unsigned long long a1, unsigned long long a2, unsigned long long a3, unsigned long long a4,
+                                void **v1, void **v2, void **v3, void **v4, unsigned long long a9) {
+    g_generate_where = "SingleSetup 0xb4b9f0";
+    generate_hook(a1, a2, a3, a4, v1, v2, v3, v4, a9);
+}
+static void generate_hook_other(unsigned long long a1, unsigned long long a2, unsigned long long a3, unsigned long long a4,
+                                void **v1, void **v2, void **v3, void **v4, unsigned long long a9) {
+    g_generate_where = "0xb4cc40";
+    generate_hook(a1, a2, a3, a4, v1, v2, v3, v4, a9);
+}
+static void hook_acceptance(void) {
+    hook_call(0xb4bce6, RVA_GENERATE, (void *)generate_hook_setup, "expedition generation (SingleSetup)");
+    hook_call(0xb4d937, RVA_GENERATE, (void *)generate_hook_other, "expedition generation (0xb4cc40)");
+    for (unsigned i = 0; i < sizeof SYNC_SEND_SITES / sizeof *SYNC_SEND_SITES; i++)
+        hook_call(SYNC_SEND_SITES[i], RVA_SESSION_SEND, (void *)sync_send_hook, "sync request send");
+    hook_call(0xdcdd52, RVA_SESSION_READ, (void *)sync_read_hook, "host sync request read");
+    hook_call(RVA_MATCH_VALUE_CALL, RVA_MATCH_VALUE, (void *)match_value_hook, "player data receive");
+    hook_call(RVA_READY_READ_CALL, RVA_READY_READ, (void *)ready_read_hook, "host ready read");
+    hook_call(RVA_GO_SEND_CALL, RVA_GO_SEND, (void *)go_send_hook, "host go send");
+    hook_call(RVA_EXPECTED_CALL_JOIN, RVA_EXPECTED_MEMBER, (void *)expected_join_hook, "host join check");
+    hook_call(RVA_EXPECTED_CALL_DATA, RVA_EXPECTED_MEMBER, (void *)expected_data_hook, "host player-data check");
+    hook_call(RVA_READ_ANSWER_CALL1, RVA_READ_ANSWER, (void *)read_answer_hook, "join answer log");
+    hook_call(RVA_READ_ANSWER_CALL2, RVA_READ_ANSWER, (void *)read_answer_hook, "join answer log");
 }
 
 // Returns 1 if a leave was requested.
@@ -556,6 +837,7 @@ static void watch_network(void) {
     logf("network: offline flag %u", now[6]);
 }
 
+static unsigned g_squad;  // host: squad size fixed when the lobby is first marked (set below)
 static void watch_session(void) {
     static unsigned last_state = 0xffffffff, last_handle = 0xffffffff, last_started = 0xffffffff;
     static unsigned last_players = 0xffffffff;
@@ -582,7 +864,8 @@ static void watch_session(void) {
     // Host: the number of invaders follows from the squad that is actually in the session.
     // ponytail: counts every session member as squad; subtract invaders once they can join.
     if (state == 3 && players)
-        logf("host: squad of %u, up to %u invaders allowed", players, invaders_allowed(players));
+        logf("host: %u session members (squad at marking %u), up to %u invaders allowed", players, g_squad ? g_squad : players,
+             invaders_allowed(g_squad ? g_squad : players));
     if (!impl || (state != 3 && state != 6)) return;  // only a host or a client has a session
     typedef char (*export_fn)(void *, unsigned, void *, unsigned *);
     export_fn export_join_data = *(export_fn *)((char *)*impl + IMPL_VT_EXPORT_JOIN_DATA);
@@ -890,6 +1173,9 @@ static DWORD g_request_tick;  // when the last start request arrived
 #define LOBBY_GAME       "1.3.3"         // GAME_TIMESTAMP's build
 #define LOBBY_SQUAD_KEY  "nrpvp_squad"
 #define LOBBY_FREE_KEY   "nrpvp_free"
+#define LOBBY_BLOCK_KEY  "nrpvp_block"   // host's map block id, 8 hex digits (ChrIns+0x38)
+#define LOBBY_POS_KEY    "nrpvp_pos"     // host's position "x,y,z" from the game's getter 0x3d0fd0
+#define LOBBY_START_KEY  "nrpvp_start"   // host's expedition start block (game manager +0xa74), 8 hex digits
 #define LOBBY_EQUAL      0               // ELobbyComparison
 #define LOBBY_WORLDWIDE  3               // ELobbyDistanceFilter
 #define LOBBY_MATCH_LIST 510             // LobbyMatchList_t::k_iCallback (500 + 10; LobbyCreated_t is 513)
@@ -909,6 +1195,14 @@ static struct {
     unsigned char (*completed)(void *, u64, unsigned char *);
     unsigned char (*result)(void *, u64, void *, int, int, unsigned char *);
 } g_steam;
+static struct {  // optional, for steam_watch
+    void *user, *net;
+    unsigned char (*logged_on)(void *);
+    u64 (*self)(void *);
+    u64 (*owner)(void *, u64);
+    u64 (*member)(void *, u64, int);
+    unsigned char (*p2p)(void *, u64, void *);
+} g_diag;
 static int steam_ready(void) {
     static int state;  // 0 not tried, 1 ready, -1 failed
     if (state) return state > 0;
@@ -935,9 +1229,160 @@ static int steam_ready(void) {
         if (!g_steam.mm || !g_steam.utils) state = -1;
     }
     logf("steam: %s (matchmaking %p, utils %p)", state > 0 ? "ready" : "NOT available", g_steam.mm, g_steam.utils);
+    if (state > 0) {  // for the connection log only; missing ones just leave it shorter
+        void *(*user)(void) = (void *(*)(void))GetProcAddress(m, "SteamAPI_SteamUser_v021");
+        void *(*net)(void) = (void *(*)(void))GetProcAddress(m, "SteamAPI_SteamNetworking_v006");
+        g_diag.user = user ? user() : NULL;
+        g_diag.net = net ? net() : NULL;
+        g_diag.logged_on = (void *)GetProcAddress(m, "SteamAPI_ISteamUser_BLoggedOn");
+        g_diag.self = (void *)GetProcAddress(m, "SteamAPI_ISteamUser_GetSteamID");
+        g_diag.owner = (void *)GetProcAddress(m, "SteamAPI_ISteamMatchmaking_GetLobbyOwner");
+        g_diag.member = (void *)GetProcAddress(m, "SteamAPI_ISteamMatchmaking_GetLobbyMemberByIndex");
+        g_diag.p2p = (void *)GetProcAddress(m, "SteamAPI_ISteamNetworking_GetP2PSessionState");
+        if (!g_diag.user || !g_diag.net || !g_diag.logged_on || !g_diag.self || !g_diag.owner || !g_diag.member || !g_diag.p2p)
+            logf("steam: connection log incomplete (an export is missing)");
+    }
     return state > 0;
 }
 
+// Connection log (host and joiner, every STEAM_WATCH_MS, a line when anything changed): whether this
+// Steam client is logged on to Steam, the lobby's member count and limit as this client sees them,
+// the owner (a 16-bit tag of its id, the same on both sides, so the logs can be matched without
+// writing ids; "us" when it is this player), and the P2P session (ISteamNetworking 006, the one the
+// game uses) with each other member: a active, c connecting, e error, r relay.
+#define STEAM_WATCH_MS 5000
+static unsigned id_tag(u64 id) {
+    unsigned h = 2166136261u;
+    for (int i = 0; i < 8; i++) h = (h ^ (unsigned char)(id >> (i * 8))) * 16777619u;
+    return (h ^ h >> 16) & 0xffff;
+}
+static void steam_watch(const char *who, u64 lobby) {
+    static DWORD next;
+    static char last[256];
+    if (!lobby || !g_diag.user || !g_diag.net || !g_diag.logged_on || !g_diag.self || !g_diag.owner || !g_diag.member ||
+        !g_diag.p2p || (int)(GetTickCount() - next) < 0)
+        return;
+    next = GetTickCount() + STEAM_WATCH_MS;
+    u64 me = g_diag.self(g_diag.user), owner = g_diag.owner(g_steam.mm, lobby);
+    int n = g_steam.members(g_steam.mm, lobby);
+    char text[256];
+    int at = snprintf(text, sizeof text, "logged on %u, members %d of %d, owner %s", g_diag.logged_on(g_diag.user), n,
+                      g_steam.limit(g_steam.mm, lobby), !owner ? "none" : owner == me ? "us" : "");
+    if (owner && owner != me) at += snprintf(text + at, sizeof text - at, "%04x", id_tag(owner));
+    for (int i = 0; i < n && i < 6 && at < (int)sizeof text - 40; i++) {
+        u64 peer = g_diag.member(g_steam.mm, lobby, i);
+        if (!peer || peer == me) continue;
+        struct { unsigned char active, connecting, error, relay; int bytes, packets; unsigned ip; unsigned short port; } st = {0};
+        if (g_diag.p2p(g_diag.net, peer, &st))
+            at += snprintf(text + at, sizeof text - at, "; p2p %04x a%u c%u e%u r%u", id_tag(peer), st.active, st.connecting,
+                           st.error, st.relay);
+        else at += snprintf(text + at, sizeof text - at, "; p2p %04x none", id_tag(peer));
+    }
+    if (strcmp(text, last)) {
+        snprintf(last, sizeof last, "%s", text);
+        logf("%s: steam: %s", who, text);
+    }
+}
+
+// Session member flags, both sides, a line when any changes. Per member of the session manager
+// (+0x78, 0xf0 each): +0xe1 us, +0xe2 remote, +0xe3, +0xe4, +0xe8, +0xe9, +0xd4 player number.
+// The client's MoveMap sends ready 0x21 only when every other member has +0xe4, or +0xe8 and +0xe9 and
+// +0xd4 != -1 (0xdf0cb0); sync step 17 WaitNetworkChrIns waits until no remote member lacks +0xe4
+// (0xdf03a0; 120 s, then it leaves). Also the second manager at 0x3c21fc8 (it reads and sends the
+// 0x38-byte player info packet 0x93, 0xdf9830 / 0xdfa270, and marks a member's +0xe4 there): its
+// first word and each member's +0xe4.
+#define RVA_PARTY_MAN_PTR 0x3c21fc8
+static void member_flags_log(const char *who, char *sm) {
+    static char last[400];
+    char text[400];
+    int at = 0;
+    char *b = *(char **)(sm + 0x78), *e = *(char **)(sm + 0x80);
+    for (int i = 0; b && e > b && b + i * 0xf0 < e && i < 6; i++) {
+        char *m = b + i * 0xf0;
+        // slot state: byte [slot +0xd0] of the table at *(0x3c078d0)+0x18; the in-world step 0xc43900
+        // creates a waiting member's character (and clears its +0xe2) once it is 0x1f (0x1feab0)
+        char *pd = *(char **)(g_base + 0x3c078d0);
+        int slot = *(int *)(m + 0xd0), st = -1;
+        if (pd && slot >= 0 && slot < 8 && *(char **)(pd + 0x18) && !IsBadReadPtr(*(char **)(pd + 0x18) + slot, 1))
+            st = (unsigned char)(*(char **)(pd + 0x18))[slot];
+        at += snprintf(text + at, sizeof text - at,
+                       "%s[us %u wait %u e3 %u e4 %u e8 %u e9 %u rejoin %u asks %02x/%02x no %d slot %d state %02x]",
+                       i ? " " : "", (unsigned char)m[0xe1], (unsigned char)m[0xe2], (unsigned char)m[0xe3],
+                       (unsigned char)m[0xe4], (unsigned char)m[0xe8], (unsigned char)m[0xe9], (unsigned char)m[0xea],
+                       (unsigned char)m[0xeb], (unsigned char)m[0xec], *(int *)(m + 0xd4), slot, st & 0xff);
+    }
+    char *pm = *(char **)(g_base + RVA_PARTY_MAN_PTR);
+    if (pm && !IsBadReadPtr(pm, 0x40)) {
+        char *pb = *(char **)(pm + 0x30), *pe = *(char **)(pm + 0x38);
+        at += snprintf(text + at, sizeof text - at, " | party man %d:", *(int *)pm);
+        for (int i = 0; pb && pe > pb && pb + i * 0xf0 < pe && i < 6 && at < (int)sizeof text - 20; i++)
+            at += snprintf(text + at, sizeof text - at, " e4 %u", (unsigned char)pb[i * 0xf0 + 0xe4]);
+    }
+    if (strcmp(text, last)) {
+        snprintf(last, sizeof last, "%s", text);
+        logf("%s: members: %s", who, text);
+    }
+}
+// Host: the player-state exchange with a member who joins mid-expedition. Each side asks the members
+// it waits for (+0xe2) for their state with packet 10 (0xdf20c0 -> 0xddeb50; the game does it in
+// MoveMapStep's CreateDrawPlan, 0xc334e0, i.e. while loading a map). The answer (0xdde260: level 0xb,
+// 8, 0x3d, equipment 0xc through 0xddfca0) is sent only while the session role (+0x10) is 7; before
+// that requests are queued and answered when it becomes 7. Role 7 is set only by 0xdf28e0, from
+// MoveMapStep's HorseWait / TexStabilizeWait: a map load inside the session. Our host loaded its map
+// before its session existed, so it stays at 5, queues the joiner's request and never answers; and it
+// never loads a map again, so it never asks the joiner either. Those four packets set bits 0x10, 2, 4,
+// 8 of the member's slot state (0x202f10, 0x202f50, 0x202f70, 0x202f30; bit 1 at the join,
+// 0x200aa0); at 0x1f the in-world step creates the member's character. So: once a member has been
+// admitted and waits (+0xe2), role 5 -> 7 with the game's own setter (not before, so the admission runs
+// in the role it always ran in), then packet 10 to each newly waiting member.
+#define RVA_SM_SET_INGAME     0xdf28e0  // sm+0x10 = 7, sm+0x74c = 0
+#define RVA_SM_REQUEST_STATE  0xdf20c0  // packet 10 to every member with +0xe2
+static int g_host_switched, g_host_old_dc;
+static void host_member_sync(char *sm) {
+    static unsigned long long for_lobby;
+    static int last_waiting;
+    if (for_lobby != g_lobby) for_lobby = g_lobby, last_waiting = 0, g_admit_kind = 0, g_host_switched = 0;
+    if (!(g_host_test == 2 && g_network_on && guard_intact())) return;
+    int waiting = 0, remote = 0;
+    char *b = *(char **)(sm + 0x78), *e = *(char **)(sm + 0x80);
+    for (char *m = b; b && m < e; m += 0xf0) waiting += !m[0xe1] && m[0xe2], remote += !m[0xe1];
+    // Only once the member's admission is complete on our side: the join check answered (bit 1) and
+    // its player data 0x60 checked and applied (bit 2), and a second later. The run of b593722b showed
+    // that switching as soon as the member appears refuses it (answer 2). With nobody of ours left in
+    // the session the role goes back to 5, so the next arrival is admitted in role 5 again.
+    if (waiting && *(int *)(sm + 0x10) == 5 && g_admit_kind == 3 && GetTickCount() - g_admit_tick > 1000) {
+        ((void (*)(void *))(g_base + RVA_SM_SET_INGAME))(sm);
+        logf("host: member admitted; session role 5 -> %d (0xdf28e0, as a map load inside the session sets it)",
+             *(int *)(sm + 0x10));
+        // a group host's play mode +0xdc/+0xdd is 2 (multiplayer); a solo host's is its context mode, and
+        // the equipment packet 0xc goes out only at 2 (0xddfca0)
+        char *pd = *(char **)(g_base + 0x3c078d0);
+        if (pd && pd[0xdc] != 2) {
+            g_host_old_dc = (unsigned char)pd[0xdc] | 0x100;
+            ((void (*)(unsigned char))(g_base + 0x202230))(2);
+            play_state_log("host, member admitted");
+        }
+    }
+    if (!remote && *(int *)(sm + 0x10) == 7 && g_host_switched) {
+        *(int *)(sm + 0x10) = 5;
+        g_admit_kind = 0;
+        g_host_switched = 0;
+        if (g_host_old_dc) {
+            ((void (*)(unsigned char))(g_base + 0x202230))((unsigned char)g_host_old_dc);
+            g_host_old_dc = 0;
+            play_state_log("host, no member left");
+        }
+        logf("host: no member left; session role back to 5 for the next arrival");
+    }
+    if (*(int *)(sm + 0x10) == 7) g_host_switched = 1;
+    // packet 10 to each newly waiting member, once the role is 7 (requests are answered only then)
+    if (*(int *)(sm + 0x10) == 7 && waiting > last_waiting) {
+        ((void (*)(void *))(g_base + RVA_SM_REQUEST_STATE))(sm);
+        logf("host: state request (packet 10) sent to %d waiting member(s) (0xdf20c0)", waiting);
+        last_waiting = waiting;
+    }
+    if (waiting < last_waiting) last_waiting = waiting;
+}
 // The session's join data is the lobby id (0xdf0560: implementation vt+0x40; 8 bytes from the Steam
 // session object's +0x870).
 static u64 session_lobby_id(char *sm) {
@@ -962,7 +1407,7 @@ static DWORD g_list_tick;
 static unsigned g_list_count;
 static int g_self_check;  // host: 0 not yet, 1 request done
 static u64 g_candidate;    // invader: the lobby the last list picked, 0 = none
-static int g_join_test;    // invader: "join-test" file present when the search started
+static int g_join_test;    // invader: join-test setting, taken when the search started
 static unsigned g_squad;   // host: the expedition's squad size, fixed when the lobby is first marked
 
 static void log_pending_state(const char *who);
@@ -975,6 +1420,7 @@ static void lobby_mark(void) {
         if (g_lobby) logf("host: lobby_state %u, no longer host of lobby %llu (its marker goes with it)", state, g_lobby);
         g_lobby = 0;
         g_marked_squad = ~0u;
+        g_someone_joining = 0;
         return;
     }
     char *begin = *(char **)(sm + SM_PLAYERS_BEGIN), *end = *(char **)(sm + SM_PLAYERS_BEGIN + 8);
@@ -992,6 +1438,14 @@ static void lobby_mark(void) {
         lobby_set(LOBBY_MARK_KEY, "1");
         lobby_set(LOBBY_PROTO_KEY, LOBBY_PROTO);
         lobby_set(LOBBY_GAME_KEY, LOBBY_GAME);
+        {  // the expedition's start block: what a solo start put in the pending block (SingleStart ->
+           // context vt+8 0xb44630 -> 0xb47470), kept by the game manager for the whole expedition
+            char *gm = *(char **)(g_base + 0x3c13258), text[16];
+            if (gm) {
+                snprintf(text, sizeof text, "%08x", *(unsigned *)(gm + 0xa74));
+                lobby_set(LOBBY_START_KEY, text);
+            }
+        }
         g_squad = members;
         g_list_tick = GetTickCount();  // self-check one period after marking
     }
@@ -999,7 +1453,11 @@ static void lobby_mark(void) {
     // all in it by InGame). Session members beyond it are invaders; Steam lobby members beyond the
     // session's are someone in the middle of joining, and hold a slot too.
     // ponytail: a squad member who rejoins after a drop-out would count as an invader.
+    steam_watch("host", g_lobby);
+    member_flags_log("host", sm);
+    host_member_sync(sm);
     int in_lobby = g_steam.members(g_steam.mm, g_lobby);
+    g_someone_joining = in_lobby > (int)members;
     unsigned key = members | (unsigned)(in_lobby & 0xff) << 8;
     if (key == g_marked_squad) return;
     g_marked_squad = key;
@@ -1056,6 +1514,8 @@ static int lobby_search_frame(const char *who) {
         u64 id = g_steam.by_index(g_steam.mm, (int)i);
         const char *game = g_steam.get_data(g_steam.mm, id, LOBBY_GAME_KEY), *squad = g_steam.get_data(g_steam.mm, id, LOBBY_SQUAD_KEY);
         const char *free = g_steam.get_data(g_steam.mm, id, LOBBY_FREE_KEY), *proto = g_steam.get_data(g_steam.mm, id, LOBBY_PROTO_KEY);
+        const char *block = g_steam.get_data(g_steam.mm, id, LOBBY_BLOCK_KEY), *pos = g_steam.get_data(g_steam.mm, id, LOBBY_POS_KEY);
+        logf("%s:   lobby %llu: host block '%s' pos '%s'", who, id, block ? block : "?", pos ? pos : "?");
         int own = id == g_lobby && g_lobby, slots = free ? atoi(free) : 0;
         int fits = !own && slots > 0 && game && !strcmp(game, LOBBY_GAME);
         // GetLobbyData gives "" for a key that is not set.
@@ -1064,13 +1524,13 @@ static int lobby_search_frame(const char *who) {
              g_steam.limit(g_steam.mm, id), own ? "our own lobby" : fits ? "has a free invader slot" : "no slot for us");
         if (fits && !chosen) chosen = id;  // Steam sorts by distance: the first that fits
     }
-    if (chosen) logf("%s: %s lobby %llu", who, g_join_test ? "candidate" : "would join (no join-test file)", chosen);
+    if (chosen) logf("%s: %s lobby %llu", who, g_join_test ? "candidate" : "would join (join-test is off)", chosen);
     else logf("%s: no lobby to join", who);
     g_candidate = chosen;
     return 1;
 }
 
-// --- Join test (invader side), only with a "join-test" file next to the DLL -----------------------
+// --- Join test (invader side), only with join-test = true in the test settings ------------------
 //
 // Join: 0xdf0f70(manager, u8 multiplay type, vector *join data, u8 title flow, u8 *one), the manager
 // half of the game's joins (JoinSessionJob through 0x73fa60 passes title flow 0, the title screen's
@@ -1100,17 +1560,26 @@ static int lobby_search_frame(const char *who) {
 static int g_join;            // 0 waiting for a candidate, 1 join called, 2 joined (holding), 3 over
 static DWORD g_join_tick;
 static u64 g_join_data[1];    // the lobby id, kept for as long as the implementation might read it
+#define QM_CTRL_REFUSED 0x10d
+static char *g_qm_ctrl;  // the controller, as seen by the step hook
+static int g_qm_step = -1;  // its current step
+static int g_move_test;     // move-test setting (with enter-test): force the map move, see move_force
+static int g_move;          // 0 not yet, 1 wanted (sync at EndLobbyExit), 2 forced, 3 a map load began
+static DWORD g_move_tick;
+static int g_move_online;   // we set gm+0xb40
+static int g_enter_test;    // enter-test setting (with join-test): stay a client and watch the game's way into the host's world
 static void join_test_start(void) {
-    char path[MAX_PATH];
-    strcpy(path, log_path);
-    char *a = strrchr(path, '\\'), *b = strrchr(path, '/'), *dir = a > b ? a : b;
-    g_join_test = 0;
     g_join = 0;
     g_candidate = 0;
-    if (!dir) return;
-    strcpy(dir + 1, "join-test");
-    g_join_test = GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
-    if (g_join_test) logf("join test: on (%s): the first candidate is joined", path);
+    g_join_test = setting(S_JOIN_TEST);
+    g_enter_test = g_join_test && setting(S_ENTER_TEST);
+    g_move_test = g_enter_test && setting(S_MOVE_TEST);
+    if (setting(S_MOVE_TEST) && !g_enter_test) logf("move test: needs join-test and enter-test = true as well; off");
+    if (g_move_test) logf("move test: on: at EndLobbyExit the controller is sent to MoveMapStart");
+    if (setting(S_ENTER_TEST) && !g_join_test) logf("enter test: needs join-test = true as well; off");
+    if (g_enter_test) logf("enter test: on: a client stays and the way into the host's world is watched");
+    if (g_join_test) logf("join test: on: the first candidate is joined; controller +0x10d %d",
+                          g_qm_ctrl ? (unsigned char)g_qm_ctrl[QM_CTRL_REFUSED] : -1);
 }
 // Every frame while joining: one line per change of the session's state, with ms since the call.
 static void join_watch(char *sm) {
@@ -1160,13 +1629,47 @@ static void log_pending_state(const char *who) {
     char *begin = *(char **)(record + 0x40), *end = *(char **)(record + 0x48);
     logf("%s: rejoin record %s, join data %lld bytes", who, hex, begin && end >= begin ? (long long)(end - begin) : -1LL);
 }
+// A refused client: the session update (0xdf2a20, client role 1) reads the host's 4-byte answer
+// in packet 0x49 (0xdde8a0); answer 1 shows notice 0x2789, leaves and calls 0xb67140, which sets
+// CSQuickMatchingCtrl+0x10d = 1; answer 2 shows notice 0x27a7 and leaves. The controller's own
+// join set-up (0xb51070) clears +0x10d first. Inferred: +0x10d left at 1 is why the next
+// "Invasion" sent no start request; so it is logged, and cleared when the join test ends.
 static void toggle_search(const char *where);
+static int g_move, g_move_online;
+#define RVA_QM_UNREGISTER 0xb52ef0  // void (ctrl*): if step != 0, cancel the job chain, set step 25
 static void join_over(const char *why) {
     g_join = 3;
     logf("join test: stopping (%s), leaving and ending the search", why);
+    // A forced MoveMapStart / MoveMap would be left behind with no session: back to None, the call
+    // our expedition-start cancel makes. FailedStartMultiplay and Unregister are the game's own exits.
+    if (g_move_online) {
+        g_move_online = 0;
+        ((void (*)(unsigned char))(g_base + 0x6b0530))(0);
+        logf("move test: online-mode flag gm+0xb40 put back to 0");
+    }
+    // After a map load the player is in another world: Unregister (0xb52ef0, what the game's return to
+    // the title uses: cancels the controller's job chain at +0xb0, then step 25) so the game ends that
+    // expedition and goes back to the Roundtable Hold, instead of leaving a stray solo world.
+    if (g_move >= 3 && g_qm_ctrl && g_qm_step != QM_STEP_NONE && g_qm_step != 25) {
+        logf("move test: map was loaded; controller step %d -> Unregister (0xb52ef0)", g_qm_step);
+        ((void (*)(void *))(g_base + RVA_QM_UNREGISTER))(g_qm_ctrl);
+        logf("move test: controller +0x40 %d +0x44 %d after Unregister", *(int *)(g_qm_ctrl + 0x40), *(int *)(g_qm_ctrl + 0x44));
+    } else if (g_move >= 2 && g_qm_ctrl && (g_qm_step == 21 || g_qm_step == 22)) {
+        ((void (*)(void *, int))(*(void ***)g_qm_ctrl)[QM_CTRL_VT_SET_STEP])(g_qm_ctrl, QM_STEP_NONE);
+        logf("move test: controller step %d set back to None", g_qm_step);
+    }
     toggle_search("join test over");
+    if (g_qm_ctrl && g_qm_ctrl[QM_CTRL_REFUSED]) {
+        logf("join test: quick-match controller +0x10d was %u (set by a refused join), cleared", (unsigned char)g_qm_ctrl[QM_CTRL_REFUSED]);
+        g_qm_ctrl[QM_CTRL_REFUSED] = 0;
+    }
 }
-// Idle step, every frame while searching with the join test on.
+#define ENTER_WATCHDOG_MS  180000
+static DWORD g_enter_tick, g_enter_world;
+static int g_enter_effect;
+static void enter_watch(char *sm);
+
+// Idle step, every frame while searching with the join test on (and every step while an enter test watches).
 static void join_frame(void) {
     char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
     if (!sm || g_join == 3) return;
@@ -1203,32 +1706,48 @@ static void join_frame(void) {
         return;
     }
     join_watch(sm);
+    steam_watch("join test", g_candidate);
     DWORD waited = GetTickCount() - g_join_tick;
     if (g_join == 1) {
         if (state == 6) {
             g_join = 2;
             g_join_tick = GetTickCount();
-            logf("join test: joined as client after %lums. Entering the host's world is not built: holding %ums, then leaving",
-                 waited, JOIN_HOLD_MS);
+            if (g_enter_test) {
+                g_join = 4;
+                g_enter_tick = GetTickCount();
+                g_enter_world = 0;
+                g_enter_effect = 0;
+                g_move = 0;
+                logf("join test: joined as client after %lums; enter test: watching for up to %ums", waited, ENTER_WATCHDOG_MS);
+            } else
+                logf("join test: joined as client after %lums. Entering the host's world is not built: holding %ums, then leaving",
+                     waited, JOIN_HOLD_MS);
             log_members(sm, "join test");
             log_pending_state("join test");
         } else if (state == 0 || state == 2 || state == 5) join_over("join failed");
         else if (waited > JOIN_TIMEOUT_MS) join_over("join timed out");
     } else if (state != 6) join_over("no longer a client");
-    else if (waited > JOIN_HOLD_MS) join_over("hold time over");
+    else if (g_join == 4) {
+        enter_watch(sm);
+        if (!g_enter_world && GetTickCount() - g_enter_tick > ENTER_WATCHDOG_MS) join_over("enter test watchdog: no way into the world");
+    } else if (waited > JOIN_HOLD_MS) join_over("hold time over");
 }
 // Leave a session we joined. Returns 1 if a leave was requested (the network then waits for it).
 static int join_leave(void) {
     char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
     if (!g_join_test || !sm) return 0;
     unsigned state = *(unsigned *)(sm + SM_LOBBY_STATE);
+    if (state == 7) {  // the game is already leaving: wait for it before the network goes down
+        logf("join test: the session is already leaving (lobby_state 7); waiting for it");
+        return 1;
+    }
     if (state != 4 && state != 6) return 0;
     ((void (*)(void *, unsigned char))(g_base + RVA_SESSION_LEAVE))(sm, 0);
     logf("join test: leave session, lobby_state %u -> %u", state, *(unsigned *)(sm + SM_LOBBY_STATE));
     return 1;
 }
 
-// --- Team test, only with a "team-test" file next to the DLL ------------------------------------
+// --- Team test, only with team-test = true in the test settings ---------------------------------
 //
 // Puts the local player on team 16 for 180 s, 90 s after the expedition reaches its world, through
 // our SpEffect row 90071610 (build_regulation.py: copy of the neutral row 10101 with
@@ -1287,46 +1806,212 @@ static void team_log(const char *when) {
          (unsigned char)chr[CHR_BASE_TEAM], team, TEAM_TEST_SPEFFECT,
          active < 0 ? "MISSING from regulation.bin" : active ? "active" : "not active", GetTickCount() - g_team_tick);
 }
-// Where the host is (decision 14), not settled: which fields hold the local player's map block and
-// position is not read in this executable. ELDEN RING's ChrIns (fromsoftware-rs, read only) has the
-// block ids at +0x30..+0x3f and the position in map chunk coordinates at +0x80; in Nightreign the
-// team byte sits 8 bytes later than ELDEN RING's (+0x74 vs +0x6c), so the same fields may sit at
-// +0x38.. and +0x88/+0x90. The team test logs these candidates (and the game manager's +0xa70 /
-// +0xa74) every 10 s, so walking around shows which ones follow the player. Reads only.
-static void log_position_candidates(void) {
-    char *chr = local_player(), *gm = *(char **)(g_base + RVA_GAME_MAN_PTR);
-    if (!chr || IsBadReadPtr(chr, 0xb0)) return;
-    float *a = (float *)(chr + 0x80), *b = (float *)(chr + 0x88), *c = (float *)(chr + 0x90);
-    logf("team test: position candidates: chr+38 %08x +3c %08x +40 %08x +44 %08x | +80 %.1f %.1f %.1f | +88 %.1f %.1f %.1f | "
-         "+90 %.1f %.1f %.1f | gm+a70 %08x +a74 %08x", *(unsigned *)(chr + 0x38), *(unsigned *)(chr + 0x3c),
-         *(unsigned *)(chr + 0x40), *(unsigned *)(chr + 0x44), a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2],
-         gm ? *(unsigned *)(gm + 0xa70) : 0, gm ? *(unsigned *)(gm + 0xa74) : 0);
+// Where the player is (decision 14). Map block: ChrIns+0x38, the id of the map tile the character
+// is in (the first solo test showed it change as the player crossed areas: 3c2a2520 -> 3c0a0922 ->
+// 26000101 -> 3c2a2420; ELDEN RING keeps block_id at the same place, 8 bytes earlier). Position:
+// the game's own getter 0x3d0fd0 (ChrIns*, vec4 *out), which the play-area manager (0x696170) uses
+// for the local player: ChrIns+0x60 -> +0x10 -> +0x1b8 -> +0x68 -> 16 bytes at +0x70 (0x39bd50,
+// 0x466470: all three read). It writes with movaps, so the buffer must be 16-byte aligned. Whether
+// x/y/z are world or block-local is not read; the log compares it with ChrIns+0x80 / +0x90, which
+// moved together with a constant offset in the first test.
+#define RVA_CHR_POSITION 0x3d0fd0
+#define CHR_BLOCK_ID     0x38
+static int player_position(float out[3], unsigned *block) {
+    char *chr = local_player();
+    if (!chr || IsBadReadPtr(chr, 0xa0)) return 0;
+    char *ctrl = *(char **)(chr + 0x60), *a = ctrl ? *(char **)(ctrl + 0x10) : NULL;
+    char *b = a && !IsBadReadPtr(a + 0x1b8, 8) ? *(char **)(a + 0x1b8) : NULL;
+    if (!b || IsBadReadPtr(b + 0x68, 8) || IsBadReadPtr(*(char **)(b + 0x68), 0x80)) return 0;
+    _Alignas(16) float v[4];
+    ((void *(*)(void *, void *))(g_base + RVA_CHR_POSITION))(chr, v);
+    out[0] = v[0], out[1] = v[1], out[2] = v[2];
+    *block = *(unsigned *)(chr + CHR_BLOCK_ID);
+    return 1;
+}
+static void log_position(const char *who) {
+    float p[3];
+    unsigned block;
+    char *chr = local_player();
+    if (!player_position(p, &block)) {
+        logf("%s: position: no local player", who);
+        return;
+    }
+    float *c80 = (float *)(chr + 0x80), *c90 = (float *)(chr + 0x90);
+    logf("%s: position: block %08x (+3c %08x +40 %08x +44 %08x) pos %.1f %.1f %.1f | chr+80 %.1f %.1f %.1f | chr+90 %.1f %.1f %.1f",
+         who, block, *(unsigned *)(chr + 0x3c), *(unsigned *)(chr + 0x40), *(unsigned *)(chr + 0x44), p[0], p[1], p[2],
+         c80[0], c80[1], c80[2], c90[0], c90[1], c90[2]);
+}
+
+// Enter test (joiner, with join-test and enter-test). Once a client, the session update moves the
+// client role (+0x10) from 1 (waiting for every member's answer 0) to 2 and starts the world sync
+// CSInitSyncStep (object at manager +0x1b8, current step at +0x40, read by its vt+0x50 0xdccbe0;
+// steps: 0 Wait, 1 Host, 2 StartSessionJoin, 3 WaitPlayerNo, 4 EndSessionJoin, 5 StartLobbyExit,
+// 6 HostInitInfo, 7 ProgressInfo, 8 EventState, 9 MapOwnerInitSync, 10 EndLobbyExit,
+// 11 StartIngameEnter, 12 DeathBoxSelection, 13 ShareEventSelection, 14 MapInitState,
+// 15 WeatherInitSync, 16 IngameTimeInitSync, 17 WaitNetworkChrIns, 18 BulletInitSync,
+// 19 MapItemInitSync, 20 PreEndRejoinMapEnter, 21 EndIngameEnter, 22 StartIngame,
+// 23 NonActiveBlockInfo, 24 EndIngame, 25 Finish). Nothing is forced: this only watches, logs every
+// change of role, sync step, controller step, controller +0x288, the game manager's next map
+// (+0xadc), lobby state and the player's map block, and leaves after ENTER_WATCHDOG_MS without a
+// sync step past StartIngameEnter, or whenever the client is no longer one. Once the sync is past
+// StartIngame and 10 s have gone by, our team SpEffect (90071610, 180 s) is put on the player.
+#define SM_INIT_SYNC       0x1b8
+#define INIT_SYNC_STEP     0x40
+#define QM_CTRL_ENTER      0x288
+// Step 10 (EndLobbyExit, 0xdcd8e0) waits for the sync object's phase byte (+0xd8) to be 3. Its only
+// writer is 0xdd0100, called only through 0xdf28b0 from MoveMapStep::STEP_MsbLoad (0xc36840): the
+// joiner's own game must start loading a map. The phase is logged too (1 started, 2 session joined,
+// 3 map load started), with what a map move would start from: the game manager's pending block
+// (+0xa74), its map exit state (+0xb3c, set to 1 by 0x6af5d0) and the controller's context mode.
+static const char *const SYNC_STEP_NAMES[26] = {
+    "Wait", "Host", "StartSessionJoin", "WaitPlayerNo", "EndSessionJoin", "StartLobbyExit", "HostInitInfo",
+    "ProgressInfo", "EventState", "MapOwnerInitSync", "EndLobbyExit", "StartIngameEnter", "DeathBoxSelection",
+    "ShareEventSelection", "MapInitState", "WeatherInitSync", "IngameTimeInitSync", "WaitNetworkChrIns",
+    "BulletInitSync", "MapItemInitSync", "PreEndRejoinMapEnter", "EndIngameEnter", "StartIngame",
+    "NonActiveBlockInfo", "EndIngame", "Finish"};
+static const char *sync_step_name(int i) { return i >= 0 && i < 26 ? SYNC_STEP_NAMES[i] : "?"; }
+#define INIT_SYNC_PHASE 0xd8
+#define MOVE_LOAD_WAIT_MS  60000
+#define MOVE_SCENE_WAIT_MS 90000
+static void enter_watch(char *sm) {
+    static int last[14] = {-9, -9, -9, -9, -9, -9, -9, -9, -9, -9, -9, -9, -9, -9};
+    char *sync = *(char **)(sm + SM_INIT_SYNC), *gm = *(char **)(g_base + RVA_GAME_MAN_PTR), *chr = local_player();
+    if (chr && IsBadReadPtr(chr, 0xa0)) chr = NULL;  // the player is rebuilt while a world loads
+    if (sync && IsBadReadPtr(sync, 0xe8)) sync = NULL;
+    char *ctx = g_qm_ctrl && !IsBadReadPtr(g_qm_ctrl + 0xa8, 8) ? *(char **)(g_qm_ctrl + 0xa8) : NULL;
+    if (ctx && IsBadReadPtr(ctx, 0xa0)) ctx = NULL;
+    int now[14] = {(int)*(unsigned *)(sm + SM_LOBBY_STATE), *(int *)(sm + 0x10),
+                   sync ? *(int *)(sync + INIT_SYNC_STEP) : -1, g_qm_step,
+                   g_qm_ctrl ? *(int *)(g_qm_ctrl + QM_CTRL_ENTER) : -1, gm ? *(int *)(gm + 0xadc) : -1,
+                   chr ? *(int *)(chr + CHR_BLOCK_ID) : -1, sync ? (unsigned char)sync[INIT_SYNC_PHASE] : -1,
+                   gm ? *(int *)(gm + 0xa74) : -1, gm ? *(int *)(gm + 0xb3c) : -1, ctx ? (unsigned char)ctx[0x9d] : -1,
+                   ctx ? *(int *)(ctx + 0x98) : -1, g_qm_ctrl ? *(int *)(g_qm_ctrl + 0x40) : -1,
+                   g_qm_ctrl ? *(int *)(g_qm_ctrl + 0x44) : -1};
+    DWORD t = GetTickCount() - g_enter_tick;
+    if (memcmp(now, last, sizeof now)) {
+        memcpy(last, now, sizeof now);
+        logf("enter test: +%lums lobby_state %d role %d sync step %d %s (phase %d) controller step %d +0x288 %d | "
+             "next map %08x pending block %08x map exit %d context mode %d players %d | ctrl +40 %d +44 %d | block %08x",
+             t, now[0], now[1], now[2], sync_step_name(now[2]), now[7], now[3], now[4], now[5], now[8], now[9], now[10],
+             now[11], now[12], now[13], now[6]);
+    }
+    if (g_move_test && !g_move && now[0] == 6 && now[2] == 10 && now[3] == QM_STEP_NONE) {
+        g_move = 1;
+        logf("move test: sync at EndLobbyExit (phase %d), controller idle: forcing now", now[7]);
+    }
+    if (g_move == 3 && g_searching) {
+        static int cleared;
+        if (cleared != (int)g_move_load_tick) {
+            cleared = (int)g_move_load_tick;
+            clear_notices();  // the map load has begun: the "searching" notice goes
+            logf("move test: map load began, search notice cleared");
+        }
+    }
+    if (g_move >= 2 && g_qm_ctrl && sm) {
+        // What MoveMapStart (0xb593a0) and MoveMap (0xb590a0) wait for, every change:
+        //  MoveMapStart: mode != 2, or gm+0xb40; then sync step 0/1/10, and in mode 2 members == ctx+0x98.
+        //  MoveMap (client, mode 2): ctrl+0x10b (set by MoveMapStep's HorseWait, 0xc347d0, during a map
+        //  load) before it sends ready 0x21; ctrl+0x10a (the host's 0x23 "go", read in 0xb5da90) before
+        //  its timer runs out (or it leaves the session); ctrl+0x10c / session +8 before it lets go.
+        static int wlast[8] = {-9, -9, -9, -9, -9, -9, -9, -9};
+        char *b = *(char **)(sm + SM_PLAYERS_BEGIN), *e = *(char **)(sm + SM_PLAYERS_BEGIN + 8);
+        int w[8] = {gm ? (unsigned char)gm[0xb40] : -1, now[10], now[11], b && e >= b ? (int)((e - b) / SM_PLAYER_SIZE) : -1,
+                    (unsigned char)g_qm_ctrl[0x10a], (unsigned char)g_qm_ctrl[0x10b], (unsigned char)g_qm_ctrl[0x10c],
+                    *(int *)(sm + 8)};
+        member_flags_log("move test", sm);
+        if (memcmp(w, wlast, sizeof w)) {
+            memcpy(wlast, w, sizeof w);
+            logf("move test: wait state: online %d mode %d expected %d members %d | ctrl +10a go %d +10b loaded %d +10c %d | "
+                 "session +8 %d | sync step %d controller step %d", w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], now[2], now[3]);
+        }
+    }
+    if (g_move >= 2 && !g_enter_world) {
+        DWORD now_ms = GetTickCount();
+        if (now[3] == 24 || now[3] == 25) {
+            join_over(now[3] == 24 ? "move test: controller went to FailedStartMultiplay" : "move test: controller went to Unregister");
+            return;
+        }
+        if (g_step_back_to_hub) {
+            g_step_back_to_hub = 0;
+            join_over("move test: the map load went back to the Roundtable Hold");
+            return;
+        }
+        if (g_move == 2 && now_ms - g_move_tick > MOVE_LOAD_WAIT_MS) {
+            join_over("move test: no map load within 60 s of the forced step");
+            return;
+        }
+        if (g_move == 3 && now[2] < 11 && now_ms - g_move_load_tick > MOVE_SCENE_WAIT_MS) {
+            join_over("move test: map loading, but the sync did not move past EndLobbyExit within 90 s");
+            return;
+        }
+    }
+    if (now[2] >= 22 && !g_enter_world) {
+        g_enter_world = t;
+        logf("enter test: world sync at step %d: in the host's world?", now[2]);
+        log_position("enter test");
+        log_members(sm, "enter test");
+    }
+    if (g_enter_world && !g_enter_effect && t - g_enter_world > 10000 && chr) {
+        g_enter_effect = 1;
+        team_log("enter test, before the team effect");
+        ((void (*)(void *, int, unsigned char))(g_base + RVA_ADD_SPEFFECT))(chr, TEAM_TEST_SPEFFECT, 0);
+        team_log("enter test, after the team effect");
+    }
+}
+// Death while on our team (decision 3: a dead invader leaves the session). The effect goes by rule:
+// our row keeps dontDeleteOnDead at 0 (SpEffectParam field per Smithbox's paramdef; the code that
+// honours it is not read). The solo test showed it gone well before its 180 s. Signal used here:
+// our effect active one frame and gone the next while its time is not up; the next 15 s are logged
+// to show what the game does (respawn, team back to base, character instance kept or replaced).
+// ponytail: a proxy for death; HP / a death flag on the character are not located yet.
+static DWORD g_team_position, g_team_death;
+static int g_team_was_active;
+static char *g_team_chr;
+static void team_death_watch(DWORD t) {
+    char *chr = local_player();
+    int active = chr ? our_speffect_active(chr) == 1 : 0;
+    if (g_team_was_active && !active && !g_team_death && t + 2000 < TEAM_TEST_START_MS + TEAM_TEST_LEN_MS) {
+        g_team_death = t;
+        logf("team test: our effect ended early at +%lums (%lus before its time; death?), character %p (was %p)", t,
+             (TEAM_TEST_START_MS + TEAM_TEST_LEN_MS - t) / 1000, (void *)chr, (void *)g_team_chr);
+        team_log("at the early end");
+        log_position("team test");
+    }
+    static int phase;
+    if (!g_team_death) phase = 0;
+    else if (phase == 0 && t - g_team_death >= 5000) {
+        team_log("5 s after the early end");
+        phase = 1;
+    } else if (phase == 1 && t - g_team_death >= 15000) {
+        team_log("15 s after the early end");
+        logf("team test: character now %p", (void *)local_player());
+        phase = 2;
+    }
+    g_team_was_active = active;
+    if (active) g_team_chr = chr;
 }
 // InGame step, every frame. first: the first frame of this expedition's world.
 static void team_test_frame(int first) {
     if (first) {
-        char path[MAX_PATH];
-        strcpy(path, log_path);
-        char *a = strrchr(path, '\\'), *b = strrchr(path, '/'), *dir = a > b ? a : b;
         g_team_test = 0;
-        if (!dir) return;
-        strcpy(dir + 1, "team-test");
-        if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) return;
+        if (!setting(S_TEAM_TEST)) return;
         g_team_test = 1;
         g_team_tick = GetTickCount();
-        logf("team test: on (%s): team 16 from +%us to +%us", path, TEAM_TEST_START_MS / 1000,
+        g_team_position = 0;
+        g_team_was_active = 0;
+        g_team_death = 0;
+        logf("team test: on: team 16 from +%us to +%us", TEAM_TEST_START_MS / 1000,
              (TEAM_TEST_START_MS + TEAM_TEST_LEN_MS) / 1000);
         team_log("start");
         return;
     }
     if (!g_team_test) return;
     DWORD t = GetTickCount() - g_team_tick;
-    static DWORD next_position;
-    if (t < 1000) next_position = 0;
-    if (t >= next_position) {
-        log_position_candidates();
-        next_position = t + 10000;
+    if (t >= g_team_position) {
+        log_position("team test");
+        g_team_position = t + 10000;
     }
+    if (g_team_test == 2) team_death_watch(t);
     if (g_team_test == 3) return;
     if (g_team_test == 1 && t >= TEAM_TEST_START_MS) {
         char *chr = local_player();
@@ -1350,6 +2035,124 @@ static void team_test_frame(int first) {
     }
 }
 
+// --- Slow clock (test sessions), only with slow-time = true in the test settings -----------------
+//
+// The expedition's clock: singleton 0x3c125d8 (created in 0x62ed40, set up by 0x65a9c0 / 0x65af70).
+// +0x08 time of day, packed (hour bits 34-38, minute 39-44, second 45-50, as 0x602f80 unpacks it);
+// +0x34 base rate, from GameSystemCommonParam row 0 +0x1bc (72.9), or the debug property
+// Game.IngameTime.TimeScale when it is above 0 (0xf884b0, read once, at set-up); +0x38 the rate
+// the update 0x65c1d0 advances the time with; +0x4b "running". A client's rate is pulled toward
+// the host's time (0x65c750: every 15 s from the host, a jump when 120 s apart), so the host's
+// rate is the one that counts. With slow-time on this sets both rates to a tenth of the base,
+// once per expedition, unless the base is already below 10 (the profile's TimeScale arrived).
+// Every 30 s it logs the time of day and the rates, so the log shows how fast the day goes.
+// The solo test of 12 Nov showed the circles do NOT run on this clock (rain at its 07:00).
+//
+// The circles run on the play-area manager's own clock (singleton 0x3c13158): +0x100 packed time
+// (same packing; +0xf8 its guard word), advanced in 0x698430 by dt * +0x118 * 1000 ms, unless the
+// debug property Game.PlayAreaTime.DebugIsDisableProgress is set. +0x118 the rate, +0x11c the base,
+// both set in 0x68b130 from param table 0x92 row 0 +0x1b4 (fallback 96), or the debug property
+// Game.PlayAreaTime.TimeScale when above 0. The circle update 0x696170 places the circle by this
+// time against each phase's start/end hour:minute (+0x1a4.. per 0x20-byte phase), and the event
+// script's "time of day" condition 0x603070 reads it too. A host (lobby_state 3) sends it every
+// 15 s (0x6987b0); a client (6) nudges its +0x118 by the difference / 15, or jumps when 120 s or
+// more apart and puts +0x118 back to its own +0x11c. So the host's rate counts, and a client whose
+// base is not also slowed keeps being pulled back.
+#define RVA_CLOCK_PTR   0x3c125d8
+#define CLOCK_TIME      0x08
+#define CLOCK_BASE_RATE 0x34
+#define CLOCK_RATE      0x38
+#define CLOCK_RUNNING   0x4b
+#define RVA_PLAY_AREA_PTR 0x3c13158
+#define PA_TIME           0x100
+#define PA_RATE           0x118
+#define PA_BASE_RATE      0x11c
+static int g_slow_time;
+static DWORD g_clock_tick, g_clock_next;
+static void clock_log(const char *when) {
+    char *clock = *(char **)(g_base + RVA_CLOCK_PTR);
+    if (!clock) {
+        logf("clock: %s: no clock", when);
+        return;
+    }
+    unsigned long long v = *(unsigned long long *)(clock + CLOCK_TIME);
+    logf("clock: %s: time of day %02u:%02u:%02u, base rate %.3f, rate %.3f, running %u (+%lus)", when,
+         (unsigned)(v >> 34) & 0x1f, (unsigned)(v >> 39) & 0x3f, (unsigned)(v >> 45) & 0x3f,
+         *(float *)(clock + CLOCK_BASE_RATE), *(float *)(clock + CLOCK_RATE), (unsigned char)clock[CLOCK_RUNNING],
+         (GetTickCount() - g_clock_tick) / 1000);
+    char *pa = *(char **)(g_base + RVA_PLAY_AREA_PTR);
+    if (!pa) return;
+    v = *(unsigned long long *)(pa + PA_TIME);
+    logf("clock: %s: circle clock %02u:%02u:%02u, base rate %.3f, rate %.3f", when, (unsigned)(v >> 34) & 0x1f,
+         (unsigned)(v >> 39) & 0x3f, (unsigned)(v >> 45) & 0x3f, *(float *)(pa + PA_BASE_RATE), *(float *)(pa + PA_RATE));
+}
+static void slow_time_frame(int first) {
+    if (first) {
+        g_clock_tick = GetTickCount();
+        g_clock_next = 0;
+        g_slow_time = setting(S_SLOW_TIME);
+        clock_log(g_slow_time ? "expedition start (slow-time on)" : "expedition start");
+        char *clock = *(char **)(g_base + RVA_CLOCK_PTR);
+        if (g_slow_time && clock) {
+            float base = *(float *)(clock + CLOCK_BASE_RATE);
+            if (base >= 10.0f) {
+                *(float *)(clock + CLOCK_BASE_RATE) = base / 10.0f;
+                *(float *)(clock + CLOCK_RATE) = base / 10.0f;
+                clock_log("rate set to a tenth");
+            } else logf("clock: base rate %.3f already slow (debug property arrived), left as it is", base);
+        }
+        char *pa = *(char **)(g_base + RVA_PLAY_AREA_PTR);
+        if (g_slow_time && pa) {
+            float base = *(float *)(pa + PA_BASE_RATE);
+            if (base >= 10.0f) {
+                *(float *)(pa + PA_BASE_RATE) = base / 10.0f;
+                *(float *)(pa + PA_RATE) = base / 10.0f;
+                clock_log("circle clock rate set to a tenth");
+            } else logf("clock: circle clock base rate %.3f already slow (debug property arrived), left as it is", base);
+        }
+        g_clock_next = 30000;
+        return;
+    }
+    if (GetTickCount() - g_clock_tick >= g_clock_next) {
+        clock_log("every 30 s");
+        g_clock_next += 30000;
+    }
+}
+
+// Host: publish where the host is. Checked every LOBBY_POS_PERIOD_MS; written when the block changed,
+// otherwise only when the host moved at least LOBBY_POS_MIN_MOVE and LOBBY_POS_MIN_GAP_MS passed since
+// the last write (or LOBBY_POS_REFRESH_MS passed), and never while someone is joining. Kept sparse
+// since the 12 Nov run, where the host's Steam client lost its lobby (cause not known; these writes
+// were the only new Steam traffic).
+#define LOBBY_POS_PERIOD_MS  10000
+#define LOBBY_POS_MIN_GAP_MS 30000
+#define LOBBY_POS_REFRESH_MS 60000
+#define LOBBY_POS_MIN_MOVE   5.0f
+static void lobby_position(void) {
+    static DWORD next, last_write;
+    static unsigned last_block;
+    static float last[3];
+    static u64 for_lobby;
+    DWORD now = GetTickCount();
+    if (for_lobby != g_lobby) for_lobby = g_lobby, next = 0, last_write = 0, last_block = 0;
+    if (!g_lobby || !steam_ready() || now < next || g_someone_joining) return;
+    next = now + LOBBY_POS_PERIOD_MS;
+    float p[3];
+    unsigned block;
+    if (!player_position(p, &block)) return;
+    float dx = p[0] - last[0], dy = p[1] - last[1], dz = p[2] - last[2];
+    if (block == last_block && last_write &&
+        (now - last_write < LOBBY_POS_MIN_GAP_MS ||
+         (dx * dx + dy * dy + dz * dz < LOBBY_POS_MIN_MOVE * LOBBY_POS_MIN_MOVE && now - last_write < LOBBY_POS_REFRESH_MS)))
+        return;
+    char text[64];
+    snprintf(text, sizeof text, "%08x", block);
+    lobby_set(LOBBY_BLOCK_KEY, text);
+    snprintf(text, sizeof text, "%.1f,%.1f,%.1f", p[0], p[1], p[2]);
+    lobby_set(LOBBY_POS_KEY, text);
+    last_block = block, last[0] = p[0], last[1] = p[1], last[2] = p[2], last_write = now;
+}
+
 // Host session over the expedition (called for every step of CSQuickMatchingCtrl).
 // Start: the first frame of InGame (23), after MoveMapStart has made its own solo-expedition leave
 // and after every loading screen of the start. End: the first frame of any other step. InGame
@@ -1369,12 +2172,13 @@ static void host_expedition(int step) {
     if (step == QM_STEP_INGAME) {
         if (!g_in_expedition) {
             team_test_frame(1);
+            slow_time_frame(1);
             g_in_expedition = 1;
             g_expedition_tick = GetTickCount();
             g_self_check = 0;
             lobby_search_reset();
             host_test_start();
-            logf("host: expedition reached its world%s", g_host_test ? ", opening a host session" : " (no host session: no host-test file)");
+            logf("host: expedition reached its world%s", g_host_test ? ", opening a host session" : " (no host session: host-test is off)");
             if (g_host_test) {
                 if (g_stop_pending) finish_pending_stop(1);
                 if (!g_network_on) set_network(1);
@@ -1385,6 +2189,7 @@ static void host_expedition(int step) {
             }
         }
         team_test_frame(0);
+        slow_time_frame(0);
         if (g_host_test == 1) {
             host_test_create();
             if (g_host_test == 1 && g_expedition_tick && GetTickCount() - g_expedition_tick > NET_READY_WAIT_MS) {
@@ -1394,6 +2199,7 @@ static void host_expedition(int step) {
         }
         if (g_host_test == 2) {
             lobby_mark();
+            lobby_position();
             if (g_lobby && !g_self_check && lobby_search_frame("host self-check")) g_self_check = 1;
         }
     } else if (g_in_expedition) {
@@ -1426,8 +2232,119 @@ static void toggle_search(const char *where) {
 // With one player a request moves the machine to SingleStart at once, and an Invasion request is
 // stopped there. With more players the machine stays idle offline (the game waits for its own
 // matchmaking), so an Invasion request still pending a moment later is taken up from the idle step.
+// Move test (joiner, at sync step 10 EndLobbyExit, controller idle in the Roundtable Hold). In order:
+//  1. pending map state through the game's one-line setters (0x6b0610 and the others 0x740110 /
+//     0xdf8a00 use; field matched by reading each setter): block gm+0xa74 = the host's nrpvp_block,
+//     gm+0xaac = 1 (0x6b05f0) and type gm+0xdc0 = 14 (0x6b0410), both as the host has them in its
+//     expedition. Join reason, +0xdc1 and the position stay as they are (no value we know; the
+//     position goes through protected code).
+//  2. context (vtable 0x2c75d20): mode +0x9d (vt+0x50), expected players +0x98 (vt+0x30). MoveMapStart
+//     (0xb593a0) with mode 2 sends a member-count mismatch to FailedStartMultiplay, so then the
+//     expected count is set to the session's member count with the context's own setter (vt+0x28,
+//     0xb454a0: one write). With mode 2 it also waits until gm+0xb40 is set (logged only).
+//  3. the controller's own set-step, vtable 0x2c76bd8 entry 4 (0xb5d840, a thunk into the game's
+//     protected code; the same call our expedition-start cancel makes, and what the game's steps do,
+//     e.g. SingleStart 0xb5c010 ends with vt+0x20(ctrl, 13)), with 21 MoveMapStart, made from inside
+//     the controller's step like the game's own calls; this frame's None step is then skipped.
+//     MoveMapStart accepts sync steps 0, 1 and 10 (0xdf0a80 -> 0xdcd030) and otherwise leaves.
+// Entry at MoveMapWait (13) was not chosen: it only waits (timer, cutscenes, members' +0xe7) and
+// then goes to HeroReSelect (14, the group's hero choice, which needs the host there too) in mode 2,
+// or to SingleSetup (18, a solo set-up job chain) otherwise.
+#define RVA_QM_CTRL_VTABLE  0x2c76bd8
+#define RVA_QM_SET_STEP     0xb5d840
+#define RVA_QM_CTX_VTABLE   0x2c75d20
+#define RVA_SET_PENDING_BLOCK 0x6b0610  // gm+0xa74 = *arg
+#define RVA_SET_PENDING_AAC   0x6b05f0  // gm+0xaac = arg
+#define RVA_SET_PENDING_TYPE  0x6b0410  // gm+0xdc0 = arg
+#define RVA_SET_PENDING_REASON 0x6b0520 // gm+0xdbc = arg
+#define QM_STEP_MOVE_MAP_START 21
+#define RVA_SET_ONLINE_MODE   0x6b0530  // gm+0xb40 = arg
+static void pending_log(const char *when) {
+    char *gm = *(char **)(g_base + RVA_GAME_MAN_PTR);
+    if (gm) logf("move test: %s: pending block %08x +aac %u type %u reason %d +dc1 %u", when, *(unsigned *)(gm + 0xa74),
+                 (unsigned char)gm[0xaac], (unsigned char)gm[0xdc0], *(int *)(gm + 0xdbc), (unsigned char)gm[0xdc1]);
+}
+static int move_force(char *ctrl) {
+    g_move = 2;
+    g_move_tick = GetTickCount();
+    void **vt = *(void ***)ctrl;
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR), *gm = *(char **)(g_base + RVA_GAME_MAN_PTR);
+    if ((char *)vt != g_base + RVA_QM_CTRL_VTABLE || vt[QM_CTRL_VT_SET_STEP] != (void *)(g_base + RVA_QM_SET_STEP) || !sm || !gm) {
+        join_over("move test: controller or managers not as expected");
+        return 0;
+    }
+    // The expedition's start block (as a solo start uses, with +0xaac 1 and reason -14), so the game
+    // places the player at the expedition's start; the host's current block only if that key is absent.
+    const char *text = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_START_KEY);
+    if (!text || !*text) {
+        logf("move test: the host's lobby has no %s, using %s", LOBBY_START_KEY, LOBBY_BLOCK_KEY);
+        text = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_BLOCK_KEY);
+    }
+    char *end = NULL;
+    unsigned block = text && *text ? (unsigned)strtoul(text, &end, 16) : 0;
+    if (!text || !*text || !end || *end || block == 0 || block == 0xffffffff) {
+        logf("move test: the host's lobby has no usable %s ('%s')", LOBBY_BLOCK_KEY, text ? text : "");
+        join_over("move test: no host block");
+        return 0;
+    }
+    ctx_log("move test");
+    play_state_log("move test, before");
+    // Play state as a group guest's start sets it (SingleStart 0xb5c010 / GuestReadyWait 0xb545a0:
+    // 0x200a20(2) requested mode expedition; 0x200a30 requested +0xdd = 2 so that after the switch
+    // +0xdc is 2 and the equipment packet 0xc is sent; gm+0xaf0 cleared with 0x6abae0, or the move
+    // request turns the requested mode into the sparring set-up 1).
+    ((void (*)(unsigned char))(g_base + 0x200a20))(2);
+    ((void (*)(unsigned char))(g_base + 0x200a30))(2);
+    if (gm[0xaf0]) ((void (*)(void))(g_base + 0x6abae0))();
+    play_state_log("move test, after");
+    pending_log("before");
+    ((void (*)(unsigned *))(g_base + RVA_SET_PENDING_BLOCK))(&block);
+    ((void (*)(unsigned char))(g_base + RVA_SET_PENDING_AAC))(1);
+    ((void (*)(unsigned char))(g_base + RVA_SET_PENDING_TYPE))(14);
+    // Join reason as a solo start sets it: SingleStart (0xb5c010) fills the join parameters with the
+    // context's vt+8 (0xb44630: reason -14 = 0xfffffff2 at +0x1c, type 14 at +0x20, +0x18 = 1 when the
+    // context is not a rejoin) and applies them with 0x740110, which passes the reason to 0x6b0520.
+    ((void (*)(int))(g_base + RVA_SET_PENDING_REASON))(-14);
+    pending_log("after (start block from the host's lobby)");
+    char *ctx = *(char **)(ctrl + 0xa8);
+    if (!ctx || *(char **)ctx != g_base + RVA_QM_CTX_VTABLE) {
+        join_over("move test: controller context not as expected");
+        return 0;
+    }
+    char *begin = *(char **)(sm + SM_PLAYERS_BEGIN), *stop = *(char **)(sm + SM_PLAYERS_BEGIN + 8);
+    int members = begin && stop >= begin ? (int)((stop - begin) / SM_PLAYER_SIZE) : 0;
+    unsigned char mode = (unsigned char)ctx[0x9d];
+    int expected = *(int *)(ctx + 0x98);
+    logf("move test: context mode %u, expected players %d, session members %d, gm+0xb40 %u", mode, expected, members,
+         (unsigned char)gm[0xb40]);
+    if (mode == 2 && expected != members) {
+        ((void (*)(void *, int))(*(void ***)ctx)[0x28 / 8])(ctx, members);
+        logf("move test: expected players set to %d (was %d), so MoveMapStart's count check passes", *(int *)(ctx + 0x98), expected);
+    }
+    // gm+0xb40 is the game's online-mode flag. Its only writers are the network flow's steps (0xde72f0
+    // Init, 0xde7f90 OfflineMode: 1 once the network is ready, 0xde7330 LeaveOnlineMode: 0), all through
+    // the one-line setter 0x6b0530. Our network runs with OfflineMode held (flow_offline_hook), so the
+    // flag stays 0, and MoveMapStart in mode 2 waits for it. Set it the way OfflineMode would; the flow
+    // itself stays held (no NotifyLeaveOfflineModeWait / OnlineMode / ServerRequestWait). Put back at 0
+    // when the test stops.
+    if (mode == 2 && !gm[0xb40]) {
+        if (g_network_on && guard_intact()) {
+            ((void (*)(unsigned char))(g_base + RVA_SET_ONLINE_MODE))(1);
+            g_move_online = 1;
+            logf("move test: online-mode flag gm+0xb40 set to %u (as the network flow's OfflineMode does)", (unsigned char)gm[0xb40]);
+        } else logf("move test: mode 2 with gm+0xb40 0 and no network of ours: MoveMapStart will wait");
+    }
+    logf("move test: controller +0x40 %d +0x44 %d before set-step(%d)", *(int *)(ctrl + 0x40), *(int *)(ctrl + 0x44),
+         QM_STEP_MOVE_MAP_START);
+    ((void (*)(void *, int))vt[QM_CTRL_VT_SET_STEP])(ctrl, QM_STEP_MOVE_MAP_START);
+    logf("move test: controller +0x40 %d +0x44 %d after", *(int *)(ctrl + 0x40), *(int *)(ctrl + 0x44));
+    return 1;
+}
+
 static void step_hook(void *ctrl, void *time, int step) {
     static int last = -1;
+    g_qm_ctrl = ctrl;
+    g_qm_step = step;
     if (step != last) {
         if (step != QM_STEP_NONE) log_start(ctrl, step);
         else logf("step None");
@@ -1440,10 +2357,13 @@ static void step_hook(void *ctrl, void *time, int step) {
             set_network(0);
         }
     }
-    host_expedition(step);
+    if (g_join != 4) host_expedition(step);  // an enter-test client opens no host session of its own
     if (g_host_test == 2 || g_stop_pending) host_test_watch();
     if (g_stop_pending) finish_pending_stop(0);
-    if (step != QM_STEP_NONE) {
+    if (step != QM_STEP_NONE && g_searching && g_join == 4) {
+        join_frame();  // enter test: the game may be taking the client into the host's world; network stays up
+        if (g_join == 3) return;  // just stopped (and a forced step may have been set back): skip this frame's step
+    } else if (step != QM_STEP_NONE) {
         if (g_invasion_pending) {
             void **vt = *(void ***)ctrl;
             ((void (*)(void *, int))vt[QM_CTRL_VT_SET_STEP])(ctrl, QM_STEP_NONE);
@@ -1460,8 +2380,11 @@ static void step_hook(void *ctrl, void *time, int step) {
     } else {  // the idle step runs every frame in the Roundtable Hold
         if (g_invasion_pending && GetTickCount() - g_request_tick > 300) toggle_search("machine stayed idle");
         if (g_searching && notices_idle()) notice(0);
-        if (g_searching) lobby_search_frame("search");
+        // No lobby list requests while a join is under way: nothing to choose then, and one less
+        // thing talking to Steam during the join.
+        if (g_searching && !(g_join_test && (g_join == 1 || g_join == 2 || g_join == 4))) lobby_search_frame("search");
         if (g_searching && g_join_test) join_frame();
+        if (g_move == 1 && g_join == 4 && g_searching && move_force(ctrl)) return;
     }
     g_step_original[step](ctrl, time);
 }
@@ -1653,6 +2576,7 @@ static DWORD WINAPI run(LPVOID self) {
         return 0;
     }
     logf("loaded, game base %p", g_base);
+    settings_load();
     if (g_guard_ok) logf("net guard: installed, %u of %u imports patched (outbound %s)", (unsigned)GUARDED_COUNT,
                          (unsigned)GUARDED_COUNT, NET_GUARD_REFUSE_OUTBOUND ? "refused" : "logged only");
     else logf("net guard: NOT installed (%s); the network will not be started", g_guard_msg);
@@ -1661,12 +2585,14 @@ static DWORD WINAPI run(LPVOID self) {
         logf("Seamless Co-op is loaded: observing only, no menu changes");
     } else {
         hook_target_list();
+        hook_map_load();
         hook_players_option();
         hook_expedition_start();
         hook_offline_check();
         hook_network_flow();
         hook_button_text();
         hook_eac_begin();
+        hook_acceptance();
     }
     for (;;) {
         Sleep(250);

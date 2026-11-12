@@ -16,6 +16,11 @@ mkdir -p "$O"
 
 gcc -O2 -Wall -Wextra -o "$D/linux/nightreign-invasions" "$L/gtk.c" "$L/core.c" "$O/zstd-linux.o" $(pkg-config --cflags --libs gtk+-3.0)
 gcc -O2 -Wall -Wextra -o "$D/linux/cli" "$L/cli.c" "$L/core.c" "$O/zstd-linux.o"
+# The build machine's C runtime objects may be marked as needing a newer CPU level than our code
+# uses (x86-64-v4 on CachyOS); the loader then refuses the binary on older CPUs, the Steam Deck among
+# them. Our own code is plain x86-64 (-O2, no -march), so the marking goes.
+objcopy --remove-section .note.gnu.property "$D/linux/nightreign-invasions"
+objcopy --remove-section .note.gnu.property "$D/linux/cli"
 "$ZIG" cc -target x86_64-windows-gnu -O2 -Wall -Wextra -Wl,--subsystem,windows -o "$D/windows/NightreignInvasions.exe" \
   "$L/win.c" "$L/core.c" "$O/zstd-windows.obj" -lole32 -lshell32 -ladvapi32 -lgdi32
 "$ZIG" cc -target x86_64-windows-gnu -O2 -o "$D/windows/cli.exe" "$L/cli.c" "$L/core.c" "$O/zstd-windows.obj" -ladvapi32

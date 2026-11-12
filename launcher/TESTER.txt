@@ -1,0 +1,20 @@
+Nightreign Invasions - tester build (not for release)
+=====================================================
+
+Both players must use the same package (the same invasion.dll); mixed versions are not supported.
+
+Test settings are in test-settings.toml, next to the launcher. Open it in a text editor, set the
+lines for your role to true, save, and start the game with "Play with the mod". Everything false
+plays like the plain mod. Extracting a new package over an old folder replaces test-settings.toml
+with the all-false one: set your lines again. Old empty switch files in work/native are ignored.
+
+  Host:     host-test = true
+  Invader:  join-test = true, enter-test = true and move-test = true  (not host-test)
+
+The other settings (team-test, no-rain, slow-time) are explained in the file. For no-rain and
+slow-time both players should use the same value; for slow-time the host's counts.
+
+enter-test and move-test may end on a stuck loading screen or a crash; quit the game if it hangs.
+
+The mod writes its log to work/native/invasion.log (its first lines list the settings it used).
+Send that file after each test session.

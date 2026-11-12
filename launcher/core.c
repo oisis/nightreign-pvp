@@ -859,18 +859,46 @@ static int no_rain(buf p) {
 // Slow clock (test sessions only): an empty file "slow-time" in work/native/ makes the profile set
 // the game's debug property Game.IngameTime.TimeScale to 7.29, a tenth of the expedition clock's
 // rate (GameSystemCommonParam +0x1bc = 72.9; the game reads the property in 0x140f884b0 and lets it
-// replace that rate when the clock is set up). The host's clock is the one clients follow.
-static int slow_time_wanted(void) {
-    char path[1300];
-    snprintf(path, sizeof path, "%s" SEP "work" SEP "native" SEP "slow-time", g_app);
-    return exists(path);
+// replace that rate when the clock is set up). The circles run on a second clock, the play-area
+// manager's, with its own property Game.PlayAreaTime.TimeScale (read in 0x14068b130 when above 0;
+// otherwise its rate comes from param table 0x92 row 0 +0x1b4): set to 7.29 as well. The host's
+// clocks are the ones clients follow.
+// Test settings (test phase only): test-settings.toml next to the launcher, read at every build
+// (each "Play with the mod"). A missing file means all false. no-rain and slow-time act here; the
+// resolved values of all of them go to work/native/test-settings.toml, which the DLL reads.
+#include "../mod/dll/settings.h"
+static signed char g_set[SETTINGS_COUNT];
+static int setting(int i) { return g_set[i] > 0; }
+static int load_settings(const char *path, signed char v[SETTINGS_COUNT]) {  // 0: no file
+    buf t = read_file(path);
+    char bad[300];
+    if (!t.p) {
+        for (int i = 0; i < SETTINGS_COUNT; i++) v[i] = 0;
+        return 0;
+    }
+    if (settings_parse((const char *)t.p, t.n, v, bad, sizeof bad)) logf_("test-settings.toml: ignored: %s", bad);
+    for (int i = 0; i < SETTINGS_COUNT; i++) if (v[i] < 0) v[i] = 0;
+    free(t.p);
+    return 1;
 }
-
-static int no_rain_wanted(void) {
-    char path[1300];
-    snprintf(path, sizeof path, "%s" SEP "work" SEP "native" SEP "no-rain", g_app);
-    return exists(path);
+static int read_settings(void) {
+    char path[1300], on[200] = "";
+    snprintf(path, sizeof path, "%s" SEP "test-settings.toml", g_app);
+    int found = load_settings(path, g_set);
+    for (int i = 0; i < SETTINGS_COUNT; i++)
+        if (g_set[i]) snprintf(on + strlen(on), sizeof on - strlen(on), " %s", SETTING_NAMES[i]);
+    logf_(found ? "Test settings:%s" : "Test settings:%s (no test-settings.toml next to the launcher)", on[0] ? on : " none");
+    snprintf(path, sizeof path, "%s" SEP "work" SEP "native" SEP "test-settings.toml", g_app);
+    make_parents(path);
+    FILE *f = fopen(path, "w");
+    if (!f) return logf_("cannot write %s", path), 0;
+    fprintf(f, "# Written by the launcher from test-settings.toml at every start; changes here are overwritten.\n");
+    for (int i = 0; i < SETTINGS_COUNT; i++) fprintf(f, "%s = %s\n", SETTING_NAMES[i], g_set[i] ? "true" : "false");
+    fclose(f);
+    return 1;
 }
+static int slow_time_wanted(void) { return setting(S_SLOW_TIME); }
+static int no_rain_wanted(void) { return setting(S_NO_RAIN); }
 
 // game's regulation.bin -> work/build/regulation.bin with our Target list row.
 static int build_regulation(const char *game_dir) {
@@ -910,7 +938,7 @@ static int build_regulation(const char *game_dir) {
         wr32(team_row + 0x08, 0x43340000);   // effectEndurance 180.0 s
         team_row[0x16D] = 16;                // changeTeamType 16
         wr32(team_row + 0x18C, 300050);      // vfxId1: red phantom look
-        if (no_rain_wanted()) logf_("Test option: no rain damage (work/native/no-rain)");
+        if (no_rain_wanted()) logf_("Test option: no rain damage");
         // Written as a zlib DCX, like our other files (the launcher has no zstd compressor). It has
         // to be compressed: the game crashes at start-up on a 55 MB regulation.bin of stored zstd
         // blocks. ponytail: unlike the game's own file this is not zstd; if the game ever stops
@@ -1232,8 +1260,8 @@ static int write_profile(void) {
     }
     fprintf(f, "\n[[natives]]\npath = \"native/invasion.dll\"\n");
     if (slow_time_wanted()) {
-        fprintf(f, "\n[debug_properties]\n\"Game.IngameTime.TimeScale\" = 7.29\n");
-        logf_("Test option: slow day clock (work/native/slow-time)");
+        fprintf(f, "\n[debug_properties]\n\"Game.IngameTime.TimeScale\" = 7.29\n\"Game.PlayAreaTime.TimeScale\" = 7.29\n");
+        logf_("Test option: slow day and circle clocks");
     }
     fclose(f);
     return 1;
@@ -1242,6 +1270,7 @@ static int write_profile(void) {
 int core_build(const char *game_dir) {
     char bhd_path[1100], bdt_path[1100], from[1300], to[1300];
     if (!core_check_game(game_dir)) return logf_("This is not the game's folder: %s", game_dir), 0;
+    if (!read_settings()) return 0;
     snprintf(bhd_path, sizeof bhd_path, "%s" SEP "data0.bhd", game_dir);
     snprintf(bdt_path, sizeof bdt_path, "%s" SEP "data0.bdt", game_dir);
     logf_("Reading the game archive...");
@@ -1461,6 +1490,18 @@ int core_selftest(void) {
         }
         if (!good) { ok = 0; logf_("selftest: param row insertion failed"); }
         free(q.p);
+    }
+    {  // test settings: values, comments, CRLF, case, unknown keys and bad values, a missing file
+        static const char t[] = "# c\r\nhost-test = true\r\n  JOIN-TEST=FALSE # x\r\nslow-time\t= True\r\n"
+                                "nope = true\r\nteam-test = yes\r\n\r\nno-rain = false";
+        signed char v[SETTINGS_COUNT];
+        char bad[64];
+        static const signed char want[SETTINGS_COUNT] = {1, 0, -1, -1, -1, 0, 1};
+        int good = settings_parse(t, sizeof t - 1, v, bad, sizeof bad) == 2 && !memcmp(v, want, sizeof v) &&
+                   !strcmp(bad, "nope = true, team-test = yes");
+        good = good && !load_settings("/nonexistent/test-settings.toml", v);
+        for (int i = 0; i < SETTINGS_COUNT; i++) good = good && v[i] == 0;
+        if (!good) { ok = 0; logf_("selftest: test settings parser failed"); }
     }
     if (ok) logf_("selftest ok");
     return ok;

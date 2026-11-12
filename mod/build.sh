@@ -1,6 +1,7 @@
 #!/bin/sh
 # Developer build of the mod into $W/build (see re/common.sh for R and W):
 #   native/invasion.dll        the client DLL
+#   native/test-settings.toml  copy of $W/test-settings.toml (test settings; none: all false)
 #   regulation.bin             the game's params plus our Target list row
 #   msg/<lang>/menu_dlc01…     menu texts, for the languages extracted to analysis/gamefiles
 #   menu/21_common_dlc01_…     the DLC menu icon atlas plus our Target list icon (needs Pillow)
@@ -22,8 +23,12 @@ DLL="-target x86_64-windows-gnu -shared -O2 -Wall -Wextra"
 "$ZIG" cc $DLL -o "$B/native/invasion.dll" "$R/mod/dll/invasion.c"
 "$ZIG" cc -target x86_64-windows-gnu -O2 -o "$B/unkrak.exe" "$R/mod/tools/unkrak.c"
 
-# Test sessions without the rain's damage: an empty file "no-rain" next to the DLL (build/native/).
-NO_RAIN=""; [ -e "$B/native/no-rain" ] && NO_RAIN="--no-rain"
+# Test settings: $W/test-settings.toml (same format as launcher/test-settings.toml) goes next to the
+# DLL, which reads it; without it every setting is false. no-rain acts here, on the regulation.
+SETTINGS="$W/test-settings.toml"
+if [ -e "$SETTINGS" ]; then cp "$SETTINGS" "$B/native/test-settings.toml"; else rm -f "$B/native/test-settings.toml"; fi
+NO_RAIN=""
+[ -e "$SETTINGS" ] && tr -d '\r' < "$SETTINGS" | grep -qiE '^[[:space:]]*no-rain[[:space:]]*=[[:space:]]*true[[:space:]]*(#.*)?$' && NO_RAIN="--no-rain"
 uv run -q "$R/mod/build_regulation.py" "$GAME/regulation.bin" "$B/regulation.bin" $NO_RAIN
 
 # Menu texts for the development package (the launcher does this itself for all languages).
