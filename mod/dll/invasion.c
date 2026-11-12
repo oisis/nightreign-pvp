@@ -78,6 +78,41 @@ static unsigned invaders_allowed(unsigned squad) {
 // Log the session manager's state whenever it changes.
 // ponytail: polled from our own thread, not the game's update thread. Fine for reading a few
 // fields; move onto a game-thread hook before doing anything heavier.
+// The game's three network managers. Each embeds the same starter object: state at +0x10 (0 off,
+// 1 starting, 2 ready, 3 and up: stopped with an error), "enabled" byte at +0x20. The game's
+// "network ready" test (0xdecac0) wants all three at 2; 0xdecc10(flag) enables or disables all
+// three and 0xdecc70() starts them. Observed only: which of them a session needs is not known yet.
+#define RVA_NET_OFFLINE_FLAG 0x3c174ac  // u8, the inverse of the last enable flag
+static const struct { unsigned ptr_rva, starter; } NET_MANAGERS[3] = {
+    {0x3c21e50, 0x60}, {0x3c21638, 0x18}, {RVA_SESSION_MAN_PTR, 0x48}};
+
+// Class name of a C++ object from its RTTI, or "?".
+static const char *class_name(void *object) {
+    char *vt = object ? *(char **)object : NULL;
+    if (!vt || vt < g_base || vt > g_base + 0x8000000) return "?";
+    char *locator = *(char **)(vt - 8);
+    if (locator < g_base || locator > g_base + 0x8000000) return "?";
+    unsigned type = *(unsigned *)(locator + 0x0c);
+    return type && type < 0x8000000 ? g_base + type + 0x10 : "?";
+}
+
+static void watch_network(void) {
+    static unsigned last[7] = {0xffffffff};
+    unsigned now[7];
+    char *obj[3];
+    for (int i = 0; i < 3; i++) {
+        obj[i] = *(char **)(g_base + NET_MANAGERS[i].ptr_rva);
+        now[i * 2] = obj[i] ? *(unsigned *)(obj[i] + NET_MANAGERS[i].starter + 0x10) : 0xfffffffe;
+        now[i * 2 + 1] = obj[i] ? (unsigned char)obj[i][NET_MANAGERS[i].starter + 0x20] : 0xfffffffe;
+    }
+    now[6] = *(unsigned char *)(g_base + RVA_NET_OFFLINE_FLAG);
+    if (!memcmp(now, last, sizeof now)) return;
+    memcpy(last, now, sizeof now);
+    for (int i = 0; i < 3; i++)
+        logf("network %d (%s): state %d, enabled %d", i, class_name(obj[i]), (int)now[i * 2], (int)now[i * 2 + 1]);
+    logf("network: offline flag %u", now[6]);
+}
+
 static void watch_session(void) {
     static unsigned last_state = 0xffffffff, last_handle = 0xffffffff, last_started = 0xffffffff;
     static unsigned last_players = 0xffffffff;
@@ -524,12 +559,18 @@ static DWORD WINAPI run(LPVOID self) {
         return 0;
     }
     logf("loaded, game base %p", g_base);
-    hook_target_list();
-    hook_players_option();
-    hook_expedition_start();
-    hook_offline_check();
+    // Seamless Co-op changes the same menu and lobby code. Next to it we only watch and log.
+    if (GetModuleHandleA("nrsc.dll")) {
+        logf("Seamless Co-op is loaded: observing only, no menu changes");
+    } else {
+        hook_target_list();
+        hook_players_option();
+        hook_expedition_start();
+        hook_offline_check();
+    }
     for (;;) {
         Sleep(250);
+        watch_network();
         watch_session();
     }
 }
