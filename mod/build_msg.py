@@ -18,9 +18,9 @@ OUR_TEXT = {
         131160: ("Invasion", "Najazd"),
         131161: ("Enter another squad's expedition as an invader.\nDefeat its host to win.",
                  "Wejdź do wyprawy innej drużyny jako najeźdźca.\nPokonaj hosta, aby wygrać."),
-        # Notice shown by the DLL when Invasion is chosen (until the search exists).
-        131162: ("Invasion chosen.\nSearching for an expedition to invade does not work in this version of the mod yet.",
-                 "Wybrano najazd.\nSzukanie wyprawy do najechania nie działa jeszcze w tej wersji moda."),
+        # Small notices shown by the DLL: repeated while searching, and once when the search is called off.
+        131162: ("Searching for an expedition to invade...", "Szukanie wyprawy do najechania..."),
+        131163: ("Invasion search cancelled", "Anulowano szukanie najazdu"),
     },
 }
 

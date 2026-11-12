@@ -6,8 +6,8 @@
 //   - adds an "Invasion" entry to the expedition menu's Target list (row 101 of NightBossMenuParam,
 //     which must exist in regulation.bin: mod/build_regulation.py, or the launcher) and a fourth
 //     entry to the "Number of Players" option;
-//   - cancels the expedition start when that Invasion entry is the chosen target, logs what was
-//     chosen and shows a notice; the search for a session to invade is not implemented yet.
+//   - when that Invasion entry is the chosen target: cancels the expedition start and enters the
+//     "searching" state, with a small repeating notice. Nothing is searched for yet.
 //
 // ponytail: addresses are hard-coded for nightreign.exe 1.3.3 (PE timestamp below) and the DLL does
 // nothing on any other build. Replace with signature scans when a second game version has to work.
@@ -263,7 +263,6 @@ static void hook_players_option(void) {
 // into a boss number (two lookups by row id, then a combine) and hands the result to the context's
 // "set targets" method. Our row converts to boss 0, so by then the choice is lost; we note it at the
 // first lookup instead.
-// ponytail: nothing searches for a session yet; that goes where the log line is.
 #define RVA_QM_STEP_TABLE        0x39ae9d0
 #define QM_STEP_NONE             0
 #define QM_CTRL_CONTEXT          0xa8       // CS::CSQuickMatchLobbyContext*
@@ -303,31 +302,59 @@ static int invasion_chosen(char *ctrl, const char *step, int log_it) {
     return g_invasion_chosen;
 }
 
-// A message box with a line of ours, the way the game reports a failed matchmaking start
-// (0x60a1c0): build the text object from its id, hand it to the dialog function.
-// The text object is never destroyed (one small leak per notice).
-#define RVA_MENU_TEXT_CTOR 0x7ac800  // text* (text *out, int id): CL_MenuText line by id
-#define RVA_SHOW_DIALOG    0x86a7a0  // handle* (handle out[2], text*)
-#define TEXT_INVASION_NOTICE 131162  // added to CL_MenuText by build_msg.py / the launcher
-static void show_notice(int text_id) {
-    _Alignas(16) char text[0x100];
-    void *handle[2];
-    void *t = ((void *(*)(void *, int))(g_base + RVA_MENU_TEXT_CTOR))(text, text_id);
-    ((void *(*)(void *, void *))(g_base + RVA_SHOW_DIALOG))(handle, t);
+// Small on-screen notices: the game's "summon message" box (CS::SummonMsgData pushed to the menu
+// manager's SummonMsgQueue), which shows a line for a moment and fades out by itself.
+#define RVA_MENU_TEXT_CTOR  0x7ac800  // text* (text *out, int id): CL_MenuText line by id
+#define RVA_SUMMON_MESSAGE  0x86b8d0  // bool (text*): queue a summon message (the queue copies the text)
+#define TEXT_SEARCHING      131162    // added to CL_MenuText by build_msg.py / the launcher
+#define TEXT_SEARCH_CANCELLED 131163
+static void notice(int which) {  // 0 searching, 1 cancelled
+    static _Alignas(16) char text[2][0x100];  // built once and kept: the game never frees them for us
+    static void *ready[2];
+    if (!ready[which])
+        ready[which] = ((void *(*)(void *, int))(g_base + RVA_MENU_TEXT_CTOR))(
+            text[which], which ? TEXT_SEARCH_CANCELLED : TEXT_SEARCHING);
+    ((unsigned char (*)(void *))(g_base + RVA_SUMMON_MESSAGE))(ready[which]);
 }
+
+// The invasion search. Choosing Invasion starts it, choosing it again or starting an ordinary
+// expedition ends it. While it runs the "searching" notice is repeated.
+// ponytail: nothing is searched for yet; the matchmaking call goes where the search starts.
+#define NOTICE_PERIOD_MS 4000  // one notice every this often: shown for a moment, then a pause
+static int g_searching;
+static DWORD g_last_notice;
 
 static void step_hook(int slot, void *ctrl, void *time) {
     DWORD now = GetTickCount();
     int entered = now - g_steps[slot].last_tick > 1000;  // first frame of this step
     g_steps[slot].last_tick = now;
     if (invasion_chosen(ctrl, g_steps[slot].name, entered)) {
-        if (entered) logf("invasion: chosen as the target, expedition start cancelled (search not implemented yet)");
         void **vt = *(void ***)ctrl;
         ((void (*)(void *, int))vt[QM_CTRL_VT_SET_STEP])(ctrl, QM_STEP_NONE);
-        if (entered) show_notice(TEXT_INVASION_NOTICE);
+        if (entered) {
+            g_searching = !g_searching;
+            g_last_notice = now;
+            notice(g_searching ? 0 : 1);
+            logf("invasion: search %s (expedition start cancelled)", g_searching ? "started" : "called off");
+        }
         return;
     }
+    if (entered && g_searching) {
+        g_searching = 0;
+        logf("invasion: search ended, an ordinary expedition is starting");
+    }
     g_steps[slot].original(ctrl, time);
+}
+
+// The machine's idle step runs every frame in the Roundtable Hold: our clock for the notice.
+#define RVA_QM_STEP_NONE_FN 0xb59820
+static void idle_step_hook(void *ctrl, void *time) {
+    DWORD now = GetTickCount();
+    if (g_searching && now - g_last_notice >= NOTICE_PERIOD_MS) {
+        g_last_notice = now;
+        notice(0);
+    }
+    ((step_fn)(g_base + RVA_QM_STEP_NONE_FN))(ctrl, time);
 }
 static void step_hook_0(void *c, void *t) { step_hook(0, c, t); }
 static void step_hook_1(void *c, void *t) { step_hook(1, c, t); }
@@ -388,6 +415,8 @@ static void hook_expedition_start(void) {
         g_steps[i].original = table[g_steps[i].index * 2];
         table[g_steps[i].index * 2] = hooks[i];
     }
+    if (table[QM_STEP_NONE * 2] == (step_fn)(g_base + RVA_QM_STEP_NONE_FN)) table[QM_STEP_NONE * 2] = idle_step_hook;
+    else logf("expedition start: idle step does not look as expected, notices will not repeat");
     logf("expedition start: hooked");
 }
 
