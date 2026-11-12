@@ -366,6 +366,27 @@ static int g_host_test;  // 0 off, 1 waiting for the network, 2 create called, 3
 #define EAC_ERROR         0xa0       // u32, last error of the begin-session step
 #define SM_END_CODE       0x6b8      // u64, code of the implementation event that ended the session
 static DWORD g_host_test_tick;
+// The session's member list (0xF0-byte entries at +0x78), as the member-add code 0xdf5ae0 fills it:
+// +0xd0 player slot (0xdfd6a0), +0xd4 a value from 0x4d33c0 (host only), +0xe1 "this is us",
+// +0xe2 admitted remotely, +0xe3 set for others when we join as client (0xdf5930), +0xea a value
+// from the quick-match context (0xb67000 / 0xb66fd0). What +0xd4 and +0xea mean is not known; they
+// are logged to tell members apart. No ids or names. Also the manager's admission flags: a host
+// with +0x740 or +0x18 set, or whose block list (0xdcba00) names the member, removes a member that
+// arrives (implementation vt+0x28); +0x19 makes a client leave right after joining.
+#define SM_CLOSED   0x18
+#define SM_LEAVING  0x19
+#define SM_REFUSE   0x740
+static void log_members(char *sm, const char *who) {
+    char *begin = *(char **)(sm + SM_PLAYERS_BEGIN), *end = *(char **)(sm + SM_PLAYERS_BEGIN + 8);
+    unsigned count = begin && end >= begin ? (unsigned)((end - begin) / SM_PLAYER_SIZE) : 0;
+    logf("%s: %u members, admission flags closed %u leaving %u refuse %u", who, count, (unsigned char)sm[SM_CLOSED],
+         (unsigned char)sm[SM_LEAVING], (unsigned char)sm[SM_REFUSE]);
+    for (unsigned i = 0; i < count && i < 8; i++) {
+        unsigned char *m = (unsigned char *)begin + i * SM_PLAYER_SIZE;
+        logf("%s:   member %u: us %u slot %d d4 %d remote %u e3 %u e4 %u ea %u", who, i, m[0xe1], *(int *)(m + 0xd0),
+             *(int *)(m + 0xd4), m[0xe2], m[0xe3], m[0xe4], m[0xea]);
+    }
+}
 static void host_test_watch(void) {
     static unsigned last[7];
     static unsigned long long last_end;
@@ -379,11 +400,13 @@ static void host_test_watch(void) {
     unsigned long long end_code = *(unsigned long long *)(sm + SM_END_CODE);
     if (!memcmp(now, last, sizeof now) && end_code == last_end && g_host_test_tick) return;
     if (!g_host_test_tick) g_host_test_tick = GetTickCount();
+    int members_changed = now[4] != last[4];
     memcpy(last, now, sizeof now);
     last_end = end_code;
     logf("host test: +%lums lobby_state %u handle %u create %u role %u players %u end_code %llx | eac %s, platform %s, flags %u, error %u (0x%x)",
          GetTickCount() - g_host_test_tick, now[0], now[1], now[2], now[3], now[4], end_code, eac ? "present" : "missing",
          eac && *(void **)(eac + EAC_PLATFORM) ? "set" : "null", now[5], now[6], now[6]);
+    if (members_changed) log_members(sm, "host test");
 }
 static unsigned long long g_lobby;      // Steam lobby id of our host session, once read
 static unsigned g_marked_squad;         // squad size last written to the lobby, ~0 = not yet
@@ -479,6 +502,7 @@ static int host_test_leave(void) {
 // LEAVE_WAIT_MS, checked on every step of the machine.
 #define LEAVE_WAIT_MS 5000
 static void set_network(int on);
+static int join_leave(void);
 static DWORD g_stop_pending;  // tick of the leave request; network still up until it is through
 static void finish_pending_stop(int now) {
     char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
@@ -500,6 +524,7 @@ static void set_network(int on) {
     }
     if (!on) {
         host_test_leave();
+        join_leave();
         g_stop_pending = 0;
     }
     g_network_on = on;
@@ -936,7 +961,11 @@ static u64 g_list_call;
 static DWORD g_list_tick;
 static unsigned g_list_count;
 static int g_self_check;  // host: 0 not yet, 1 request done
+static u64 g_candidate;    // invader: the lobby the last list picked, 0 = none
+static int g_join_test;    // invader: "join-test" file present when the search started
+static unsigned g_squad;   // host: the expedition's squad size, fixed when the lobby is first marked
 
+static void log_pending_state(const char *who);
 // Host, every frame while the session runs: mark the lobby once, then keep squad / free slots current.
 static void lobby_mark(void) {
     char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
@@ -949,8 +978,8 @@ static void lobby_mark(void) {
         return;
     }
     char *begin = *(char **)(sm + SM_PLAYERS_BEGIN), *end = *(char **)(sm + SM_PLAYERS_BEGIN + 8);
-    unsigned squad = begin && end >= begin ? (unsigned)((end - begin) / SM_PLAYER_SIZE) : 0;
-    if (squad == g_marked_squad || !squad || !steam_ready()) return;
+    unsigned members = begin && end >= begin ? (unsigned)((end - begin) / SM_PLAYER_SIZE) : 0;
+    if (!members || !steam_ready()) return;
     if (!g_lobby) {
         static int told;
         if (!(g_lobby = session_lobby_id(sm))) {
@@ -959,19 +988,31 @@ static void lobby_mark(void) {
         }
         told = 0;
         logf("host: session up, Steam lobby %llu (%016llx), type left as the game made it", g_lobby, g_lobby);
+        log_pending_state("host");
         lobby_set(LOBBY_MARK_KEY, "1");
         lobby_set(LOBBY_PROTO_KEY, LOBBY_PROTO);
         lobby_set(LOBBY_GAME_KEY, LOBBY_GAME);
+        g_squad = members;
+        g_list_tick = GetTickCount();  // self-check one period after marking
     }
-    // ponytail: every member counts as squad; subtract invaders once they can join.
+    // Squad: the session's members when the lobby was first marked (the expedition's own players are
+    // all in it by InGame). Session members beyond it are invaders; Steam lobby members beyond the
+    // session's are someone in the middle of joining, and hold a slot too.
+    // ponytail: a squad member who rejoins after a drop-out would count as an invader.
+    int in_lobby = g_steam.members(g_steam.mm, g_lobby);
+    unsigned key = members | (unsigned)(in_lobby & 0xff) << 8;
+    if (key == g_marked_squad) return;
+    g_marked_squad = key;
+    unsigned invaders = members > g_squad ? members - g_squad : 0;
+    unsigned joining = in_lobby > (int)members ? (unsigned)in_lobby - members : 0, allowed = invaders_allowed(g_squad);
+    unsigned free_slots = allowed > invaders + joining ? allowed - invaders - joining : 0;
     char text[16];
-    snprintf(text, sizeof text, "%u", squad);
+    snprintf(text, sizeof text, "%u", g_squad);
     lobby_set(LOBBY_SQUAD_KEY, text);
-    snprintf(text, sizeof text, "%u", invaders_allowed(squad));
+    snprintf(text, sizeof text, "%u", free_slots);
     lobby_set(LOBBY_FREE_KEY, text);
-    logf("host: lobby members %d of %d", g_steam.members(g_steam.mm, g_lobby), g_steam.limit(g_steam.mm, g_lobby));
-    if (g_marked_squad == ~0u) g_list_tick = GetTickCount();  // self-check one period after marking
-    g_marked_squad = squad;
+    logf("host: lobby members %d of %d; session members %u = squad %u + invaders %u, joining %u, free invader slots %u",
+         in_lobby, g_steam.limit(g_steam.mm, g_lobby), members, g_squad, invaders, joining, free_slots);
 }
 
 // One lobby list request at a time, every SEARCH_PERIOD_MS: the invader every idle frame while
@@ -1023,9 +1064,268 @@ static int lobby_search_frame(const char *who) {
              g_steam.limit(g_steam.mm, id), own ? "our own lobby" : fits ? "has a free invader slot" : "no slot for us");
         if (fits && !chosen) chosen = id;  // Steam sorts by distance: the first that fits
     }
-    if (chosen) logf("%s: would join lobby %llu (joining is not built)", who, chosen);
+    if (chosen) logf("%s: %s lobby %llu", who, g_join_test ? "candidate" : "would join (no join-test file)", chosen);
     else logf("%s: no lobby to join", who);
+    g_candidate = chosen;
     return 1;
+}
+
+// --- Join test (invader side), only with a "join-test" file next to the DLL -----------------------
+//
+// Join: 0xdf0f70(manager, u8 multiplay type, vector *join data, u8 title flow, u8 *one), the manager
+// half of the game's joins (JoinSessionJob through 0x73fa60 passes title flow 0, the title screen's
+// JoinSessionByTitleFlowJob 0xb1a3e0 passes 1, 0xdfd830 passes 0). Read: refuses unless lobby_state
+// is none/failed and +0x19 is clear; same ciphers and parameters as create (0xdf6e70, 0xdf4830);
+// implementation vt+0x10 (params, data, length) starts the Steam session, whose step 0x25921e0
+// takes an 8-byte lobby id and calls ISteamMatchmaking::JoinLobby; join handle at +0x28,
+// lobby_state 4. The manager's update (0xdf2a20) then sees the handle finish: success -> session
+// handle, EAC begin (0xdf2d3c, result ignored), members added, 0xdf5930 lobby_state 6 (client);
+// failure -> cleanup 0xdf61e0, a "could not join" notice (0x5b69e0), lobby_state 0.
+// Title flow 1 is used: after a started join it only calls 0xb831a0(0) (one global set to 0), where
+// 0 also shows a notice (0x60a8e0 text 0x2775), sets a flag in the game manager (0x6af640) and the
+// same global. The game's own join (0x73fa60) first stores the 0x22-byte join parameters as
+// pending multiplayer state (setters 0x6b0410..0x6b0620: multiplay type +0xdc0, ...); we have no
+// such parameters for a lobby found ourselves and leave them alone.
+// ponytail: multiplay type 0 (white summon), as the host's session; which type an invader should
+// carry is an open choice (1 = the old red invasion entry of the type table).
+// Where it stops: once lobby_state is 6 we are a member of the host's session, still in our hub.
+// Nothing readable shows what takes a client into a host's running expedition (the title-screen
+// rejoin's map entry and the quick-match guest steps are not traced to an entry point we can
+// drive), so the test holds the session JOIN_HOLD_MS, logging everything, then leaves and ends the
+// search. Any failure or a join stuck longer than JOIN_TIMEOUT_MS ends it the same way.
+#define RVA_SESSION_JOIN 0xdf0f70
+#define SM_JOIN_HANDLE   0x28
+#define JOIN_TIMEOUT_MS  30000
+#define JOIN_HOLD_MS     30000
+static int g_join;            // 0 waiting for a candidate, 1 join called, 2 joined (holding), 3 over
+static DWORD g_join_tick;
+static u64 g_join_data[1];    // the lobby id, kept for as long as the implementation might read it
+static void join_test_start(void) {
+    char path[MAX_PATH];
+    strcpy(path, log_path);
+    char *a = strrchr(path, '\\'), *b = strrchr(path, '/'), *dir = a > b ? a : b;
+    g_join_test = 0;
+    g_join = 0;
+    g_candidate = 0;
+    if (!dir) return;
+    strcpy(dir + 1, "join-test");
+    g_join_test = GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+    if (g_join_test) logf("join test: on (%s): the first candidate is joined", path);
+}
+// Every frame while joining: one line per change of the session's state, with ms since the call.
+static void join_watch(char *sm) {
+    static unsigned last[6];
+    static unsigned long long last_end;
+    static DWORD logged_for;  // g_join_tick of the join last logged: a new join always gets a first line
+    char *begin = *(char **)(sm + SM_PLAYERS_BEGIN), *end = *(char **)(sm + SM_PLAYERS_BEGIN + 8);
+    unsigned now[6] = {*(unsigned *)(sm + SM_LOBBY_STATE), *(unsigned *)(sm + SM_HANDLE), *(unsigned *)(sm + SM_JOIN_HANDLE),
+                       *(unsigned *)(sm + 0x10), begin && end >= begin ? (unsigned)((end - begin) / SM_PLAYER_SIZE) : 0,
+                       (unsigned char)sm[SM_LEAVING]};
+    unsigned long long end_code = *(unsigned long long *)(sm + SM_END_CODE);
+    if (!memcmp(now, last, sizeof now) && end_code == last_end && logged_for == g_join_tick) return;
+    logged_for = g_join_tick;
+    int members_changed = now[4] != last[4];
+    memcpy(last, now, sizeof now);
+    last_end = end_code;
+    char *eac = *(char **)(g_base + RVA_EAC_MAN_PTR);
+    logf("join test: +%lums lobby_state %u handle %u join %u role %u players %u leaving %u end_code %llx | eac error %u (0x%x)",
+         GetTickCount() - g_join_tick, now[0], now[1], now[2], now[3], now[4], now[5], end_code,
+         eac ? *(unsigned *)(eac + EAC_ERROR) : 0, eac ? *(unsigned *)(eac + EAC_ERROR) : 0);
+    if (members_changed) log_members(sm, "join test");
+}
+// The game manager's pending multiplayer state: where a joining player is put on the next map
+// load. Setters read (0x6b0410..0x6b0620, filled by the game's join 0x73fa60 and the title-screen
+// rejoin 0xb1a3e0 from the 0x22-byte join parameters); readers: the spawn choice 0xc38d31 (+0xaac
+// flag, +0xaa0, +0xa74 a map block id m{AA}_{BB}_{CC}_{DD}, +0xa78..+0xa80 three floats, as a
+// position) and MoveMapStep's constructor 0xc2fc30 (+0xdc0 multiplay type copied to the local
+// player's data +0xe6, +0xdbc join reason: -27..-24 are rejoin cases). +0xa78..+0xa80 is written by a
+// protected fragment (0x1afca8d), so the position reading is inferred from its readers.
+// The rejoin record (session info +0x150, 0x1fe9b0): what the title-screen rejoin reads (join data
+// at +0x40, checked through the session layer by CheckSessionExistenceJob); a quick-match guest
+// writes it in GuestReadyWait (0x2022d0). Logged only, to compare host and joiner.
+#define RVA_GAME_MAN_PTR    0x3c13258
+#define RVA_SESSION_INFO    0x3c078d0
+static void log_pending_state(const char *who) {
+    char *gm = *(char **)(g_base + RVA_GAME_MAN_PTR), *info = *(char **)(g_base + RVA_SESSION_INFO);
+    if (!gm) return;
+    float *pos = (float *)(gm + 0xa78);
+    logf("%s: game manager +a70 %08x block +a74 %08x pos %.2f %.2f %.2f +a94 %d +aa0 %d +aa4 %d +aa8 %d +aac %u join reason %d "
+         "type %u +dc1 %u next map +adc %08x", who, *(unsigned *)(gm + 0xa70), *(unsigned *)(gm + 0xa74), pos[0], pos[1], pos[2],
+         *(int *)(gm + 0xa94), *(int *)(gm + 0xaa0), *(int *)(gm + 0xaa4), *(int *)(gm + 0xaa8), (unsigned char)gm[0xaac],
+         *(int *)(gm + 0xdbc), (unsigned char)gm[0xdc0], (unsigned char)gm[0xdc1], *(unsigned *)(gm + 0xadc));
+    char *record = info ? *(char **)(info + 0x150) : NULL;
+    if (!record || IsBadReadPtr(record, 0x58)) return;
+    char hex[0x40 * 2 + 1];
+    for (unsigned i = 0; i < 0x40; i++) sprintf(hex + 2 * i, "%02x", (unsigned char)record[i]);
+    char *begin = *(char **)(record + 0x40), *end = *(char **)(record + 0x48);
+    logf("%s: rejoin record %s, join data %lld bytes", who, hex, begin && end >= begin ? (long long)(end - begin) : -1LL);
+}
+static void toggle_search(const char *where);
+static void join_over(const char *why) {
+    g_join = 3;
+    logf("join test: stopping (%s), leaving and ending the search", why);
+    toggle_search("join test over");
+}
+// Idle step, every frame while searching with the join test on.
+static void join_frame(void) {
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
+    if (!sm || g_join == 3) return;
+    unsigned state = *(unsigned *)(sm + SM_LOBBY_STATE);
+    if (g_join == 0) {
+        if (!g_candidate) return;
+        void **impl = session_impl(sm);
+        if (!((unsigned char (*)(void))(g_base + RVA_NET_READY))() || !impl || !*(unsigned *)((char *)impl + 0x10)) {
+            static DWORD told;
+            if (!told || GetTickCount() - told > 10000) logf("join test: candidate %llu waiting for the network", g_candidate);
+            told = GetTickCount();
+            return;
+        }
+        if ((state != 0 && state != 2 && state != 5) || sm[SM_LEAVING]) {
+            logf("join test: lobby_state %u leaving %u, the manager would refuse a join", state, (unsigned char)sm[SM_LEAVING]);
+            join_over("session manager busy");
+            return;
+        }
+        g_join_data[0] = g_candidate;
+        void *vector[2] = {g_join_data, g_join_data + 1};  // {begin, end}, as 0xdf0f70 reads it
+        unsigned char one = 1;
+        g_join_tick = GetTickCount();
+        logf("join test: joining lobby %llu (type %d, title flow 1)", g_candidate, MULTIPLAY_WHITE);
+        unsigned char ok = ((unsigned char (*)(void *, unsigned char, void *, unsigned char, unsigned char *))(
+            g_base + RVA_SESSION_JOIN))(sm, MULTIPLAY_WHITE, vector, 1, &one);
+        logf("join test: join -> %u, lobby_state %u -> %u, join handle %u", ok, state, *(unsigned *)(sm + SM_LOBBY_STATE),
+             *(unsigned *)(sm + SM_JOIN_HANDLE));
+        join_watch(sm);
+        if (!ok) {
+            join_over("join refused");
+            return;
+        }
+        g_join = 1;
+        return;
+    }
+    join_watch(sm);
+    DWORD waited = GetTickCount() - g_join_tick;
+    if (g_join == 1) {
+        if (state == 6) {
+            g_join = 2;
+            g_join_tick = GetTickCount();
+            logf("join test: joined as client after %lums. Entering the host's world is not built: holding %ums, then leaving",
+                 waited, JOIN_HOLD_MS);
+            log_members(sm, "join test");
+            log_pending_state("join test");
+        } else if (state == 0 || state == 2 || state == 5) join_over("join failed");
+        else if (waited > JOIN_TIMEOUT_MS) join_over("join timed out");
+    } else if (state != 6) join_over("no longer a client");
+    else if (waited > JOIN_HOLD_MS) join_over("hold time over");
+}
+// Leave a session we joined. Returns 1 if a leave was requested (the network then waits for it).
+static int join_leave(void) {
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
+    if (!g_join_test || !sm) return 0;
+    unsigned state = *(unsigned *)(sm + SM_LOBBY_STATE);
+    if (state != 4 && state != 6) return 0;
+    ((void (*)(void *, unsigned char))(g_base + RVA_SESSION_LEAVE))(sm, 0);
+    logf("join test: leave session, lobby_state %u -> %u", state, *(unsigned *)(sm + SM_LOBBY_STATE));
+    return 1;
+}
+
+// --- Team test, only with a "team-test" file next to the DLL ------------------------------------
+//
+// Puts the local player on team 16 for 180 s, 90 s after the expedition reaches its world, through
+// our SpEffect row 90071610 (build_regulation.py: copy of the neutral row 10101 with
+// effectEndurance 180, changeTeamType 16, vfxId1 300050 = red phantom look).
+// Calls, all read:
+//   0x3c7fd0 (ChrIns*, int SpEffect id, u8 0): the game's "add SpEffect to this character" (136
+//     call sites, nearly all (chr, constant id, 0)); it fills default vectors and calls the full
+//     apply 0x3c80a0 with the character as its own source. Only the wrapper is read in full; the
+//     apply behind it is long and read only in part (the team step is in 0x3db410: SpEffect row
+//     +0x16d < 81 -> temporary-team slot at ChrIns+0x338).
+//   0x3d1b30 (ChrIns*, u8 *out): effective team = byte ChrIns+0x74, 15 while a SpEffect with
+//     state 0x84 is on (0x508e20), else the temporary-team slot's value when one is set.
+//   0xea17e0 (ref*, u32 id): SpEffectParam row lookup (param 15), to recognise our effect.
+// Local player: WorldChrMan (0x3c0f0a8) +0x174e8, as the game's own code tests it (e.g. 0x3db410).
+// Active effects: the character's SpEffect module (ChrIns+0x190), list from +8, next at entry+0x38,
+// entry+0 the param row, entry+0x68 flags (0x800c0003 = not active), as 0x508e20 walks it.
+// The effect ends by itself (effectEndurance); nothing removes it. Its row has saveCategory -1.
+#define RVA_WORLD_CHR_MAN  0x3c0f0a8
+#define WCM_LOCAL_PLAYER   0x174e8
+#define RVA_ADD_SPEFFECT   0x3c7fd0
+#define RVA_CHR_TEAM       0x3d1b30
+#define RVA_SPEFFECT_ROW   0xea17e0
+#define CHR_BASE_TEAM      0x74
+#define CHR_SPEFFECTS      0x190
+#define TEAM_TEST_SPEFFECT 90071610
+#define TEAM_TEST_START_MS 90000
+#define TEAM_TEST_LEN_MS   180000
+static int g_team_test;        // 0 off, 1 waiting, 2 applied, 3 over
+static DWORD g_team_tick, g_team_next;
+static int g_team_phase;
+static char *local_player(void) {
+    char *wcm = *(char **)(g_base + RVA_WORLD_CHR_MAN);
+    return wcm ? *(char **)(wcm + WCM_LOCAL_PLAYER) : NULL;
+}
+static int our_speffect_active(char *chr) {
+    struct { char *row; unsigned id; unsigned char flag; } ref = {0};
+    ((void (*)(void *, unsigned))(g_base + RVA_SPEFFECT_ROW))(&ref, TEAM_TEST_SPEFFECT);
+    char *module = *(char **)(chr + CHR_SPEFFECTS);
+    if (!ref.row) return -1;  // row not in regulation.bin
+    if (!module) return 0;
+    int n = 0;
+    for (char **e = *(char ***)(module + 8); e && n < 512; e = (char **)e[7], n++)
+        if (e[0] == ref.row && !(*(unsigned *)((char *)e + 0x68) & 0x800c0003)) return 1;
+    return 0;
+}
+static void team_log(const char *when) {
+    char *chr = local_player();
+    if (!chr) {
+        logf("team test: %s: no local player", when);
+        return;
+    }
+    unsigned char team = 0;
+    ((unsigned char *(*)(void *, unsigned char *))(g_base + RVA_CHR_TEAM))(chr, &team);
+    int active = our_speffect_active(chr);
+    logf("team test: %s: base team %u, effective team %u, our SpEffect %d %s (+%lums)", when,
+         (unsigned char)chr[CHR_BASE_TEAM], team, TEAM_TEST_SPEFFECT,
+         active < 0 ? "MISSING from regulation.bin" : active ? "active" : "not active", GetTickCount() - g_team_tick);
+}
+// InGame step, every frame. first: the first frame of this expedition's world.
+static void team_test_frame(int first) {
+    if (first) {
+        char path[MAX_PATH];
+        strcpy(path, log_path);
+        char *a = strrchr(path, '\\'), *b = strrchr(path, '/'), *dir = a > b ? a : b;
+        g_team_test = 0;
+        if (!dir) return;
+        strcpy(dir + 1, "team-test");
+        if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) return;
+        g_team_test = 1;
+        g_team_tick = GetTickCount();
+        logf("team test: on (%s): team 16 from +%us to +%us", path, TEAM_TEST_START_MS / 1000,
+             (TEAM_TEST_START_MS + TEAM_TEST_LEN_MS) / 1000);
+        team_log("start");
+        return;
+    }
+    if (!g_team_test || g_team_test == 3) return;
+    DWORD t = GetTickCount() - g_team_tick;
+    if (g_team_test == 1 && t >= TEAM_TEST_START_MS) {
+        char *chr = local_player();
+        if (!chr) return;  // try again next frame
+        team_log("before apply");
+        ((void (*)(void *, int, unsigned char))(g_base + RVA_ADD_SPEFFECT))(chr, TEAM_TEST_SPEFFECT, 0);
+        logf("team test: add SpEffect %d to the local player called", TEAM_TEST_SPEFFECT);
+        team_log("after apply");
+        g_team_test = 2;
+        g_team_phase = 0;
+        g_team_next = t + 5000;
+        return;
+    }
+    if (g_team_test == 2 && t >= g_team_next) {  // phases: 5 s after apply, effect's end, 5 s after
+        static const char *const what[] = {"5 s after apply", "effect due to end", "5 s after the end"};
+        team_log(what[g_team_phase]);
+        g_team_phase++;
+        if (g_team_phase == 1) g_team_next = TEAM_TEST_START_MS + TEAM_TEST_LEN_MS;
+        else if (g_team_phase == 2) g_team_next += 5000;
+        else g_team_test = 3;
+    }
 }
 
 // Host session over the expedition (called for every step of CSQuickMatchingCtrl).
@@ -1046,6 +1346,7 @@ static int host_test_leave(void);
 static void host_expedition(int step) {
     if (step == QM_STEP_INGAME) {
         if (!g_in_expedition) {
+            team_test_frame(1);
             g_in_expedition = 1;
             g_expedition_tick = GetTickCount();
             g_self_check = 0;
@@ -1061,6 +1362,7 @@ static void host_expedition(int step) {
                 }
             }
         }
+        team_test_frame(0);
         if (g_host_test == 1) {
             host_test_create();
             if (g_host_test == 1 && g_expedition_tick && GetTickCount() - g_expedition_tick > NET_READY_WAIT_MS) {
@@ -1088,7 +1390,10 @@ static void toggle_search(const char *where) {
     lobby_search_reset();
     if (g_searching) {
         if (g_stop_pending) finish_pending_stop(1);
+        join_test_start();
         set_network(1);
+    } else if (guard_intact() && join_leave()) {
+        g_stop_pending = GetTickCount();  // a joined session: the network goes down once the leave is through
     } else set_network(0);  // the search only looks: no session of ours to leave
     clear_notices();
     notice(g_searching ? 0 : 1);
@@ -1134,6 +1439,7 @@ static void step_hook(void *ctrl, void *time, int step) {
         if (g_invasion_pending && GetTickCount() - g_request_tick > 300) toggle_search("machine stayed idle");
         if (g_searching && notices_idle()) notice(0);
         if (g_searching) lobby_search_frame("search");
+        if (g_searching && g_join_test) join_frame();
     }
     g_step_original[step](ctrl, time);
 }
