@@ -208,26 +208,9 @@ static void watch_session(void) {
 
 // Runs in place of the game's call to _CreateBossList: let the game build its list (Nightlords from
 // fixed row numbers), then add our row the same way the game adds its own, and move it to the top.
-// While a search is running the entry reads "Cancel invasion": choosing it again calls the search
-// off. The texts are the row's name and description ids, swapped in the param row in memory (found
-// by value, like build_regulation.py does) each time the list is built.
-#define TEXT_INVASION_NAME 131160
-#define TEXT_INVASION_DESC 131161
-#define TEXT_CANCEL_NAME   131164
-#define TEXT_CANCEL_DESC   131165
-static int g_searching;  // defined with the search code below
-static void label_invasion_row(int *row) {
-    if (!row) return;
-    for (int i = 0; i < 19; i++) {  // the row is 19 ints
-        if (row[i] == TEXT_INVASION_NAME || row[i] == TEXT_CANCEL_NAME) row[i] = g_searching ? TEXT_CANCEL_NAME : TEXT_INVASION_NAME;
-        else if (row[i] == TEXT_INVASION_DESC || row[i] == TEXT_CANCEL_DESC) row[i] = g_searching ? TEXT_CANCEL_DESC : TEXT_INVASION_DESC;
-    }
-}
-
 static void show_boss_list_hook(void *grid, char *list, void *a3, void *a4) {
     _Alignas(16) char item[0x40];  // a MatchingNightBossViewItem is 0x28 bytes
     ((void *(*)(void *, int, unsigned char, unsigned char))(g_base + RVA_BOSS_ITEM_CTOR))(item, INVASION_ROW, 0, 0);
-    label_invasion_row(*(int **)(item + 0x18));
     ((void (*)(void *, void *))(g_base + RVA_BOSS_ITEM_PUSH))(list, item);
     ((void (*)(void *))(g_base + RVA_BOSS_ITEM_DTOR))(item);
     char *begin = *(char **)(list + 0x10), *end = *(char **)(list + 0x18);
@@ -566,6 +549,48 @@ static void hook_offline_check(void) {
     logf("offline check: hooked");
 }
 
+// The start button's label. The dialog builds it from one of several CL_MenuText lines ("Begin
+// expedition", "... 1 player", "... 2 players", ...) through seven calls to the text constructor,
+// with the dialog in rbx. With Invasion as the chosen target the line is replaced: "Begin invasion",
+// or "Cancel invasion" while a search is running (pressing the button then calls the search off).
+#define TEXT_BEGIN_INVASION  131166
+#define TEXT_CANCEL_INVASION 131164
+#define DIALOG_REQUEST       0xfc8   // the dialog's start request (same object fill_context gets)
+static void *button_text_hook(void *out, int id, char *dialog) {
+    char *request = dialog && !IsBadReadPtr(dialog + DIALOG_REQUEST, 8) ? *(char **)(dialog + DIALOG_REQUEST) : NULL;
+    if (request && !IsBadReadPtr(request + REQ_ROWS_BEGIN, 16)) {
+        unsigned *begin = *(unsigned **)(request + REQ_ROWS_BEGIN), *end = *(unsigned **)(request + REQ_ROWS_BEGIN + 8);
+        size_t count = begin && end >= begin ? (size_t)(end - begin) : 0;
+        if (count && count <= 64 && !IsBadReadPtr(begin, count * 4))
+            for (size_t i = 0; i < count; i++)
+                if (begin[i] == INVASION_ROW) {
+                    id = g_searching ? TEXT_CANCEL_INVASION : TEXT_BEGIN_INVASION;
+                    break;
+                }
+    }
+    return ((void *(*)(void *, int))(g_base + RVA_MENU_TEXT_CTOR))(out, id);
+}
+static void hook_button_text(void) {
+    static const unsigned sites[] = {0x9ef45e, 0x9ef4b8, 0x9ef509, 0x9ef563, 0x9ef5ce, 0x9ef61f, 0x9ef676};
+    unsigned char *stub = near_alloc(16);
+    void *hook = (void *)button_text_hook;
+    if (!stub) return;
+    stub[0] = 0x49; stub[1] = 0x89; stub[2] = 0xD8;  // mov r8, rbx   (the dialog)
+    stub[3] = 0x48; stub[4] = 0xB8;                  // mov rax, hook
+    memcpy(stub + 5, &hook, 8);
+    stub[13] = 0xFF; stub[14] = 0xE0;                // jmp rax
+    for (unsigned i = 0; i < sizeof sites / sizeof *sites; i++) {
+        unsigned char *site = (unsigned char *)g_base + sites[i];
+        int expected = (int)(RVA_MENU_TEXT_CTOR - (sites[i] + 5));
+        if (site[0] != 0xE8 || memcmp(site + 1, &expected, 4)) {
+            logf("start button: site %x does not look as expected, not hooked", sites[i]);
+            continue;
+        }
+        patch_rel32(site + 1, site + 5, stub);
+    }
+    logf("start button: hooked");
+}
+
 static void hook_expedition_start(void) {
     static const unsigned sites[] = {RVA_FILL_CONTEXT_CALL1, RVA_FILL_CONTEXT_CALL2};
     unsigned char *stub = near_alloc(12);
@@ -637,6 +662,7 @@ static DWORD WINAPI run(LPVOID self) {
         hook_expedition_start();
         hook_offline_check();
         hook_network_flow();
+        hook_button_text();
     }
     for (;;) {
         Sleep(250);

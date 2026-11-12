@@ -38,7 +38,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 7
+#define BUILD_FORMAT 8
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
                               "porbr", "rusru", "spaar", "spaes", "thath", "zhocn", "zhotw"};
@@ -55,7 +55,7 @@ static const struct { u32 id; const char *english, *polish; } OUR_TEXT[] = {
     {131162, "Searching for an expedition to invade...", "Szukanie wyprawy do najechania..."},
     {131163, "Invasion search cancelled", "Anulowano szukanie najazdu"},
     {131164, "Cancel invasion", "Anuluj najazd"},
-    {131165, "Stop searching for an expedition to invade.", "Przerwij szukanie wyprawy do najechania."},
+    {131166, "Begin invasion", "Rozpocznij najazd"},
 };
 #define OUR_TEXT_COUNT (sizeof OUR_TEXT / sizeof *OUR_TEXT)
 
