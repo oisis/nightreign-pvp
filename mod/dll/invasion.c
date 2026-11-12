@@ -392,6 +392,50 @@ static unsigned long long fill_context_hook(char *self, char *request) {
     return result;
 }
 
+// "Begin expedition" in the menu first checks the request (rax) for offline play:
+//     cmp byte [rax+0x49], 1 ; ja no      choices 0 and 1 (three, two players) ask "is online play on?"
+//     call is_online ; test al, al ; jne ok
+// no: cmp byte [rax+0x49], 2 ; je ok      choice 2 (one player) is always fine
+//     ... "cannot start a multiplayer session in offline mode"
+// Two changes: the first comparison takes our choice 3 as well (it was refused even online), and
+// the online question is answered "yes" when Invasion is the chosen target, because an invasion is
+// started by us, not by the game's matchmaking, whatever the squad size option says.
+#define RVA_OFFLINE_CMP_IMM   0x9eee9a  // the "1" of: 80 78 49 01
+#define RVA_OFFLINE_CALL      0x9eee9d  // e8 3e fc cb ff
+#define RVA_IS_ONLINE         0x6aeae0  // bool (void)
+static unsigned char online_check_hook(char *request) {
+    unsigned *begin = *(unsigned **)(request + REQ_ROWS_BEGIN), *end = *(unsigned **)(request + REQ_ROWS_BEGIN + 8);
+    size_t count = begin && end >= begin ? (size_t)(end - begin) : 0;
+    for (size_t i = 0; i < count && i < 64; i++)
+        if (begin[i] == INVASION_ROW) return 1;
+    return ((unsigned char (*)(void))(g_base + RVA_IS_ONLINE))();
+}
+
+static void hook_offline_check(void) {
+    unsigned char *imm = (unsigned char *)g_base + RVA_OFFLINE_CMP_IMM, *site = (unsigned char *)g_base + RVA_OFFLINE_CALL;
+    int expected = (int)(RVA_IS_ONLINE - (RVA_OFFLINE_CALL + 5));
+    unsigned char *stub = near_alloc(16);
+    static const unsigned char cmp[] = {0x80, 0x78, 0x49, 0x01};
+    if (memcmp(imm - 3, cmp, 4) || site[0] != 0xE8 || memcmp(site + 1, &expected, 4) || !stub) {
+        logf("offline check: code does not look as expected, not hooking");
+        return;
+    }
+    void *hook = (void *)online_check_hook;
+    stub[0] = 0x48; stub[1] = 0x89; stub[2] = 0xC1;  // mov rcx, rax   (the request)
+    stub[3] = 0x48; stub[4] = 0xB8;                  // mov rax, hook
+    memcpy(stub + 5, &hook, 8);
+    stub[13] = 0xFF; stub[14] = 0xE0;                // jmp rax
+    DWORD old;
+    if (!patch_rel32(site + 1, site + 5, stub) || !VirtualProtect(imm, 1, PAGE_EXECUTE_READWRITE, &old)) {
+        logf("offline check: cannot patch");
+        return;
+    }
+    *imm = PLAYERS_CHOICE_FOUR;
+    VirtualProtect(imm, 1, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), imm, 1);
+    logf("offline check: hooked");
+}
+
 static void hook_expedition_start(void) {
     static const unsigned sites[] = {RVA_FILL_CONTEXT_CALL1, RVA_FILL_CONTEXT_CALL2};
     unsigned char *stub = near_alloc(12);
@@ -447,6 +491,7 @@ static DWORD WINAPI run(LPVOID self) {
     hook_target_list();
     hook_players_option();
     hook_expedition_start();
+    hook_offline_check();
     for (;;) {
         Sleep(250);
         watch_session();
