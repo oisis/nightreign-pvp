@@ -208,32 +208,7 @@ static void watch_session(void) {
 
 // Runs in place of the game's call to _CreateBossList: let the game build its list (Nightlords from
 // fixed row numbers), then add our row the same way the game adds its own, and move it to the top.
-// The game remembers the chosen target as a boss number, and our row has none (it becomes boss 0),
-// so on the next visit the menu comes up with the first Nightlord chosen and "Begin expedition" on
-// the button. When the last start was an invasion, or a search is running, the dialog's request is
-// pointed back at our row before the list is shown. The grid is embedded in the dialog at +0xff0.
-static int g_invasion_last;  // the last start request chose Invasion
-static int g_searching;      // defined with the search code below
-#define DIALOG_FROM_GRID 0xff0
-#define DIALOG_REQUEST   0xfc8  // the dialog's start request: chosen Target rows at +0x58 (u32 vector)
-static void preselect_invasion(char *grid) {
-    char *dialog = grid - DIALOG_FROM_GRID;
-    char *request = !IsBadReadPtr(dialog + DIALOG_REQUEST, 8) ? *(char **)(dialog + DIALOG_REQUEST) : NULL;
-    if (!request || IsBadReadPtr(request + 0x58, 16)) return;
-    unsigned *begin = *(unsigned **)(request + 0x58), *end = *(unsigned **)(request + 0x60);
-    size_t count = begin && end >= begin ? (size_t)(end - begin) : 0;
-    char rows[200] = "";
-    for (size_t i = 0; i < count && i < 16 && !IsBadReadPtr(begin, count * 4); i++)
-        snprintf(rows + strlen(rows), sizeof rows - strlen(rows), "%s%u", i ? "," : "", begin[i]);
-    int want = g_invasion_last || g_searching;
-    logf("target list: request has rows [%s]%s", rows, want ? ", pointing it at Invasion" : "");
-    if (!want || !count || count > 64 || IsBadWritePtr(begin, 4)) return;  // an empty vector has no storage to reuse
-    begin[0] = INVASION_ROW;
-    *(unsigned **)(request + 0x60) = begin + 1;
-}
-
 static void show_boss_list_hook(void *grid, char *list, void *a3, void *a4) {
-    preselect_invasion(grid);
     _Alignas(16) char item[0x40];  // a MatchingNightBossViewItem is 0x28 bytes
     ((void *(*)(void *, int, unsigned char, unsigned char))(g_base + RVA_BOSS_ITEM_CTOR))(item, INVASION_ROW, 0, 0);
     ((void (*)(void *, void *))(g_base + RVA_BOSS_ITEM_PUSH))(list, item);
@@ -524,7 +499,6 @@ static unsigned long long fill_context_hook(char *self, char *request) {
         if (ctx && *(char **)ctx == g_base + RVA_QM_CONTEXT_VTABLE) *(unsigned *)(ctx + QM_CTX_PLAYERS) = 4;
     }
     g_invasion_pending = invasion;
-    g_invasion_last = invasion;
     g_request_tick = GetTickCount();
     logf("start request: players choice %u, %u target rows, invasion %d", (unsigned char)request[REQ_PLAYERS_CHOICE],
          (unsigned)count, invasion);
@@ -581,6 +555,7 @@ static void hook_offline_check(void) {
 // or "Cancel invasion" while a search is running (pressing the button then calls the search off).
 #define TEXT_BEGIN_INVASION  131166
 #define TEXT_CANCEL_INVASION 131164
+#define DIALOG_REQUEST       0xfc8   // the dialog's start request (same object fill_context gets)
 static void *button_text_hook(void *out, int id, char *dialog) {
     char *request = dialog && !IsBadReadPtr(dialog + DIALOG_REQUEST, 8) ? *(char **)(dialog + DIALOG_REQUEST) : NULL;
     if (request && !IsBadReadPtr(request + REQ_ROWS_BEGIN, 16)) {
