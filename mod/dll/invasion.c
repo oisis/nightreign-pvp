@@ -59,6 +59,195 @@ static void logf(const char *fmt, ...) {
     fclose(f);
 }
 
+// --- network guard -------------------------------------------------------------------------------
+//
+// The mod must never let the game reach FromSoftware's servers, and reading code cannot prove that
+// (parts of the game's network code are encrypted). So the game executable is made unable to do it:
+// its own imports of the functions that open connections or resolve names point at the functions
+// below instead. Steam's traffic (lobbies, P2P) runs inside steamclient through steam_api64.dll and
+// does not use these imports.
+//   - WINHTTP!WinHttpConnect: always refused. The game's one WinHTTP user (0x2109fa1) is its HTTP
+//     request runner, and the only URL in the executable is https://cl-steam.fromsoftware-game.net.
+//   - WS2_32!getaddrinfo, gethostbyname (#52): names containing "fromsoftware" refused, others passed
+//     through; every name is logged the first time it is seen.
+//   - WS2_32!connect (#4), WSAConnect, sendto (#20, UDP to an address): every destination logged the
+//     first time and refused while NET_GUARD_REFUSE_OUTBOUND is 1. Their callers in readable code are
+//     libcurl, Havok's debug socket and Dantelion's DevConnect / TCPServerSocket tools; nothing there
+//     belongs to Steam P2P (the session layer uses ISteamNetworking through steam_api64).
+// The rest of WS2_32 (socket, bind, listen, accept, send/recv on sockets that already exist, select,
+// byte order, getnameinfo, ...) cannot open a connection to a new address and is left alone.
+// Code reads these slots at each call ("call [rip+slot]"); no readable code copies them elsewhere.
+// The rdata copy of the import table (0x2bc2000) has no readable references for these functions.
+//
+// Installed from DllMain, before the game's code runs on (me3 loads natives right after the
+// protection's start-up, before the game's main), and checked again: if any slot is missing, holds
+// something unexpected or is later overwritten, set_network(1) refuses to bring the network up.
+#define NET_GUARD_REFUSE_OUTBOUND 1  // 0: only log connect/WSAConnect/sendto destinations
+static int g_guard_ok;               // all slots patched
+static volatile LONG g_guard_broken; // a patched slot no longer points at our function
+static char g_guard_msg[200];        // why the guard failed, for the log (DllMain cannot log)
+static SRWLOCK g_seen_lock = SRWLOCK_INIT;
+
+// True the first time `key` is seen. ponytail: 128 keys, after that nothing new is logged.
+static int first_time(const char *key) {
+    static char seen[128][80];
+    static int count;
+    int fresh = 1;
+    AcquireSRWLockExclusive(&g_seen_lock);
+    for (int i = 0; i < count && fresh; i++) fresh = strcmp(seen[i], key) != 0;
+    if (fresh && count < 128) snprintf(seen[count++], sizeof seen[0], "%s", key);
+    else fresh = 0;
+    ReleaseSRWLockExclusive(&g_seen_lock);
+    return fresh;
+}
+static int is_fromsoftware(const char *name) {
+    static const char word[] = "fromsoftware";
+    for (const char *p = name; p && *p; p++) {
+        size_t i = 0;
+        while (word[i] && p[i] && (p[i] | 0x20) == word[i]) i++;
+        if (!word[i]) return 1;
+    }
+    return 0;
+}
+// "1.2.3.4:443" or "[0:0:...:1]:443" from a sockaddr.
+static void addr_text(const unsigned char *sa, int len, char *out, size_t cap) {
+    unsigned family = sa && len >= 4 ? (unsigned)(sa[0] | sa[1] << 8) : 0, port = sa && len >= 4 ? (unsigned)(sa[2] << 8 | sa[3]) : 0;
+    if (family == 2 && len >= 16) snprintf(out, cap, "%u.%u.%u.%u:%u", sa[4], sa[5], sa[6], sa[7], port);
+    else if (family == 23 && len >= 24) {
+        snprintf(out, cap, "[");
+        for (int i = 0; i < 8; i++)
+            snprintf(out + strlen(out), cap - strlen(out), "%s%x", i ? ":" : "", (unsigned)(sa[8 + 2 * i] << 8 | sa[9 + 2 * i]));
+        snprintf(out + strlen(out), cap - strlen(out), "]:%u", port);
+    } else snprintf(out, cap, "family %u", family);
+}
+
+typedef void *(WINAPI *winhttp_connect_fn)(void *, const wchar_t *, unsigned short, DWORD);
+typedef int(WINAPI *getaddrinfo_fn)(const char *, const char *, const void *, void **);
+typedef void *(WINAPI *gethostbyname_fn)(const char *);
+typedef int(WINAPI *connect_fn)(UINT_PTR, const void *, int);
+typedef int(WINAPI *wsaconnect_fn)(UINT_PTR, const void *, int, void *, void *, void *, void *);
+typedef int(WINAPI *sendto_fn)(UINT_PTR, const char *, int, int, const void *, int);
+static getaddrinfo_fn g_getaddrinfo;
+static gethostbyname_fn g_gethostbyname;
+static connect_fn g_connect;
+static wsaconnect_fn g_wsaconnect;
+static sendto_fn g_sendto;
+
+static void *WINAPI guard_winhttp_connect(void *session, const wchar_t *server, unsigned short port, DWORD reserved) {
+    (void)session, (void)reserved;
+    char host[80] = "", key[100];
+    for (int i = 0; server && server[i] && i < 79; i++) host[i] = server[i] < 128 ? (char)server[i] : '?';
+    snprintf(key, sizeof key, "http %s:%u", host, port);
+    if (first_time(key)) logf("net guard: WinHttpConnect %s:%u refused", host, port);
+    SetLastError(12029);  // ERROR_WINHTTP_CANNOT_CONNECT
+    return NULL;
+}
+static int name_refused(const char *api, const char *name) {
+    int refuse = is_fromsoftware(name);
+    char key[100];
+    snprintf(key, sizeof key, "dns %s", name ? name : "(null)");
+    if (first_time(key)) logf("net guard: %s %s %s", api, name ? name : "(null)", refuse ? "refused" : "passed");
+    if (refuse) SetLastError(11001);  // WSAHOST_NOT_FOUND
+    return refuse;
+}
+static int WINAPI guard_getaddrinfo(const char *node, const char *service, const void *hints, void **result) {
+    if (name_refused("getaddrinfo", node)) {
+        if (result) *result = NULL;
+        return 11001;
+    }
+    return g_getaddrinfo(node, service, hints, result);
+}
+static void *WINAPI guard_gethostbyname(const char *name) {
+    return name_refused("gethostbyname", name) ? NULL : g_gethostbyname(name);
+}
+static int outbound_refused(const char *api, const void *to, int len) {
+    char addr[64], key[100];
+    addr_text(to, len, addr, sizeof addr);
+    snprintf(key, sizeof key, "%s %s", api, addr);
+    if (first_time(key)) logf("net guard: %s %s %s", api, addr, NET_GUARD_REFUSE_OUTBOUND ? "refused" : "passed");
+    if (NET_GUARD_REFUSE_OUTBOUND) SetLastError(10061);  // WSAECONNREFUSED
+    return NET_GUARD_REFUSE_OUTBOUND;
+}
+static int WINAPI guard_connect(UINT_PTR s, const void *to, int len) {
+    return outbound_refused("connect", to, len) ? -1 : g_connect(s, to, len);
+}
+static int WINAPI guard_wsaconnect(UINT_PTR s, const void *to, int len, void *a, void *b, void *c, void *d) {
+    return outbound_refused("WSAConnect", to, len) ? -1 : g_wsaconnect(s, to, len, a, b, c, d);
+}
+static int WINAPI guard_sendto(UINT_PTR s, const char *buf, int len, int flags, const void *to, int tolen) {
+    if (to && outbound_refused("sendto", to, tolen)) return -1;  // no address: an existing connection
+    return g_sendto(s, buf, len, flags, to, tolen);
+}
+
+static const struct {
+    const char *dll, *name;
+    unsigned ordinal;  // how the executable imports it; 0 = by name
+    void *hook, **original;
+} GUARDED[] = {
+    {"winhttp.dll", "WinHttpConnect", 0, (void *)guard_winhttp_connect, NULL},
+    {"ws2_32.dll", "getaddrinfo", 0, (void *)guard_getaddrinfo, (void **)&g_getaddrinfo},
+    {"ws2_32.dll", "gethostbyname", 52, (void *)guard_gethostbyname, (void **)&g_gethostbyname},
+    {"ws2_32.dll", "connect", 4, (void *)guard_connect, (void **)&g_connect},
+    {"ws2_32.dll", "WSAConnect", 0, (void *)guard_wsaconnect, (void **)&g_wsaconnect},
+    {"ws2_32.dll", "sendto", 20, (void *)guard_sendto, (void **)&g_sendto},
+};
+#define GUARDED_COUNT (sizeof GUARDED / sizeof *GUARDED)
+static void **g_guard_slot[GUARDED_COUNT];
+
+// The main module's import slot for GUARDED[i], or NULL.
+static void **import_slot(unsigned i) {
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew);
+    IMAGE_DATA_DIRECTORY dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    void **found = NULL;
+    for (IMAGE_IMPORT_DESCRIPTOR *d = (IMAGE_IMPORT_DESCRIPTOR *)(g_base + dir.VirtualAddress); dir.VirtualAddress && d->Name; d++) {
+        if (_stricmp(g_base + d->Name, GUARDED[i].dll)) continue;
+        IMAGE_THUNK_DATA64 *names = (IMAGE_THUNK_DATA64 *)(g_base + d->OriginalFirstThunk);
+        for (size_t k = 0; d->OriginalFirstThunk && names[k].u1.Ordinal; k++) {
+            ULONGLONG v = names[k].u1.Ordinal;
+            int match = IMAGE_SNAP_BY_ORDINAL64(v)
+                            ? GUARDED[i].ordinal && IMAGE_ORDINAL64(v) == GUARDED[i].ordinal
+                            : !GUARDED[i].ordinal && !strcmp(((IMAGE_IMPORT_BY_NAME *)(g_base + v))->Name, GUARDED[i].name);
+            if (!match) continue;
+            if (found) return NULL;  // imported twice: one slot would stay open
+            found = (void **)(g_base + d->FirstThunk) + k;
+        }
+    }
+    return found;
+}
+
+// Runs in DllMain (loader lock held): only module lookups of loaded DLLs, VirtualProtect and writes.
+static void install_net_guard(void) {
+    unsigned patched = 0;
+    for (unsigned i = 0; i < GUARDED_COUNT; i++) {
+        HMODULE m = GetModuleHandleA(GUARDED[i].dll);
+        void *real = m ? (void *)GetProcAddress(m, GUARDED[i].name) : NULL;
+        void **slot = import_slot(i);
+        // An ordinal import must be the function its name says.
+        if (real && GUARDED[i].ordinal && (void *)GetProcAddress(m, (LPCSTR)(ULONG_PTR)GUARDED[i].ordinal) != real) real = NULL;
+        DWORD old;
+        if (!real || !slot || *slot != real || !VirtualProtect(slot, sizeof *slot, PAGE_EXECUTE_READWRITE, &old)) {
+            snprintf(g_guard_msg, sizeof g_guard_msg, "%s!%s: %s", GUARDED[i].dll, GUARDED[i].name,
+                     !real ? "function not found" : !slot ? "import slot not found" : *slot != real ? "slot does not hold the function" : "cannot unprotect");
+            return;
+        }
+        if (GUARDED[i].original) *GUARDED[i].original = real;
+        *slot = GUARDED[i].hook;
+        VirtualProtect(slot, sizeof *slot, old, &old);
+        g_guard_slot[i] = slot;
+        patched++;
+    }
+    g_guard_ok = patched == GUARDED_COUNT;
+}
+static int guard_intact(void) {
+    if (!g_guard_ok) return 0;
+    for (unsigned i = 0; i < GUARDED_COUNT; i++)
+        if (*g_guard_slot[i] != GUARDED[i].hook) {
+            if (!InterlockedExchange(&g_guard_broken, 1)) logf("net guard: BROKEN, %s!%s was overwritten", GUARDED[i].dll, GUARDED[i].name);
+            return 0;
+        }
+    return 1;
+}
+
 // --- session observer -----------------------------------------------------------------------------
 
 // The session implementation behind the session manager (object inside the network library), or
@@ -130,9 +319,177 @@ static void hook_network_flow(void) {
     *entry = (void *)flow_offline_hook;
     logf("network flow: hooked");
 }
+// Host test (experiment): open a session as host on the network we started, once per search.
+// Active only while a file named "host-test" lies next to the DLL; looked for when a search starts.
+//
+// Create: 0xdefbd0, the game's own create-session (SessionCreateJob's lambda 0xb1ab00 calls it with
+// the job's multiplay type and a pointer to a byte 1). It refuses while lobby_state is 1, 3, 4 or 6,
+// builds the session's ciphers (0xdf6e70, protected), fills the parameters (0xdf4830: player limit
+// from +0x170) and calls the session implementation's create (0x25846a0), which needs the started
+// counter at impl+0x10 and starts a Steam session object; that object's step 0x2591950 calls
+// ISteamMatchmaking::CreateLobby. Success: lobby_state 1, then 3 (host) once Steam has made the lobby.
+// Leave: 0xdf1180(manager, 0), the way SessionLeaveJob (0xb1aa90) and CSQuickMatchingCtrl
+// (0xb59332, 0xb5944f) leave: lobby_state 7 and an asynchronous leave in the implementation.
+// ponytail: the network is stopped right after the leave request, without waiting for lobby_state 0
+// as the game's leave job does; wait for it in the idle step if the log shows the lobby left hanging.
+#define RVA_NET_READY       0xdecac0  // bool (void): all three managers at state 2 (reads only)
+#define RVA_SESSION_CREATE  0xdefbd0  // bool (CSSessionManager*, u8 multiplay type, u8 *one)
+#define RVA_SESSION_LEAVE   0xdf1180  // void (CSSessionManager*, u8 reason); the game passes 0
+#define SM_CREATE_HANDLE    0x24      // u32, what the implementation's create returned
+#define MULTIPLAY_WHITE     0         // multiplay type 0, as in the run with Seamless Co-op
+static int g_host_test;  // 0 off, 1 waiting for the network, 2 create called, 3 skipped
+
+// Why the session falls back to "none" (first host test: lobby_state 1 -> 0 within a second, one
+// member). The manager's update (0xdf2a20) polls the create handle (+0x24) through the
+// implementation (vt+8). Status 0: the session handle goes to +8 and 0xdf5500 runs: lobby_state = 3,
+// +0x10 = 4, +0x6b8 = 0, ..., and at its very end 0xf271d0(EAC manager, 2), which begins the EOS
+// anti-cheat session (0xf28cd0). If that returns false, 0xdf61e0 cleans up: lobby_state 0, handle 0.
+// Members are added after 0xdf5500 either way (that is the one member). Other status: 0xdf61e0
+// straight away, no members. Later, an implementation event 4 also ends in 0xdf61e0, storing its
+// code at +0x6b8 first.
+// 0xf28cd0 fails, and leaves a code at EAC+0xa0, when: EOS platform handle (+8) is null (0xf4241),
+// the local EOS user id is empty (0xf4242), the id is invalid (0xf4243), BeginSession fails
+// (0xf424a), other (0xf4244). The cleanup (0xf27270) clears +0x98 but not +0xa0.
+// So after a failure: EAC code set and +0x6b8 zero = the anti-cheat step; +0x6b8 non-zero = a
+// session event from the implementation. Read every frame on the game thread while the test runs.
+#define RVA_EAC_MAN_PTR   0x3c2c1a0  // EOS anti-cheat manager (EOS_AntiCheatClient_* calls)
+#define EAC_PLATFORM      0x08       // EOS platform handle
+#define EAC_SESSION_FLAGS 0x98       // u8, 2 = session begun for P2P
+#define EAC_ERROR         0xa0       // u32, last error of the begin-session step
+#define SM_END_CODE       0x6b8      // u64, code of the implementation event that ended the session
+static DWORD g_host_test_tick;
+static void host_test_watch(void) {
+    static unsigned last[7];
+    static unsigned long long last_end;
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR), *eac = *(char **)(g_base + RVA_EAC_MAN_PTR);
+    if (!sm) return;
+    char *begin = *(char **)(sm + SM_PLAYERS_BEGIN), *end = *(char **)(sm + SM_PLAYERS_BEGIN + 8);
+    unsigned now[7] = {*(unsigned *)(sm + SM_LOBBY_STATE), *(unsigned *)(sm + SM_HANDLE),
+                       *(unsigned *)(sm + SM_CREATE_HANDLE), *(unsigned *)(sm + 0x10),
+                       begin && end >= begin ? (unsigned)((end - begin) / SM_PLAYER_SIZE) : 0,
+                       eac ? (unsigned char)eac[EAC_SESSION_FLAGS] : 0xffffffff, eac ? *(unsigned *)(eac + EAC_ERROR) : 0xffffffff};
+    unsigned long long end_code = *(unsigned long long *)(sm + SM_END_CODE);
+    if (!memcmp(now, last, sizeof now) && end_code == last_end && g_host_test_tick) return;
+    if (!g_host_test_tick) g_host_test_tick = GetTickCount();
+    memcpy(last, now, sizeof now);
+    last_end = end_code;
+    logf("host test: +%lums lobby_state %u handle %u create %u role %u players %u end_code %llx | eac %s, platform %s, flags %u, error %u (0x%x)",
+         GetTickCount() - g_host_test_tick, now[0], now[1], now[2], now[3], now[4], end_code, eac ? "present" : "missing",
+         eac && *(void **)(eac + EAC_PLATFORM) ? "set" : "null", now[5], now[6], now[6]);
+}
+static void host_test_start(void) {
+    char path[MAX_PATH];
+    strcpy(path, log_path);
+    char *a = strrchr(path, '\\'), *b = strrchr(path, '/'), *dir = a > b ? a : b;
+    if (!dir) return;
+    strcpy(dir + 1, "host-test");
+    g_host_test = GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+    g_host_test_tick = 0;
+    if (g_host_test) logf("host test: on (%s)", path);
+}
+// Idle step, every frame while searching: create once the network is ready.
+static void host_test_create(void) {
+    if (g_host_test != 1 || !((unsigned char (*)(void))(g_base + RVA_NET_READY))()) return;
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
+    void **impl = sm ? session_impl(sm) : NULL;
+    if (!impl || !*(unsigned *)((char *)impl + 0x10)) return;  // layer not started yet: create would fail
+    unsigned state = *(unsigned *)(sm + SM_LOBBY_STATE);
+    if (state != 0 && state != 2 && state != 5) {  // the join's own test for "no session"
+        g_host_test = 3;
+        logf("host test: lobby_state %u, a session exists, not creating", state);
+        return;
+    }
+    g_host_test = 2;
+    host_test_watch();  // snapshot just before the call, +0ms
+    unsigned char one = 1;
+    unsigned char ok = ((unsigned char (*)(void *, unsigned char, unsigned char *))(g_base + RVA_SESSION_CREATE))(
+        sm, MULTIPLAY_WHITE, &one);
+    logf("host test: create session (type %d) -> %u, lobby_state %u -> %u, create handle %u", MULTIPLAY_WHITE, ok,
+         state, *(unsigned *)(sm + SM_LOBBY_STATE), *(unsigned *)(sm + SM_CREATE_HANDLE));
+}
+// The EOS anti-cheat step at the end of "host created" (0xdf5500): "call 0xf271d0" at 0xdf581c, with
+// the manager in rcx and 2 in dl; false makes the game clean the session up (0xdf61e0). With EAC off
+// the EOS platform handle (manager+8) is null and it always fails (0xf28cd0: error 0xf4241). Owner's
+// rule (BRIEF.md): the game's EAC checks on our own sessions are made to pass. While our network is up
+// and the guard is intact, the call reports success without running; otherwise the game's function
+// runs. What is skipped: with flags +0x98 at 0 the function would call 0xf2a060 (EndSession when a
+// platform exists; with none it only zeroes +0x98/+0x9c/+0x58/+0x60), set +0x98 to the mode and call
+// 0xf28cd0 (EOS BeginSession). We leave +0x98 at 0, so the leave (0xf27270) has nothing to end.
+// Other callers, not covered: 0xdf2d3c (joined as client, result ignored, so only error +0xa0 is
+// set), 0xdfe95e and 0xdfeb76 (mode 1, another manager's session at 0xdfexxx, not ours).
+// Peer register/unregister for members (0xf27280 from 0xdf61a6, 0xf272a0 from 0xdf6865) return at
+// once while the platform handle is null, their results are ignored, so nothing kicks anyone.
+#define RVA_EAC_BEGIN       0xf271d0  // bool (EAC manager*, u8 mode): 1 team, 2 P2P session
+#define RVA_EAC_BEGIN_CALL  0xdf581c  // e8 af 19 13 00 in 0xdf5500
+static unsigned char eac_begin_hook(void *manager, unsigned char mode) {
+    if (g_network_on && guard_intact()) {
+        logf("host test: EAC begin-session (mode %u) skipped, reported as begun", mode);
+        return 1;
+    }
+    return ((unsigned char (*)(void *, unsigned char))(g_base + RVA_EAC_BEGIN))(manager, mode);
+}
+static unsigned char *near_alloc(unsigned size);
+static int patch_rel32(unsigned char *field, unsigned char *next, unsigned char *target);
+static void hook_eac_begin(void) {
+    unsigned char *site = (unsigned char *)g_base + RVA_EAC_BEGIN_CALL;
+    int expected = (int)(RVA_EAC_BEGIN - (RVA_EAC_BEGIN_CALL + 5));
+    unsigned char *stub = near_alloc(12);
+    if (site[0] != 0xE8 || memcmp(site + 1, &expected, 4) || !stub) {
+        logf("EAC begin-session: call site does not look as expected, not hooked");
+        return;
+    }
+    void *hook = (void *)eac_begin_hook;
+    stub[0] = 0x48; stub[1] = 0xB8;  // mov rax, hook; jmp rax
+    memcpy(stub + 2, &hook, 8);
+    stub[10] = 0xFF; stub[11] = 0xE0;
+    if (patch_rel32(site + 1, site + 5, stub)) logf("EAC begin-session: hooked (host-created call site)");
+    else logf("EAC begin-session: cannot patch the call site");
+}
+
+// Returns 1 if a leave was requested.
+static int host_test_leave(void) {
+    int created = g_host_test == 2;
+    g_host_test = 0;
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
+    if (!created || !sm) return 0;
+    unsigned state = *(unsigned *)(sm + SM_LOBBY_STATE);
+    ((void (*)(void *, unsigned char))(g_base + RVA_SESSION_LEAVE))(sm, 0);
+    logf("host test: leave session, lobby_state %u -> %u", state, *(unsigned *)(sm + SM_LOBBY_STATE));
+    return 1;
+}
+
+// The leave is asynchronous: 0xdf1180 hands it to the implementation (0x2585140 -> 0x258dbd0 queues
+// a task on the Steam session object), the session's own step (slot 24, 0x2592480) calls
+// ISteamMatchmaking::LeaveLobby, and the manager's update (0xdf2a20) sees the leave handle (+0x2c)
+// finish and cleans up to lobby_state 0. Stopping the managers (0xdecb70) goes into protected code
+// (0x7475608), so nothing readable shows that a stop still leaves the lobby. So when the search is
+// called off from the hub, the network is stopped only once lobby_state is back to "none", or after
+// LEAVE_WAIT_MS. ponytail: an ordinary expedition starting stops it at once (no frames to wait in).
+#define LEAVE_WAIT_MS 5000
+static void set_network(int on);
+static DWORD g_stop_pending;  // tick of the leave request; network still up until it is through
+static void finish_pending_stop(int now) {
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
+    unsigned state = sm ? *(unsigned *)(sm + SM_LOBBY_STATE) : 0;
+    DWORD waited = GetTickCount() - g_stop_pending;
+    if (!now && state != 0 && state != 2 && state != 5 && waited < LEAVE_WAIT_MS) return;
+    logf("host test: leave %s after %lums, lobby_state %u; stopping the network",
+         state == 0 || state == 2 || state == 5 ? "done" : now ? "cut short" : "timed out", waited, state);
+    g_stop_pending = 0;
+    set_network(0);
+}
+
 // Must run on the game's thread.
 static void set_network(int on) {
     if (!g_flow_offline_step) return;  // without the hook the game would throw the player out
+    if (on && !guard_intact()) {
+        logf("network: not started, the network guard is not in place");
+        return;
+    }
+    if (!on) {
+        host_test_leave();
+        g_stop_pending = 0;
+    }
     g_network_on = on;
     if (on) {
         ((void (*)(unsigned char))(g_base + RVA_NET_ENABLE_ALL))(1);
@@ -472,7 +829,13 @@ static DWORD g_request_tick;  // when the last start request arrived
 static void toggle_search(const char *where) {
     g_invasion_pending = 0;
     g_searching = !g_searching;
-    set_network(g_searching);
+    if (g_searching) {
+        if (g_stop_pending) finish_pending_stop(1);
+        host_test_start();
+        set_network(1);
+    } else if (guard_intact() && host_test_leave()) {
+        g_stop_pending = GetTickCount();  // the network goes down once the leave is through
+    } else set_network(0);
     clear_notices();
     notice(g_searching ? 0 : 1);
     logf("invasion: search %s (%s)", g_searching ? "started" : "called off", where);
@@ -496,6 +859,7 @@ static void step_hook(void *ctrl, void *time, int step) {
             toggle_search("expedition start cancelled");
             return;
         }
+        if (g_stop_pending) finish_pending_stop(1);
         if (g_searching) {
             g_searching = 0;
             set_network(0);
@@ -505,6 +869,13 @@ static void step_hook(void *ctrl, void *time, int step) {
     } else {  // the idle step runs every frame in the Roundtable Hold
         if (g_invasion_pending && GetTickCount() - g_request_tick > 300) toggle_search("machine stayed idle");
         if (g_searching && notices_idle()) notice(0);
+        if (g_network_on && g_guard_broken) {
+            if (g_searching) toggle_search("network guard broken");
+            else finish_pending_stop(1);
+        }
+        if (g_searching) host_test_create();
+        if ((g_searching && g_host_test == 2) || g_stop_pending) host_test_watch();
+        if (g_stop_pending) finish_pending_stop(0);
     }
     g_step_original[step](ctrl, time);
 }
@@ -689,18 +1060,16 @@ static void hook_expedition_start(void) {
 }
 
 static DWORD WINAPI run(LPVOID self) {
-    // Log next to the DLL, so it is easy to find from outside the game.
-    GetModuleFileNameA((HMODULE)self, log_path, MAX_PATH);
-    char *dot = strrchr(log_path, '.');
-    if (dot) strcpy(dot, ".log");
-
-    g_base = (char *)GetModuleHandleA(NULL);
+    (void)self;
     IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew);
     if (nt->FileHeader.TimeDateStamp != GAME_TIMESTAMP) {
         logf("unsupported game build (timestamp %08lx), doing nothing", nt->FileHeader.TimeDateStamp);
         return 0;
     }
     logf("loaded, game base %p", g_base);
+    if (g_guard_ok) logf("net guard: installed, %u of %u imports patched (outbound %s)", (unsigned)GUARDED_COUNT,
+                         (unsigned)GUARDED_COUNT, NET_GUARD_REFUSE_OUTBOUND ? "refused" : "logged only");
+    else logf("net guard: NOT installed (%s); the network will not be started", g_guard_msg);
     // Seamless Co-op changes the same menu and lobby code. Next to it we only watch and log.
     if (GetModuleHandleA("nrsc.dll")) {
         logf("Seamless Co-op is loaded: observing only, no menu changes");
@@ -711,9 +1080,11 @@ static DWORD WINAPI run(LPVOID self) {
         hook_offline_check();
         hook_network_flow();
         hook_button_text();
+        hook_eac_begin();
     }
     for (;;) {
         Sleep(250);
+        guard_intact();
         watch_network();
         watch_session();
     }
@@ -723,6 +1094,15 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved) {
     (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(self);
+        // Log next to the DLL, so it is easy to find from outside the game.
+        GetModuleFileNameA(self, log_path, MAX_PATH);
+        char *dot = strrchr(log_path, '.');
+        if (dot) strcpy(dot, ".log");
+        g_base = (char *)GetModuleHandleA(NULL);
+        IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew);
+        // The guard goes in first, here rather than in run(): this runs before me3 lets the game go
+        // on, while run() starts only later, alongside the game's own start-up.
+        if (nt->FileHeader.TimeDateStamp == GAME_TIMESTAMP) install_net_guard();
         CreateThread(NULL, 0, run, self, 0, NULL);
     }
     return TRUE;
