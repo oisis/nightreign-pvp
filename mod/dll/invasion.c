@@ -304,12 +304,25 @@ static void log_start(char *ctrl, int step) {
          *(unsigned *)(ctx + QM_CTX_TARGET_INDEX), *(unsigned *)(ctx + QM_CTX_PLAYERS), g_invasion_pending);
 }
 
-// Small on-screen notices: the game's "summon message" box (CS::SummonMsgData pushed to the menu
-// manager's SummonMsgQueue), which shows a line for a moment and fades out by itself.
+// Small on-screen notices: the game's "summon message" box. CS::SummonMsgQueue (in the menu manager)
+// holds the message on screen and up to four waiting ones; the box plays one message, then takes
+// the next. So the "searching" line is queued again only when the queue has run empty, which keeps
+// it pulsing at the game's own pace without a backlog, and ending the search empties the queue.
+#define RVA_MENU_MAN_PTR    0x3c14a70 // CSMenuMan*
+#define MENU_MAN_SUMMON_QUEUE 0xd628
+#define SMQ_CURRENT_PRIORITY 0x10     // i16 priority of the message on screen, -1 when there is none
+#define SMQ_WAITING_LIST    0x58      // CSFixedList<SummonMsgData,4>
+#define SMQ_WAITING_COUNT   0x204     // i32
+#define RVA_SMQ_CLEAR_WAITING 0x8b38d0  // void (list*)
+#define RVA_SMQ_NEXT        0x8b3960  // void (queue*): take the next waiting message, or none
 #define RVA_MENU_TEXT_CTOR  0x7ac800  // text* (text *out, int id): CL_MenuText line by id
 #define RVA_SUMMON_MESSAGE  0x86b8d0  // bool (text*): queue a summon message (the queue copies the text)
 #define TEXT_SEARCHING      131162    // added to CL_MenuText by build_msg.py / the launcher
 #define TEXT_SEARCH_CANCELLED 131163
+static char *summon_queue(void) {
+    char *menu = *(char **)(g_base + RVA_MENU_MAN_PTR);
+    return menu ? menu + MENU_MAN_SUMMON_QUEUE : NULL;
+}
 static void notice(int which) {  // 0 searching, 1 cancelled
     static _Alignas(16) char text[2][0x100];  // built once and kept: the game never frees them for us
     static void *ready[2];
@@ -318,42 +331,57 @@ static void notice(int which) {  // 0 searching, 1 cancelled
             text[which], which ? TEXT_SEARCH_CANCELLED : TEXT_SEARCHING);
     ((unsigned char (*)(void *))(g_base + RVA_SUMMON_MESSAGE))(ready[which]);
 }
+static int notices_idle(void) {
+    char *q = summon_queue();
+    return q && *(short *)(q + SMQ_CURRENT_PRIORITY) < 0 && *(int *)(q + SMQ_WAITING_COUNT) == 0;
+}
+static void clear_notices(void) {
+    char *q = summon_queue();
+    if (!q) return;
+    ((void (*)(void *))(g_base + RVA_SMQ_CLEAR_WAITING))(q + SMQ_WAITING_LIST);
+    ((void (*)(void *))(g_base + RVA_SMQ_NEXT))(q);
+}
 
 // The invasion search. Choosing Invasion starts it, choosing it again or starting an ordinary
-// expedition ends it. While it runs the "searching" notice is repeated.
+// expedition ends it. While it runs the "searching" notice keeps coming back.
 // ponytail: nothing is searched for yet; the matchmaking call goes where the search starts.
-#define NOTICE_PERIOD_MS 4000  // one notice every this often: shown for a moment, then a pause
 static int g_searching;
-static DWORD g_last_notice;
+static DWORD g_request_tick;  // when the last start request arrived
 
-// Every step of the machine runs through here (step: its index in the table). Whichever step a
-// start reaches first, with one player or more, an Invasion request stops there.
+static void toggle_search(const char *where) {
+    g_invasion_pending = 0;
+    g_searching = !g_searching;
+    clear_notices();
+    notice(g_searching ? 0 : 1);
+    logf("invasion: search %s (%s)", g_searching ? "started" : "called off", where);
+}
+
+// Every step of the machine runs through here (step: its index in the table).
+// With one player a request moves the machine to SingleStart at once, and an Invasion request is
+// stopped there. With more players the machine stays idle offline (the game waits for its own
+// matchmaking), so an Invasion request still pending a moment later is taken up from the idle step.
 static void step_hook(void *ctrl, void *time, int step) {
     static int last = -1;
-    DWORD now = GetTickCount();
     if (step != last) {
         if (step != QM_STEP_NONE) log_start(ctrl, step);
         else logf("step None");
         last = step;
     }
-    if (step != QM_STEP_NONE && g_invasion_pending) {
-        g_invasion_pending = 0;
-        void **vt = *(void ***)ctrl;
-        ((void (*)(void *, int))vt[QM_CTRL_VT_SET_STEP])(ctrl, QM_STEP_NONE);
-        g_searching = !g_searching;
-        g_last_notice = now;
-        notice(g_searching ? 0 : 1);
-        logf("invasion: search %s (expedition start cancelled)", g_searching ? "started" : "called off");
-        return;
-    }
-    if (step == QM_STEP_NONE) {  // the idle step runs every frame in the Roundtable Hold: our clock
-        if (g_searching && now - g_last_notice >= NOTICE_PERIOD_MS) {
-            g_last_notice = now;
-            notice(0);
+    if (step != QM_STEP_NONE) {
+        if (g_invasion_pending) {
+            void **vt = *(void ***)ctrl;
+            ((void (*)(void *, int))vt[QM_CTRL_VT_SET_STEP])(ctrl, QM_STEP_NONE);
+            toggle_search("expedition start cancelled");
+            return;
         }
-    } else if (g_searching) {
-        g_searching = 0;
-        logf("invasion: search ended, an ordinary expedition is starting");
+        if (g_searching) {
+            g_searching = 0;
+            clear_notices();
+            logf("invasion: search ended, an ordinary expedition is starting");
+        }
+    } else {  // the idle step runs every frame in the Roundtable Hold
+        if (g_invasion_pending && GetTickCount() - g_request_tick > 300) toggle_search("machine stayed idle");
+        if (g_searching && notices_idle()) notice(0);
     }
     g_step_original[step](ctrl, time);
 }
@@ -385,6 +413,7 @@ static unsigned long long fill_context_hook(char *self, char *request) {
         if (ctx && *(char **)ctx == g_base + RVA_QM_CONTEXT_VTABLE) *(unsigned *)(ctx + QM_CTX_PLAYERS) = 4;
     }
     g_invasion_pending = invasion;
+    g_request_tick = GetTickCount();
     logf("start request: players choice %u, %u target rows, invasion %d", (unsigned char)request[REQ_PLAYERS_CHOICE],
          (unsigned)count, invasion);
     return result;
