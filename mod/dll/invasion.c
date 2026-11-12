@@ -6,6 +6,7 @@
 //   - adds an "Invasion" entry to the expedition menu's Target list (row 101 of NightBossMenuParam,
 //     which must exist in regulation.bin: mod/build_regulation.py, or the launcher) and a fourth
 //     entry to the "Number of Players" option;
+//   - makes that fourth option ask for a squad of four and raises the session's player limit to six;
 //   - when that Invasion entry is the chosen target: cancels the expedition start and enters the
 //     "searching" state, with a small repeating notice. Nothing is searched for yet.
 //
@@ -27,6 +28,7 @@
 #define SM_PLAYERS_BEGIN 0x78   // players vector: begin, end (+0x80); entries are 0xF0 bytes
 #define SM_PLAYER_SIZE   0xF0
 #define SM_PLAYER_LIMIT  0x170  // u32, 3 in vanilla
+#define SESSION_PLAYERS  6      // squad of four + two invaders
 #define IMPL_VT_EXPORT_JOIN_DATA 0x40  // bool (impl*, u32 handle, void *buf, u32 *size)
 
 // Expedition menu, Target list (CS::MatchingBossSelectDialog::_CreateBossList and helpers).
@@ -81,6 +83,12 @@ static void watch_session(void) {
     static unsigned last_players = 0xffffffff;
     char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
     if (!sm) return;
+    // The game allows three players per session (set once, in the manager's constructor). Ours hold a
+    // squad of up to four plus up to two invaders. Seamless Co-op raises the same field to six.
+    if (*(unsigned *)(sm + SM_PLAYER_LIMIT) == 3) {
+        *(unsigned *)(sm + SM_PLAYER_LIMIT) = SESSION_PLAYERS;
+        logf("session: player limit raised from 3 to %u", SESSION_PLAYERS);
+    }
     void **impl = session_impl(sm);
     unsigned state = *(unsigned *)(sm + SM_LOBBY_STATE), handle = *(unsigned *)(sm + SM_HANDLE);
     unsigned started = impl ? *(unsigned *)((char *)impl + 0x10) : 0;
@@ -200,8 +208,7 @@ static void hook_target_list(void) {
 #define TEXT_FOUR_PLAYERS 130460             // added to CL_MenuText by build_msg.py / the launcher
 
 // The fourth item: vtable, value byte at +8, text at +0x10. Built once, on first use.
-// ponytail: its value is 0, the same as "three players", so choosing it behaves like three players
-// for now; a value of its own needs the code that consumes the choice to be found first.
+// Its value is one the game does not know (3); fill_context_hook turns it into a squad of four.
 // The temporary string used to build it is never destroyed (one small leak per game run).
 static char *fourth_item(void) {
     static _Alignas(16) char item[COMBO_ITEM_SIZE];
@@ -210,7 +217,7 @@ static char *fourth_item(void) {
         static _Alignas(16) char tmp[0x100];
         void *text = ((void *(*)(void *, int))(g_base + RVA_TEXT_STRING_CTOR))(tmp, TEXT_FOUR_PLAYERS);
         *(void **)item = g_base + RVA_COMBO_ITEM_VTABLE;
-        item[8] = 0;
+        item[8] = 3;  // PLAYERS_CHOICE_FOUR
         ((void (*)(void *, void *))(g_base + RVA_STRING_COPY_CTOR))(item + 0x10, text);
         ready = 1;
         logf("players option: fourth item built");
@@ -258,17 +265,12 @@ static void hook_players_option(void) {
 // machine is in that step. We wrap the steps a start goes through first, solo and with matchmaking,
 // and when the chosen target is our Invasion row we send the machine back to its idle step instead
 // of letting an expedition begin.
-//
-// The chosen Target rows reach the machine's context through 0xb67cc0, which converts each menu row
-// into a boss number (two lookups by row id, then a combine) and hands the result to the context's
-// "set targets" method. Our row converts to boss 0, so by then the choice is lost; we note it at the
-// first lookup instead.
 #define RVA_QM_STEP_TABLE        0x39ae9d0
 #define QM_STEP_NONE             0
 #define QM_CTRL_CONTEXT          0xa8       // CS::CSQuickMatchLobbyContext*
 #define QM_CTRL_VT_SET_STEP      4          // void (ctrl*, int step); the game calls it with 0 on failure
 #define RVA_QM_CONTEXT_VTABLE    0x2c75d20
-#define QM_CTX_PLAYERS           0x98       // u32 (meaning to be confirmed from logs)
+#define QM_CTX_PLAYERS           0x98       // u32 squad size asked for
 #define QM_CTX_TARGETS_BEGIN     0xa8       // vector of u32 NightBossMenuParam row ids: begin, end (+8)
 #define QM_CTX_TARGET_INDEX      0x178      // u32 index into that vector
 
@@ -280,8 +282,7 @@ static struct { int index; unsigned rva; const char *name; step_fn original; DWO
     {18, 0xb5b850, "SingleSetup", NULL, 0},
 };
 
-static int g_saw_invasion_row;  // our row went through the conversion since the last "set targets"
-static int g_invasion_chosen;   // the targets now in the context came from our row
+static int g_invasion_chosen;   // the targets now in the context came from our Invasion row
 
 // Logs what is about to start. Returns 1 if it is an invasion.
 static int invasion_chosen(char *ctrl, const char *step, int log_it) {
@@ -361,47 +362,57 @@ static void step_hook_1(void *c, void *t) { step_hook(1, c, t); }
 static void step_hook_2(void *c, void *t) { step_hook(2, c, t); }
 static void step_hook_3(void *c, void *t) { step_hook(3, c, t); }
 
-// The context's "set targets" method (vtable slot 11): void (ctx*, src*), copying the u32 vector of
-// boss numbers at src+8 (begin) / src+0x10 (end).
-#define QM_CTX_VT_SET_TARGETS  11
-#define RVA_QM_CTX_SET_TARGETS 0xb45500
-static void set_targets_hook(char *ctx, char *src) {
-    g_invasion_chosen = g_saw_invasion_row;
-    g_saw_invasion_row = 0;
-    ((void (*)(char *, char *))(g_base + RVA_QM_CTX_SET_TARGETS))(ctx, src);
-}
-
-// First lookup of the row-to-boss conversion: "call 0xe7e1a0" with the menu row id in ecx.
-#define RVA_ROW_LOOKUP_CALL 0xb67e3a  // e8 61 63 31 00
-#define RVA_ROW_LOOKUP      0xe7e1a0
-static unsigned long long row_lookup_hook(unsigned row) {
-    if (row == INVASION_ROW) g_saw_invasion_row = 1;
-    return ((unsigned long long (*)(unsigned))(g_base + RVA_ROW_LOOKUP))(row);
+// The menu's start request reaches the context through "fill context" (0xb67cc0, two call sites):
+// u64 (self*, request*), with the context at self+8. In the request: the "Number of Players" choice
+// at +0x49 (0 three, 1 two, 2 one; 3 is our fourth option) and the chosen Target rows as a u32
+// vector at +0x58 (begin) / +0x60 (end). The function turns rows into boss numbers, where our row
+// becomes boss 0, and the choice into a player count.
+#define RVA_FILL_CONTEXT       0xb67cc0
+#define RVA_FILL_CONTEXT_CALL1 0xb67199  // e8 22 0b 00 00
+#define RVA_FILL_CONTEXT_CALL2 0xb671e0  // e8 db 0a 00 00
+#define REQ_PLAYERS_CHOICE     0x49
+#define REQ_ROWS_BEGIN         0x58
+#define PLAYERS_CHOICE_FOUR    3         // value of our combo item
+static unsigned long long fill_context_hook(char *self, char *request) {
+    unsigned *begin = *(unsigned **)(request + REQ_ROWS_BEGIN), *end = *(unsigned **)(request + REQ_ROWS_BEGIN + 8);
+    size_t count = begin && end >= begin ? (size_t)(end - begin) : 0;
+    int invasion = 0;
+    for (size_t i = 0; i < count && i < 64; i++)
+        if (begin[i] == INVASION_ROW) invasion = 1;
+    // Four players: let the game set everything up as for its largest squad, then correct the count.
+    int four = (unsigned char)request[REQ_PLAYERS_CHOICE] == PLAYERS_CHOICE_FOUR;
+    if (four) request[REQ_PLAYERS_CHOICE] = 0;
+    unsigned long long result = ((unsigned long long (*)(char *, char *))(g_base + RVA_FILL_CONTEXT))(self, request);
+    if (four) {
+        request[REQ_PLAYERS_CHOICE] = PLAYERS_CHOICE_FOUR;
+        char *ctx = *(char **)(self + 8);
+        if (ctx && *(char **)ctx == g_base + RVA_QM_CONTEXT_VTABLE) *(unsigned *)(ctx + QM_CTX_PLAYERS) = 4;
+    }
+    g_invasion_chosen = invasion;
+    return result;
 }
 
 static void hook_expedition_start(void) {
-    void **slot = (void **)(g_base + RVA_QM_CONTEXT_VTABLE) + QM_CTX_VT_SET_TARGETS;
-    DWORD old;
-    if (*slot == (void *)(g_base + RVA_QM_CTX_SET_TARGETS) && VirtualProtect(slot, 8, PAGE_READWRITE, &old)) {
-        *slot = (void *)set_targets_hook;
-        VirtualProtect(slot, 8, old, &old);
-    } else {
-        logf("expedition start: set-targets slot does not look as expected, not hooking");
-        return;
+    static const unsigned sites[] = {RVA_FILL_CONTEXT_CALL1, RVA_FILL_CONTEXT_CALL2};
+    unsigned char *stub = near_alloc(12);
+    for (int i = 0; i < 2; i++) {
+        unsigned char *site = (unsigned char *)g_base + sites[i];
+        int expected = (int)(RVA_FILL_CONTEXT - (sites[i] + 5));
+        if (site[0] != 0xE8 || memcmp(site + 1, &expected, 4) || !stub) {
+            logf("expedition start: fill-context call does not look as expected, not hooking");
+            return;
+        }
     }
-    unsigned char *site = (unsigned char *)g_base + RVA_ROW_LOOKUP_CALL, *stub = near_alloc(12);
-    int expected = (int)(RVA_ROW_LOOKUP - (RVA_ROW_LOOKUP_CALL + 5));
-    if (site[0] != 0xE8 || memcmp(site + 1, &expected, 4) || !stub) {
-        logf("expedition start: row lookup call does not look as expected, not hooking");
-        return;
-    }
-    void *hook = (void *)row_lookup_hook;
+    void *hook = (void *)fill_context_hook;
     stub[0] = 0x48; stub[1] = 0xB8;  // mov rax, hook; jmp rax
     memcpy(stub + 2, &hook, 8);
     stub[10] = 0xFF; stub[11] = 0xE0;
-    if (!patch_rel32(site + 1, site + 5, stub)) {
-        logf("expedition start: cannot patch the row lookup call");
-        return;
+    for (int i = 0; i < 2; i++) {
+        unsigned char *site = (unsigned char *)g_base + sites[i];
+        if (!patch_rel32(site + 1, site + 5, stub)) {
+            logf("expedition start: cannot patch a fill-context call");
+            return;
+        }
     }
 
     static const step_fn hooks[] = {step_hook_0, step_hook_1, step_hook_2, step_hook_3};
