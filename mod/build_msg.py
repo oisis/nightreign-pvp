@@ -21,6 +21,9 @@ OUR_TEXT = {
         # Small notices shown by the DLL: repeated while searching, and once when the search is called off.
         131162: ("Searching for an expedition to invade...", "Szukanie wyprawy do najechania..."),
         131163: ("Invasion search cancelled", "Anulowano szukanie najazdu"),
+        # Name and description of the Target entry while a search is running (the DLL swaps them in).
+        131164: ("Cancel invasion", "Anuluj najazd"),
+        131165: ("Stop searching for an expedition to invade.", "Przerwij szukanie wyprawy do najechania."),
     },
 }
 

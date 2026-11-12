@@ -96,6 +96,55 @@ static const char *class_name(void *object) {
     return type && type < 0x8000000 ? g_base + type + 0x10 : "?";
 }
 
+// Bringing the network up from the Roundtable Hold.
+//
+// Up: enable the three managers, then the game's own sign-in (CSAutoControlAPI::SignIn, 0xf18d30),
+// which copies the local user's identity into the sign-in manager and starts the managers. Seamless
+// Co-op makes the same two calls. Down: stop the managers and disable them again.
+//
+// The game does not expect this to happen while the player stands on a map. CS::CSNetworkFlowStep
+// watches the managers; its OfflineMode step sees them become ready and moves on to
+// NotifyLeaveOfflineModeWait, which starts CSEventNetworkErrorReturnTitleStep: a message box (empty,
+// the game has no text for it here) and a return to the title screen. So while the network is up
+// because we started it, the OfflineMode step is not run and the flow stays where it is.
+// ponytail: the flow never reaches its OnlineMode step this way. That step's server requests are
+// exactly what the mod must not make; revisit only if a session turns out to need that step.
+#define RVA_NET_ENABLE_ALL   0xdecc10   // void (u8 on); also keeps the global offline flag in step
+#define RVA_NET_STOP_ALL     0xdecb70   // void (void)
+#define RVA_SIGN_IN          0xf18d30   // bool (int user)
+#define RVA_FLOW_STEP_TABLE  0x39b2360  // CSNetworkFlowStep: 16-byte entries (function, name)
+#define FLOW_STEP_OFFLINE    1
+#define RVA_FLOW_OFFLINE_FN  0xde7f90
+static int g_network_on;  // we brought the network up
+static void (*g_flow_offline_step)(void *, void *);
+static void flow_offline_hook(void *flow, void *time) {
+    if (!g_network_on) g_flow_offline_step(flow, time);
+}
+static void hook_network_flow(void) {
+    void **entry = (void **)(g_base + RVA_FLOW_STEP_TABLE) + FLOW_STEP_OFFLINE * 2;
+    if (*entry != (void *)(g_base + RVA_FLOW_OFFLINE_FN)) {
+        logf("network flow: step table does not look as expected, not hooked");
+        return;
+    }
+    g_flow_offline_step = (void (*)(void *, void *))*entry;
+    *entry = (void *)flow_offline_hook;
+    logf("network flow: hooked");
+}
+// Must run on the game's thread.
+static void set_network(int on) {
+    if (!g_flow_offline_step) return;  // without the hook the game would throw the player out
+    g_network_on = on;
+    if (on) {
+        ((void (*)(unsigned char))(g_base + RVA_NET_ENABLE_ALL))(1);
+        unsigned char ok = ((unsigned char (*)(int))(g_base + RVA_SIGN_IN))(0);
+        logf("network: sign-in %s", ok ? "requested" : "refused (managers not there)");
+    } else {
+        ((void (*)(void))(g_base + RVA_NET_STOP_ALL))();
+        ((void (*)(unsigned char))(g_base + RVA_NET_ENABLE_ALL))(0);
+        logf("network: stopped");
+    }
+}
+
 static void watch_network(void) {
     static unsigned last[7] = {0xffffffff};
     unsigned now[7];
@@ -159,9 +208,26 @@ static void watch_session(void) {
 
 // Runs in place of the game's call to _CreateBossList: let the game build its list (Nightlords from
 // fixed row numbers), then add our row the same way the game adds its own, and move it to the top.
+// While a search is running the entry reads "Cancel invasion": choosing it again calls the search
+// off. The texts are the row's name and description ids, swapped in the param row in memory (found
+// by value, like build_regulation.py does) each time the list is built.
+#define TEXT_INVASION_NAME 131160
+#define TEXT_INVASION_DESC 131161
+#define TEXT_CANCEL_NAME   131164
+#define TEXT_CANCEL_DESC   131165
+static int g_searching;  // defined with the search code below
+static void label_invasion_row(int *row) {
+    if (!row) return;
+    for (int i = 0; i < 19; i++) {  // the row is 19 ints
+        if (row[i] == TEXT_INVASION_NAME || row[i] == TEXT_CANCEL_NAME) row[i] = g_searching ? TEXT_CANCEL_NAME : TEXT_INVASION_NAME;
+        else if (row[i] == TEXT_INVASION_DESC || row[i] == TEXT_CANCEL_DESC) row[i] = g_searching ? TEXT_CANCEL_DESC : TEXT_INVASION_DESC;
+    }
+}
+
 static void show_boss_list_hook(void *grid, char *list, void *a3, void *a4) {
     _Alignas(16) char item[0x40];  // a MatchingNightBossViewItem is 0x28 bytes
     ((void *(*)(void *, int, unsigned char, unsigned char))(g_base + RVA_BOSS_ITEM_CTOR))(item, INVASION_ROW, 0, 0);
+    label_invasion_row(*(int **)(item + 0x18));
     ((void (*)(void *, void *))(g_base + RVA_BOSS_ITEM_PUSH))(list, item);
     ((void (*)(void *))(g_base + RVA_BOSS_ITEM_DTOR))(item);
     char *begin = *(char **)(list + 0x10), *end = *(char **)(list + 0x18);
@@ -378,6 +444,7 @@ static void clear_notices(void) {
 }
 // The invasion search. Choosing Invasion starts it, choosing it again or starting an ordinary
 // expedition ends it. While it runs the "searching" notice keeps coming back.
+// The search brings the game's network up and its end takes it down again.
 // ponytail: nothing is searched for yet; the matchmaking call goes where the search starts.
 static int g_searching;
 static DWORD g_request_tick;  // when the last start request arrived
@@ -385,6 +452,7 @@ static DWORD g_request_tick;  // when the last start request arrived
 static void toggle_search(const char *where) {
     g_invasion_pending = 0;
     g_searching = !g_searching;
+    set_network(g_searching);
     clear_notices();
     notice(g_searching ? 0 : 1);
     logf("invasion: search %s (%s)", g_searching ? "started" : "called off", where);
@@ -410,6 +478,7 @@ static void step_hook(void *ctrl, void *time, int step) {
         }
         if (g_searching) {
             g_searching = 0;
+            set_network(0);
             clear_notices();
             logf("invasion: search ended, an ordinary expedition is starting");
         }
@@ -567,6 +636,7 @@ static DWORD WINAPI run(LPVOID self) {
         hook_players_option();
         hook_expedition_start();
         hook_offline_check();
+        hook_network_flow();
     }
     for (;;) {
         Sleep(250);
