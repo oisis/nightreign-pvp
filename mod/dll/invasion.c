@@ -1287,6 +1287,21 @@ static void team_log(const char *when) {
          (unsigned char)chr[CHR_BASE_TEAM], team, TEAM_TEST_SPEFFECT,
          active < 0 ? "MISSING from regulation.bin" : active ? "active" : "not active", GetTickCount() - g_team_tick);
 }
+// Where the host is (decision 14), not settled: which fields hold the local player's map block and
+// position is not read in this executable. ELDEN RING's ChrIns (fromsoftware-rs, read only) has the
+// block ids at +0x30..+0x3f and the position in map chunk coordinates at +0x80; in Nightreign the
+// team byte sits 8 bytes later than ELDEN RING's (+0x74 vs +0x6c), so the same fields may sit at
+// +0x38.. and +0x88/+0x90. The team test logs these candidates (and the game manager's +0xa70 /
+// +0xa74) every 10 s, so walking around shows which ones follow the player. Reads only.
+static void log_position_candidates(void) {
+    char *chr = local_player(), *gm = *(char **)(g_base + RVA_GAME_MAN_PTR);
+    if (!chr || IsBadReadPtr(chr, 0xb0)) return;
+    float *a = (float *)(chr + 0x80), *b = (float *)(chr + 0x88), *c = (float *)(chr + 0x90);
+    logf("team test: position candidates: chr+38 %08x +3c %08x +40 %08x +44 %08x | +80 %.1f %.1f %.1f | +88 %.1f %.1f %.1f | "
+         "+90 %.1f %.1f %.1f | gm+a70 %08x +a74 %08x", *(unsigned *)(chr + 0x38), *(unsigned *)(chr + 0x3c),
+         *(unsigned *)(chr + 0x40), *(unsigned *)(chr + 0x44), a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2],
+         gm ? *(unsigned *)(gm + 0xa70) : 0, gm ? *(unsigned *)(gm + 0xa74) : 0);
+}
 // InGame step, every frame. first: the first frame of this expedition's world.
 static void team_test_frame(int first) {
     if (first) {
@@ -1304,8 +1319,15 @@ static void team_test_frame(int first) {
         team_log("start");
         return;
     }
-    if (!g_team_test || g_team_test == 3) return;
+    if (!g_team_test) return;
     DWORD t = GetTickCount() - g_team_tick;
+    static DWORD next_position;
+    if (t < 1000) next_position = 0;
+    if (t >= next_position) {
+        log_position_candidates();
+        next_position = t + 10000;
+    }
+    if (g_team_test == 3) return;
     if (g_team_test == 1 && t >= TEAM_TEST_START_MS) {
         char *chr = local_player();
         if (!chr) return;  // try again next frame

@@ -38,7 +38,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 8
+#define BUILD_FORMAT 9
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
                               "porbr", "rusru", "spaar", "spaes", "thath", "zhocn", "zhotw"};
@@ -775,6 +775,103 @@ static buf param_add_row(buf p) {
     return out;
 }
 
+// Our SpEffect row (team test, later the invader's team), the scarabs' team and the optional no-rain
+// change. Keep in sync with mod/build_regulation.py, which explains the values and how they were
+// checked.
+#define SPEFFECT_PARAM "\\SpEffectParam.param"
+#define SPEFFECT_TEMPLATE 10101
+#define SPEFFECT_TEAM_ROW 90071610
+#define SPEFFECT_SIZE 0x400
+#define NPC_PARAM "\\NpcParam.param"
+#define NPC_TEAM 0x133
+#define PLAY_AREA_PARAM "\\PlayAreaCreateCommonParam.param"
+
+// Copy of the param with row new_id (a copy of template_id) inserted in id order; *row points at
+// the new row's data. Empty buf if the param does not look as expected.
+static buf param_insert_sorted(buf p, int template_id, int new_id, u64 size, u8 **row) {
+    buf out = {0};
+    if (p.n < 0x40 + 48 || !(p.p[0x2D] & 4)) return out;
+    u32 strings_off = rd32(p.p), count = rd16(p.p + 0x0A);
+    if (count < 2 || 0x40 + (size_t)count * 24 > p.n) return out;
+    u64 data_start = rd64(p.p + 0x48);
+    if (rd64(p.p + 0x40 + 24 + 8) - data_start != size || data_start != 0x40 + (u64)count * 24 ||
+        strings_off != data_start + count * size || strings_off > p.n) return out;
+    const u8 *tmpl = NULL;
+    u32 insert_at = count;
+    for (u32 i = 0; i < count; i++) {
+        const u8 *d = p.p + 0x40 + i * 24;
+        int id = (int)rd32(d);
+        if (rd64(d + 8) != data_start + i * size || (i && id <= (int)rd32(d - 24)) || id == new_id) return out;
+        if (id == template_id) tmpl = d;
+        if (id > new_id && insert_at == count) insert_at = i;
+    }
+    if (!tmpl) return out;
+    u32 shift = 24 + (u32)size;
+    out.p = xalloc(p.n + shift);
+    out.n = p.n + shift;
+    memcpy(out.p, p.p, 0x40);
+    wr32(out.p, strings_off + shift);
+    wr16(out.p + 0x0A, count + 1);
+    wr64(out.p + 0x10, rd64(p.p + 0x10) + shift);
+    wr64(out.p + 0x30, data_start + 24);
+    u64 new_start = data_start + 24;
+    for (u32 j = 0, i = 0; j <= count; j++) {
+        u8 *d = out.p + 0x40 + j * 24, *data = out.p + new_start + j * size;
+        const u8 *src = j == insert_at ? tmpl : p.p + 0x40 + i++ * 24;
+        wr32(d, j == insert_at ? (u32)new_id : rd32(src));
+        wr32(d + 4, 0);
+        wr64(d + 8, new_start + j * size);
+        wr64(d + 16, rd64(src + 16) + shift);
+        memcpy(data, p.p + rd64(src + 8), size);
+        if (j == insert_at) *row = data;
+    }
+    memcpy(out.p + strings_off + shift, p.p + strings_off, p.n - strings_off);
+    return out;
+}
+
+// Scarabs (NpcParam 41900000-41919999, 30 rows, all team 6) to team 17, in place. 0 if unexpected.
+static int scarab_rows(buf p) {
+    u32 count = rd16(p.p + 0x0A), changed = 0;
+    for (u32 i = 0; i < count; i++) {
+        const u8 *d = p.p + 0x40 + i * 24;
+        int id = (int)rd32(d);
+        if (id < 41900000 || id >= 41920000) continue;
+        u8 *team = p.p + rd64(d + 8) + NPC_TEAM;
+        if (*team != 6) return 0;
+        *team = 17;
+        changed++;
+    }
+    return changed == 30;
+}
+
+// No rain (test sessions only): PlayAreaCreateCommonParam row 0's rain SpEffects 99810 (+0x28) and
+// 99811 (+0x2c) become -1, in place. 0 if unexpected.
+static int no_rain(buf p) {
+    const u8 *d = p.p + 0x40;
+    if (rd16(p.p + 0x0A) < 1 || rd32(d) != 0) return 0;
+    u8 *row = p.p + rd64(d + 8);
+    if (rd32(row + 0x28) != 99810 || rd32(row + 0x2C) != 99811) return 0;
+    wr32(row + 0x28, 0xFFFFFFFF);
+    wr32(row + 0x2C, 0xFFFFFFFF);
+    return 1;
+}
+
+// Slow clock (test sessions only): an empty file "slow-time" in work/native/ makes the profile set
+// the game's debug property Game.IngameTime.TimeScale to 7.29, a tenth of the expedition clock's
+// rate (GameSystemCommonParam +0x1bc = 72.9; the game reads the property in 0x140f884b0 and lets it
+// replace that rate when the clock is set up). The host's clock is the one clients follow.
+static int slow_time_wanted(void) {
+    char path[1300];
+    snprintf(path, sizeof path, "%s" SEP "work" SEP "native" SEP "slow-time", g_app);
+    return exists(path);
+}
+
+static int no_rain_wanted(void) {
+    char path[1300];
+    snprintf(path, sizeof path, "%s" SEP "work" SEP "native" SEP "no-rain", g_app);
+    return exists(path);
+}
+
 // game's regulation.bin -> work/build/regulation.bin with our Target list row.
 static int build_regulation(const char *game_dir) {
     char path[1300];
@@ -793,18 +890,33 @@ static int build_regulation(const char *game_dir) {
     if (memcmp(dcx, "DCX", 3) || memcmp(dcx + 0x28, "ZSTD", 4) || csize > enc.n - 16 - 0x4C)
         return free(enc.p), logf_("regulation.bin is not in the expected format"), 0;
     buf bundle = {xalloc((size_t)usize + (1 << 17)), usize};
-    buf patched = {0}, body = {0}, param = {0};
-    int ok = 0, index;
+    buf patched = {0}, body = {0}, param = {0}, speffect = {0}, step = {0};
+    int ok = 0, index, sp_index, npc_index, area_index;
+    u8 *team_row = NULL;
     if (nr_zstd_decompress(dcx + 0x4C, csize, bundle.p, (size_t)usize + (1 << 17)) != usize) {
         logf_("regulation.bin could not be unpacked");
     } else if ((index = bnd4_find(bundle, TARGET_PARAM)) < 0 || !(param = param_add_row(bnd4_file(bundle, index))).p) {
         logf_("The game's Target list looks different than expected. The game may have been updated; the mod needs an update too.");
+    } else if ((sp_index = bnd4_find(bundle, SPEFFECT_PARAM)) < 0 ||
+               !(speffect = param_insert_sorted(bnd4_file(bundle, sp_index), SPEFFECT_TEMPLATE, SPEFFECT_TEAM_ROW,
+                                                SPEFFECT_SIZE, &team_row)).p ||
+               rd32(team_row + 0x08) != 0xBF800000 || team_row[0x16D] != 0xFF || rd32(team_row + 0x18C) != 0xFFFFFFFF) {
+        logf_("The game's SpEffectParam looks different than expected. The game may have been updated; the mod needs an update too.");
+    } else if ((npc_index = bnd4_find(bundle, NPC_PARAM)) < 0 || !scarab_rows(bnd4_file(bundle, npc_index))) {
+        logf_("The game's NpcParam looks different than expected. The game may have been updated; the mod needs an update too.");
+    } else if (no_rain_wanted() && ((area_index = bnd4_find(bundle, PLAY_AREA_PARAM)) < 0 || !no_rain(bnd4_file(bundle, area_index)))) {
+        logf_("The game's PlayAreaCreateCommonParam looks different than expected; no-rain cannot be applied.");
     } else {
+        wr32(team_row + 0x08, 0x43340000);   // effectEndurance 180.0 s
+        team_row[0x16D] = 16;                // changeTeamType 16
+        wr32(team_row + 0x18C, 300050);      // vfxId1: red phantom look
+        if (no_rain_wanted()) logf_("Test option: no rain damage (work/native/no-rain)");
         // Written as a zlib DCX, like our other files (the launcher has no zstd compressor). It has
         // to be compressed: the game crashes at start-up on a 55 MB regulation.bin of stored zstd
         // blocks. ponytail: unlike the game's own file this is not zstd; if the game ever stops
         // taking zlib here, a zstd compressor is the upgrade path.
-        patched = bnd4_replace(bundle, index, param);
+        step = bnd4_replace(bundle, index, param);
+        patched = bnd4_replace(step, sp_index, speffect);
         body = dcx_write(patched);
         size_t padded = (body.n + 15) / 16 * 16;
         buf out = {xalloc(16 + padded), 16 + padded};
@@ -818,7 +930,7 @@ static int build_regulation(const char *game_dir) {
         ok = write_file(path, out.p, out.n);
         free(out.p);
     }
-    free(enc.p); free(bundle.p); free(param.p); free(patched.p); free(body.p);
+    free(enc.p); free(bundle.p); free(param.p); free(speffect.p); free(step.p); free(patched.p); free(body.p);
     return ok;
 }
 
@@ -1119,6 +1231,10 @@ static int write_profile(void) {
         logf_("Seamless Co-op found next to the launcher: it will be loaded too");
     }
     fprintf(f, "\n[[natives]]\npath = \"native/invasion.dll\"\n");
+    if (slow_time_wanted()) {
+        fprintf(f, "\n[debug_properties]\n\"Game.IngameTime.TimeScale\" = 7.29\n");
+        logf_("Test option: slow day clock (work/native/slow-time)");
+    }
     fclose(f);
     return 1;
 }
@@ -1140,7 +1256,8 @@ int core_build(const char *game_dir) {
     buf dll = read_file(from);
     // BUILD_FORMAT: bump when the set of files the launcher builds changes.
     snprintf(stamp, sizeof stamp, "%016llx%016llx", (unsigned long long)fnv1a64(enc.p, enc.n),
-             (unsigned long long)(fnv1a64(dll.p, dll.n) + BUILD_FORMAT));
+             (unsigned long long)(fnv1a64(dll.p, dll.n) + BUILD_FORMAT + ((u64)no_rain_wanted() << 40) +
+                                     ((u64)slow_time_wanted() << 41)));
     free(dll.p);
     buf old_stamp = read_file(stamp_path);
     int same = old_stamp.n == 32 && !memcmp(old_stamp.p, stamp, 32);
@@ -1323,6 +1440,28 @@ int core_selftest(void) {
         logf_("selftest: DCX failed");
     }
     free(f.e); free(g.e); free(w.p); free(d.p);
+    // Param row insertion: ids 1, 5, 9 (8-byte rows, row data = id), insert 7 as a copy of 5.
+    {
+        u8 pp[0x40 + 3 * 24 + 3 * 8 + 4] = {0};
+        buf src = {pp, sizeof pp};
+        wr32(pp, 0x40 + 3 * 24 + 3 * 8);
+        wr16(pp + 0x0A, 3);
+        pp[0x2D] = 4;
+        for (u32 i = 0; i < 3; i++) {
+            wr32(pp + 0x40 + i * 24, 1 + 4 * i);
+            wr64(pp + 0x40 + i * 24 + 8, 0x40 + 3 * 24 + i * 8);
+            wr32(pp + 0x40 + 3 * 24 + i * 8, 1 + 4 * i);
+        }
+        u8 *row = NULL;
+        buf q = param_insert_sorted(src, 5, 7, 8, &row);
+        int good = q.p && rd16(q.p + 0x0A) == 4 && row && rd32(row) == 5;
+        for (u32 i = 0; good && i < 4; i++) {
+            static const u32 ids[] = {1, 5, 7, 9}, data[] = {1, 5, 5, 9};
+            good = rd32(q.p + 0x40 + i * 24) == ids[i] && rd32(q.p + rd64(q.p + 0x40 + i * 24 + 8)) == data[i];
+        }
+        if (!good) { ok = 0; logf_("selftest: param row insertion failed"); }
+        free(q.p);
+    }
     if (ok) logf_("selftest ok");
     return ok;
 }

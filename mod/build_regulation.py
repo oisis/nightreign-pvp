@@ -51,6 +51,52 @@ TEAM_INVADER, TEAM_TEST_SECONDS = 16, 180.0
 RED_PHANTOM_VFX = 300050
 
 
+# Scarabs (decision 13): an invader on team 16 can hit them. NpcParam rows 41900000-41919999 (the
+# 30 rows Smithbox names "Scarab" / "Large Scarab"; all team 6) get team 17. In the game's 81x81
+# team table 17 is like 6 toward the squad (1, 2: enemy both ways) and toward other monsters (6,
+# 7, 33, 48, 50: same as 6), enemy of 16 both ways, friend of itself; it differs from 6 only toward
+# 16, 18, 32 (unused by any NPC) and becomes neutral instead of enemy toward 22, 25-28, 46 (team 26:
+# merchants and a few special NPCs) and friend toward 21, 24, 35, 41. +0x133 is the field the game
+# reads as the NPC's team (0x1403d77d0 via 0x140e95440), checked on rows of teams 6, 7 and 33.
+NPC_PARAM = "\\NpcParam.param"
+NPC_TEAM, SCARAB_TEAM = 0x133, 17
+SCARAB_IDS = range(41900000, 41920000)
+
+
+def scarab_rows(param):
+    count, = struct.unpack_from("<H", param, 0x0A)
+    out = bytearray(param)
+    changed = 0
+    for i in range(count):
+        rid, _, off, _ = struct.unpack_from("<iiqq", param, 0x40 + i * 24)
+        if rid in SCARAB_IDS:
+            assert out[off + NPC_TEAM] == 6, f"NpcParam {rid}: team {out[off + NPC_TEAM]}, expected 6"
+            out[off + NPC_TEAM] = SCARAB_TEAM
+            changed += 1
+    assert changed == 30, f"{changed} scarab rows"
+    return bytes(out)
+
+
+# No rain (test sessions only, --no-rain): PlayAreaCreateCommonParam row 0 names the SpEffects the
+# rain puts on a character outside the circle, day 1 at +0x28 (99810) and day 2 at +0x2c (99811):
+# 2 % of HP plus 15 / 30 per tick, 110 s, chaining to 99871 / 99876. Both become -1, the value rows
+# 1 and 2 of the same param carry. The circle still shrinks on its own schedule; standing outside it
+# simply costs nothing. Every player needs the same file: the effect is applied on each machine.
+PLAY_AREA_PARAM = "\\PlayAreaCreateCommonParam.param"
+RAIN_FIELDS = {0x28: 99810, 0x2C: 99811}
+
+
+def no_rain(param):
+    count, = struct.unpack_from("<H", param, 0x0A)
+    out = bytearray(param)
+    rid, _, off, _ = struct.unpack_from("<iiqq", param, 0x40)
+    assert rid == 0
+    for field, old in RAIN_FIELDS.items():
+        assert struct.unpack_from("<i", out, off + field)[0] == old
+        struct.pack_into("<i", out, off + field, -1)
+    return bytes(out)
+
+
 def insert_row(param, template_id, new_id, size, patch):
     """Copy row template_id as new_id, kept in id order (the game binary-searches ids); patch(row)
     edits the copy. Same layout as add_row; the data area is rebuilt in descriptor order."""
@@ -129,16 +175,19 @@ def add_row(param):
     return bytes(out)
 
 
-def main(src, dst, no_row=False):
+def main(src, dst, no_row=False, rain=True):
     raw = Path(src).read_bytes()
     dcx = decrypt(raw, KEYS["nr"])
     bundle = undcx(dcx)
     param = next(b for n, b in bnd4_read(bundle) if n.endswith(PARAM))
     speffect = next(b for n, b in bnd4_read(bundle) if n.endswith(SPEFFECT_PARAM))
+    npc = next(b for n, b in bnd4_read(bundle) if n.endswith(NPC_PARAM))
     # --no-row: repack without changing anything, to tell packing problems from param problems.
     patched = bundle if no_row else bnd4_replace(bundle, {
         PARAM: add_row(param),
-        SPEFFECT_PARAM: insert_row(speffect, SPEFFECT_TEMPLATE, SPEFFECT_TEAM_ROW, SPEFFECT_SIZE, team_row)})
+        SPEFFECT_PARAM: insert_row(speffect, SPEFFECT_TEMPLATE, SPEFFECT_TEAM_ROW, SPEFFECT_SIZE, team_row),
+        NPC_PARAM: scarab_rows(npc),
+        **({} if rain else {PLAY_AREA_PARAM: no_rain(next(b for n, b in bnd4_read(bundle) if n.endswith(PLAY_AREA_PARAM)))})})
 
     # Compress the way Smithbox does (level 15, 64 KB window, no content size in the frame header).
     # Frames with a larger window, even ones that are otherwise valid, crash the game at start-up.
@@ -169,10 +218,21 @@ def main(src, dst, no_row=False):
         assert p[off + SPEFFECT_TEAM] == TEAM_INVADER
         assert struct.unpack_from("<i", p, off + SPEFFECT_VFX1)[0] == RED_PHANTOM_VFX
         print(f"regulation.bin: SpEffectParam row {SPEFFECT_TEAM_ROW} (team {TEAM_INVADER}, {TEAM_TEST_SECONDS:g} s), {count} rows")
+        p = next(b for n, b in bnd4_read(check) if n.endswith(NPC_PARAM))
+        count, = struct.unpack_from("<H", p, 0x0A)
+        teams = [p[struct.unpack_from("<q", p, 0x40 + i * 24 + 8)[0] + NPC_TEAM] for i in range(count)
+                 if struct.unpack_from("<i", p, 0x40 + i * 24)[0] in SCARAB_IDS]
+        assert teams == [SCARAB_TEAM] * 30
+        print(f"regulation.bin: {len(teams)} scarab NpcParam rows on team {SCARAB_TEAM}")
+        p = next(b for n, b in bnd4_read(check) if n.endswith(PLAY_AREA_PARAM))
+        off = struct.unpack_from("<q", p, 0x48)[0]
+        values = [struct.unpack_from("<i", p, off + f)[0] for f in RAIN_FIELDS]
+        assert values == ([99810, 99811] if rain else [-1, -1])
+        print(f"regulation.bin: rain {'as in the game' if rain else 'OFF (test build)'}")
     Path(dst).parent.mkdir(parents=True, exist_ok=True)
     Path(dst).write_bytes(out)
     print(f"regulation.bin: Target list rows {ids}")
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2], "--no-row" in sys.argv)
+    main(sys.argv[1], sys.argv[2], "--no-row" in sys.argv, "--no-rain" not in sys.argv)
