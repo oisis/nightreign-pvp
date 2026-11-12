@@ -8,13 +8,17 @@
 //     entry to the "Number of Players" option;
 //   - makes that fourth option ask for a squad of four and raises the session's player limit to six;
 //   - when that Invasion entry is the chosen target: cancels the expedition start and enters the
-//     "searching" state, with a small repeating notice. Nothing is searched for yet.
+//     "searching" state, with a small repeating notice, brings the game's network up (Steam only,
+//     behind the network guard) and lists Steam lobbies carrying the mod's marker. Nothing is joined;
+//   - with a file "host-test" next to the DLL: an ordinary expedition opens a host session on that
+//     network for its whole length and marks the session's Steam lobby as a mod session.
 //
 // ponytail: addresses are hard-coded for nightreign.exe 1.3.3 (PE timestamp below) and the DLL does
 // nothing on any other build. Replace with signature scans when a second game version has to work.
 #include <windows.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define GAME_TIMESTAMP 0x69e0dc2a  // nightreign.exe 1.3.3, Steam build 22818764
@@ -319,8 +323,13 @@ static void hook_network_flow(void) {
     *entry = (void *)flow_offline_hook;
     logf("network flow: hooked");
 }
-// Host test (experiment): open a session as host on the network we started, once per search.
-// Active only while a file named "host-test" lies next to the DLL; looked for when a search starts.
+// Host session: a mod player's expedition opens a session as host on the network we start, so that
+// invaders can find it later. For now only while a file named "host-test" lies next to the DLL
+// (looked for when the expedition reaches its world); without it expeditions stay as before.
+// When: CSQuickMatchingCtrl's InGame step (23), first frame. Not earlier, because for a solo
+// expedition the game itself leaves any session in MoveMapStart (0xb593a0: context mode +0x9d != 2
+// or online -> 0xdf1180 unless 0xdf0a80), and MoveMapStep's LeaveSessionWait (0xc357c0) is protected
+// code. Ended by the first step that is not InGame (Unregister after the run; see host_expedition).
 //
 // Create: 0xdefbd0, the game's own create-session (SessionCreateJob's lambda 0xb1ab00 calls it with
 // the job's multiplay type and a pointer to a byte 1). It refuses while lobby_state is 1, 3, 4 or 6,
@@ -330,8 +339,7 @@ static void hook_network_flow(void) {
 // ISteamMatchmaking::CreateLobby. Success: lobby_state 1, then 3 (host) once Steam has made the lobby.
 // Leave: 0xdf1180(manager, 0), the way SessionLeaveJob (0xb1aa90) and CSQuickMatchingCtrl
 // (0xb59332, 0xb5944f) leave: lobby_state 7 and an asynchronous leave in the implementation.
-// ponytail: the network is stopped right after the leave request, without waiting for lobby_state 0
-// as the game's leave job does; wait for it in the idle step if the log shows the lobby left hanging.
+// The network goes down only once the leave is through (finish_pending_stop below).
 #define RVA_NET_READY       0xdecac0  // bool (void): all three managers at state 2 (reads only)
 #define RVA_SESSION_CREATE  0xdefbd0  // bool (CSSessionManager*, u8 multiplay type, u8 *one)
 #define RVA_SESSION_LEAVE   0xdf1180  // void (CSSessionManager*, u8 reason); the game passes 0
@@ -377,7 +385,11 @@ static void host_test_watch(void) {
          GetTickCount() - g_host_test_tick, now[0], now[1], now[2], now[3], now[4], end_code, eac ? "present" : "missing",
          eac && *(void **)(eac + EAC_PLATFORM) ? "set" : "null", now[5], now[6], now[6]);
 }
+static unsigned long long g_lobby;      // Steam lobby id of our host session, once read
+static unsigned g_marked_squad;         // squad size last written to the lobby, ~0 = not yet
 static void host_test_start(void) {
+    g_lobby = 0;
+    g_marked_squad = ~0u;
     char path[MAX_PATH];
     strcpy(path, log_path);
     char *a = strrchr(path, '\\'), *b = strrchr(path, '/'), *dir = a > b ? a : b;
@@ -385,9 +397,9 @@ static void host_test_start(void) {
     strcpy(dir + 1, "host-test");
     g_host_test = GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
     g_host_test_tick = 0;
-    if (g_host_test) logf("host test: on (%s)", path);
+    if (g_host_test) logf("host test: on (%s): this expedition opens a host session", path);
 }
-// Idle step, every frame while searching: create once the network is ready.
+// InGame step, every frame until called: create once the network is ready.
 static void host_test_create(void) {
     if (g_host_test != 1 || !((unsigned char (*)(void))(g_base + RVA_NET_READY))()) return;
     char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
@@ -464,7 +476,7 @@ static int host_test_leave(void) {
 // finish and cleans up to lobby_state 0. Stopping the managers (0xdecb70) goes into protected code
 // (0x7475608), so nothing readable shows that a stop still leaves the lobby. So when the search is
 // called off from the hub, the network is stopped only once lobby_state is back to "none", or after
-// LEAVE_WAIT_MS. ponytail: an ordinary expedition starting stops it at once (no frames to wait in).
+// LEAVE_WAIT_MS, checked on every step of the machine.
 #define LEAVE_WAIT_MS 5000
 static void set_network(int on);
 static DWORD g_stop_pending;  // tick of the leave request; network still up until it is through
@@ -821,21 +833,263 @@ static void clear_notices(void) {
 }
 // The invasion search. Choosing Invasion starts it, choosing it again or starting an ordinary
 // expedition ends it. While it runs the "searching" notice keeps coming back.
-// The search brings the game's network up and its end takes it down again.
-// ponytail: nothing is searched for yet; the matchmaking call goes where the search starts.
+// The search brings the game's network up and its end takes it down again. While it runs, Steam is
+// asked for lobbies carrying the mod's marker (lobby_search_frame); nothing is joined yet.
 static int g_searching;
 static DWORD g_request_tick;  // when the last start request arrived
+
+// --- Steam lobby marker and lobby search --------------------------------------------------------
+//
+// Through steam_api64.dll's flat API (the game's own copy; exports checked in the shipped DLL, each
+// one a jump to the interface slot the game itself uses: ISteamMatchmaking009 SetLobbyData 0xa0,
+// GetLobbyData 0x98, RequestLobbyList 0x20, ...; ISteamUtils010 IsAPICallCompleted 0x58 and
+// GetAPICallResult 0x68, called by the game the same way for LobbyCreated_t at 0x25919e0).
+// Results are polled from the game thread; nothing is registered in the game's callback dispatch.
+// The game imports SteamAPI_RunCallbacks / RegisterCallResult (no manual dispatch), and polls its
+// own CreateLobby result the same way, so an unregistered call result stays readable this way.
+// Lobby type: the game creates its lobby invisible (3), or public (2) when a session flag says so
+// (0x2591950: (owner+0xa0 & 0x400) and session+0x60 bit 4). Steam's documentation: public lobbies
+// are "returned by search and visible to friends", invisible ones "returned by search, but not
+// visible to other friends". Both are listed, so the type is left as the game made it; making it
+// public would only add a "join" entry for the host's Steam friends, who may run the vanilla game.
+// The game never lists lobbies (its matchmaking slots: 0x68 0x70 0x78 0x88 0x90 0x98 0xa0 0xe0
+// 0x118) and its only lobby data key is "inviteParam", so our keys do not meet its own handling.
+// Keys: no names, no ids; the squad size and the free invader slots under decision 5 of the brief.
+// ponytail: no password yet. It would be one more key, "nrpvp_pass" = a hash of the squad's
+// password (never the password), written in lobby_mark next to the others and matched by the
+// invader with one more string filter in lobby_search_frame; lobbies without it stay open to all.
+#define LOBBY_MARK_KEY   "nrpvp"         // "1" on every mod host lobby
+#define LOBBY_PROTO_KEY  "nrpvp_proto"
+#define LOBBY_PROTO      "1"             // bump when what a joiner expects changes
+#define LOBBY_GAME_KEY   "nrpvp_game"
+#define LOBBY_GAME       "1.3.3"         // GAME_TIMESTAMP's build
+#define LOBBY_SQUAD_KEY  "nrpvp_squad"
+#define LOBBY_FREE_KEY   "nrpvp_free"
+#define LOBBY_EQUAL      0               // ELobbyComparison
+#define LOBBY_WORLDWIDE  3               // ELobbyDistanceFilter
+#define LOBBY_MATCH_LIST 510             // LobbyMatchList_t::k_iCallback (500 + 10; LobbyCreated_t is 513)
+#define SEARCH_PERIOD_MS 10000
+#define SEARCH_TIMEOUT_MS 30000
+typedef unsigned long long u64;
+static struct {
+    void *mm, *utils;  // ISteamMatchmaking*, ISteamUtils*
+    unsigned char (*set_data)(void *, u64, const char *, const char *);
+    const char *(*get_data)(void *, u64, const char *);
+    int (*members)(void *, u64);
+    int (*limit)(void *, u64);
+    void (*string_filter)(void *, const char *, const char *, int);
+    void (*distance_filter)(void *, int);
+    u64 (*request_list)(void *);
+    u64 (*by_index)(void *, int);
+    unsigned char (*completed)(void *, u64, unsigned char *);
+    unsigned char (*result)(void *, u64, void *, int, int, unsigned char *);
+} g_steam;
+static int steam_ready(void) {
+    static int state;  // 0 not tried, 1 ready, -1 failed
+    if (state) return state > 0;
+    HMODULE m = GetModuleHandleA("steam_api64.dll");
+    void *(*mm)(void) = m ? (void *(*)(void))GetProcAddress(m, "SteamAPI_SteamMatchmaking_v009") : NULL;
+    void *(*utils)(void) = m ? (void *(*)(void))GetProcAddress(m, "SteamAPI_SteamUtils_v010") : NULL;
+    static const char *const names[] = {
+        "SteamAPI_ISteamMatchmaking_SetLobbyData", "SteamAPI_ISteamMatchmaking_GetLobbyData",
+        "SteamAPI_ISteamMatchmaking_GetNumLobbyMembers",
+        "SteamAPI_ISteamMatchmaking_GetLobbyMemberLimit", "SteamAPI_ISteamMatchmaking_AddRequestLobbyListStringFilter",
+        "SteamAPI_ISteamMatchmaking_AddRequestLobbyListDistanceFilter", "SteamAPI_ISteamMatchmaking_RequestLobbyList",
+        "SteamAPI_ISteamMatchmaking_GetLobbyByIndex", "SteamAPI_ISteamUtils_IsAPICallCompleted",
+        "SteamAPI_ISteamUtils_GetAPICallResult"};
+    void **fn = (void **)&g_steam.set_data;
+    state = mm && utils ? 1 : -1;
+    for (unsigned i = 0; state > 0 && i < sizeof names / sizeof *names; i++)
+        if (!(fn[i] = m ? (void *)GetProcAddress(m, names[i]) : NULL)) {
+            logf("steam: %s not exported", names[i]);
+            state = -1;
+        }
+    if (state > 0) {
+        g_steam.mm = mm();
+        g_steam.utils = utils();
+        if (!g_steam.mm || !g_steam.utils) state = -1;
+    }
+    logf("steam: %s (matchmaking %p, utils %p)", state > 0 ? "ready" : "NOT available", g_steam.mm, g_steam.utils);
+    return state > 0;
+}
+
+// The session's join data is the lobby id (0xdf0560: implementation vt+0x40; 8 bytes from the Steam
+// session object's +0x870).
+static u64 session_lobby_id(char *sm) {
+    void **impl = session_impl(sm);
+    if (!impl) return 0;
+    typedef char (*export_fn)(void *, unsigned, void *, unsigned *);
+    export_fn export_join_data = *(export_fn *)((char *)*impl + IMPL_VT_EXPORT_JOIN_DATA);
+    unsigned char buf[64] = {0};
+    unsigned size = 0;
+    unsigned handle = *(unsigned *)(sm + SM_HANDLE);
+    if (!export_join_data(impl, handle, NULL, &size) || size < 8 || size > sizeof buf) return 0;
+    export_join_data(impl, handle, buf, &size);
+    return *(u64 *)buf;
+}
+static void lobby_set(const char *key, const char *value) {
+    unsigned char ok = g_steam.set_data(g_steam.mm, g_lobby, key, value);
+    logf("host: lobby data %s=%s %s", key, value, ok ? "accepted" : "REFUSED");
+}
+// Invader's lobby list (below); the host also sends one, as a check that its own lobby is listed.
+static u64 g_list_call;
+static DWORD g_list_tick;
+static unsigned g_list_count;
+static int g_self_check;  // host: 0 not yet, 1 request done
+
+// Host, every frame while the session runs: mark the lobby once, then keep squad / free slots current.
+static void lobby_mark(void) {
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
+    if (!sm) return;
+    unsigned state = *(unsigned *)(sm + SM_LOBBY_STATE);
+    if (state != 3) {
+        if (g_lobby) logf("host: lobby_state %u, no longer host of lobby %llu (its marker goes with it)", state, g_lobby);
+        g_lobby = 0;
+        g_marked_squad = ~0u;
+        return;
+    }
+    char *begin = *(char **)(sm + SM_PLAYERS_BEGIN), *end = *(char **)(sm + SM_PLAYERS_BEGIN + 8);
+    unsigned squad = begin && end >= begin ? (unsigned)((end - begin) / SM_PLAYER_SIZE) : 0;
+    if (squad == g_marked_squad || !squad || !steam_ready()) return;
+    if (!g_lobby) {
+        static int told;
+        if (!(g_lobby = session_lobby_id(sm))) {
+            if (!told++) logf("host: no lobby id from the session yet, lobby not marked (tried again every frame)");
+            return;
+        }
+        told = 0;
+        logf("host: session up, Steam lobby %llu (%016llx), type left as the game made it", g_lobby, g_lobby);
+        lobby_set(LOBBY_MARK_KEY, "1");
+        lobby_set(LOBBY_PROTO_KEY, LOBBY_PROTO);
+        lobby_set(LOBBY_GAME_KEY, LOBBY_GAME);
+    }
+    // ponytail: every member counts as squad; subtract invaders once they can join.
+    char text[16];
+    snprintf(text, sizeof text, "%u", squad);
+    lobby_set(LOBBY_SQUAD_KEY, text);
+    snprintf(text, sizeof text, "%u", invaders_allowed(squad));
+    lobby_set(LOBBY_FREE_KEY, text);
+    logf("host: lobby members %d of %d", g_steam.members(g_steam.mm, g_lobby), g_steam.limit(g_steam.mm, g_lobby));
+    if (g_marked_squad == ~0u) g_list_tick = GetTickCount();  // self-check one period after marking
+    g_marked_squad = squad;
+}
+
+// One lobby list request at a time, every SEARCH_PERIOD_MS: the invader every idle frame while
+// searching, the host once (who = "host self-check"). Returns 1 when a request has finished.
+static void lobby_search_reset(void) {
+    if (g_list_call) logf("search: request %u abandoned", g_list_count);
+    g_list_call = 0;
+    g_list_tick = 0;
+}
+static int lobby_search_frame(const char *who) {
+    if (!steam_ready()) return 0;
+    DWORD now = GetTickCount();
+    if (!g_list_call) {
+        if (g_list_tick && now - g_list_tick < SEARCH_PERIOD_MS) return 0;
+        g_steam.string_filter(g_steam.mm, LOBBY_MARK_KEY, "1", LOBBY_EQUAL);
+        g_steam.string_filter(g_steam.mm, LOBBY_PROTO_KEY, LOBBY_PROTO, LOBBY_EQUAL);
+        g_steam.distance_filter(g_steam.mm, LOBBY_WORLDWIDE);
+        g_list_call = g_steam.request_list(g_steam.mm);
+        g_list_tick = now;
+        g_list_count++;
+        logf("%s: request %u sent (%s=1, %s=%s, worldwide), call %llx", who, g_list_count, LOBBY_MARK_KEY,
+             LOBBY_PROTO_KEY, LOBBY_PROTO, g_list_call);
+        if (!g_list_call) logf("%s: request %u refused by Steam (no call handle)", who, g_list_count);
+        return !g_list_call;
+    }
+    unsigned char failed = 0;
+    if (!g_steam.completed(g_steam.utils, g_list_call, &failed)) {
+        if (now - g_list_tick <= SEARCH_TIMEOUT_MS) return 0;
+        logf("%s: request %u not completed after %lums (failed %u), dropped", who, g_list_count, now - g_list_tick, failed);
+        g_list_call = 0;
+        return 1;
+    }
+    struct { unsigned matching; } result = {0};  // LobbyMatchList_t
+    unsigned char got = g_steam.result(g_steam.utils, g_list_call, &result, sizeof result, LOBBY_MATCH_LIST, &failed);
+    g_list_call = 0;
+    logf("%s: request %u completed after %lums: result %s, failed %u, %u lobbies", who, g_list_count, now - g_list_tick,
+         got ? "read" : "NOT read", failed, result.matching);
+    if (!got || failed) return 1;
+    u64 chosen = 0;
+    for (unsigned i = 0; i < result.matching && i < 50; i++) {
+        u64 id = g_steam.by_index(g_steam.mm, (int)i);
+        const char *game = g_steam.get_data(g_steam.mm, id, LOBBY_GAME_KEY), *squad = g_steam.get_data(g_steam.mm, id, LOBBY_SQUAD_KEY);
+        const char *free = g_steam.get_data(g_steam.mm, id, LOBBY_FREE_KEY), *proto = g_steam.get_data(g_steam.mm, id, LOBBY_PROTO_KEY);
+        int own = id == g_lobby && g_lobby, slots = free ? atoi(free) : 0;
+        int fits = !own && slots > 0 && game && !strcmp(game, LOBBY_GAME);
+        // GetLobbyData gives "" for a key that is not set.
+        logf("%s:   lobby %llu: proto '%s' game '%s' squad '%s' free '%s', members %d of %d -> %s", who, id, proto ? proto : "?",
+             game ? game : "?", squad ? squad : "?", free ? free : "?", g_steam.members(g_steam.mm, id),
+             g_steam.limit(g_steam.mm, id), own ? "our own lobby" : fits ? "has a free invader slot" : "no slot for us");
+        if (fits && !chosen) chosen = id;  // Steam sorts by distance: the first that fits
+    }
+    if (chosen) logf("%s: would join lobby %llu (joining is not built)", who, chosen);
+    else logf("%s: no lobby to join", who);
+    return 1;
+}
+
+// Host session over the expedition (called for every step of CSQuickMatchingCtrl).
+// Start: the first frame of InGame (23), after MoveMapStart has made its own solo-expedition leave
+// and after every loading screen of the start. End: the first frame of any other step. InGame
+// (0xb58f60) never changes the step itself; the way out found in readable code is 0xb52ef0, which
+// sets Unregister (25) and is what the game's return to the title screen calls (0xc4a230 ->
+// 0xb67240 -> 0xb52ef0). Logs show InGame -> Unregister -> None for a finished or abandoned run and
+// for quitting the game from an expedition.
+// While InGame runs with lobby_state 3 it reads session packets of type 0x21 (0xddbbc0) and answers
+// with 0x23 (0xddf930); a session of one never receives any.
+#define QM_STEP_INGAME 23
+#define NET_READY_WAIT_MS 15000  // only for the log: say once if the network is slow to come up
+static int g_in_expedition;
+static DWORD g_expedition_tick;
+static void host_test_create(void);
+static int host_test_leave(void);
+static void host_expedition(int step) {
+    if (step == QM_STEP_INGAME) {
+        if (!g_in_expedition) {
+            g_in_expedition = 1;
+            g_expedition_tick = GetTickCount();
+            g_self_check = 0;
+            lobby_search_reset();
+            host_test_start();
+            logf("host: expedition reached its world%s", g_host_test ? ", opening a host session" : " (no host session: no host-test file)");
+            if (g_host_test) {
+                if (g_stop_pending) finish_pending_stop(1);
+                if (!g_network_on) set_network(1);
+                if (!g_network_on) {
+                    logf("host: network not started, no host session this expedition");
+                    g_host_test = 3;
+                }
+            }
+        }
+        if (g_host_test == 1) {
+            host_test_create();
+            if (g_host_test == 1 && g_expedition_tick && GetTickCount() - g_expedition_tick > NET_READY_WAIT_MS) {
+                logf("host: network still not ready after %lums, still waiting", GetTickCount() - g_expedition_tick);
+                g_expedition_tick = 0;
+            }
+        }
+        if (g_host_test == 2) {
+            lobby_mark();
+            if (g_lobby && !g_self_check && lobby_search_frame("host self-check")) g_self_check = 1;
+        }
+    } else if (g_in_expedition) {
+        g_in_expedition = 0;
+        lobby_search_reset();
+        logf("host: expedition over (step %s)%s", STEP_NAMES[step], g_host_test == 2 ? ", leaving the session" : "");
+        if (host_test_leave()) g_stop_pending = GetTickCount();  // network down once the leave is through
+        else if (g_network_on && !g_searching) set_network(0);
+        g_lobby = 0;
+    }
+}
 
 static void toggle_search(const char *where) {
     g_invasion_pending = 0;
     g_searching = !g_searching;
+    lobby_search_reset();
     if (g_searching) {
         if (g_stop_pending) finish_pending_stop(1);
-        host_test_start();
         set_network(1);
-    } else if (guard_intact() && host_test_leave()) {
-        g_stop_pending = GetTickCount();  // the network goes down once the leave is through
-    } else set_network(0);
+    } else set_network(0);  // the search only looks: no session of ours to leave
     clear_notices();
     notice(g_searching ? 0 : 1);
     logf("invasion: search %s (%s)", g_searching ? "started" : "called off", where);
@@ -852,6 +1106,16 @@ static void step_hook(void *ctrl, void *time, int step) {
         else logf("step None");
         last = step;
     }
+    if (g_network_on && g_guard_broken) {
+        if (g_searching) toggle_search("network guard broken");
+        else {
+            logf("network: guard broken, taking the network down");
+            set_network(0);
+        }
+    }
+    host_expedition(step);
+    if (g_host_test == 2 || g_stop_pending) host_test_watch();
+    if (g_stop_pending) finish_pending_stop(0);
     if (step != QM_STEP_NONE) {
         if (g_invasion_pending) {
             void **vt = *(void ***)ctrl;
@@ -859,9 +1123,9 @@ static void step_hook(void *ctrl, void *time, int step) {
             toggle_search("expedition start cancelled");
             return;
         }
-        if (g_stop_pending) finish_pending_stop(1);
         if (g_searching) {
             g_searching = 0;
+            lobby_search_reset();
             set_network(0);
             clear_notices();
             logf("invasion: search ended, an ordinary expedition is starting");
@@ -869,13 +1133,7 @@ static void step_hook(void *ctrl, void *time, int step) {
     } else {  // the idle step runs every frame in the Roundtable Hold
         if (g_invasion_pending && GetTickCount() - g_request_tick > 300) toggle_search("machine stayed idle");
         if (g_searching && notices_idle()) notice(0);
-        if (g_network_on && g_guard_broken) {
-            if (g_searching) toggle_search("network guard broken");
-            else finish_pending_stop(1);
-        }
-        if (g_searching) host_test_create();
-        if ((g_searching && g_host_test == 2) || g_stop_pending) host_test_watch();
-        if (g_stop_pending) finish_pending_stop(0);
+        if (g_searching) lobby_search_frame("search");
     }
     g_step_original[step](ctrl, time);
 }
