@@ -799,6 +799,7 @@ static int our_speffect_active(char *chr);
 // in this session.
 static int g_join_in_world(void);
 #define FINISH_GUARD_MS 10000  // ponytail: a guess at death animation + fade; the bleed-out death was never timed
+static int g_host_player_no = -1;  // invader: the session host's player number (member +0xd4), -1 unknown
 static char *g_hud_invaders[4];
 static int g_host_switched, g_host_old_dc;
 // Who ends a session: every readable call of the session leave (0xdf1180, 44 call sites) and of the
@@ -883,6 +884,28 @@ static char *hud_lookup_hook(void *wcm, unsigned long long *id) {
                 for (int k = 0; k < 0x18; k++) sprintf(hex + 2 * k, "%02x", ((unsigned char *)id)[0x20 + k]);
             logf("name test: tag %lld: handle %llx, character %s (team %u, our effect %d), entry +20: %s", idx, *id,
                  !c ? "not found" : c == me ? "(local)" : "found", team, c && !IsBadReadPtr(c, 0x200) ? our_speffect_active(c) : -1, hex);
+        }
+        // Run 20: the invader's tag for the host has +0x35 = 0x7f, the host's tag for the invader 0x00, and the
+        // invader's tag shows no name or rescue gauge. Logged on change for every found entry, both sides;
+        // on the invader the host's entry gets +0x35 = 0 each frame (experiment), logged once.
+        static unsigned char last_35[8] = {0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa};
+        if (idx >= 0 && idx < 8 && c && c != me && !IsBadReadPtr(c, 0x200)) {
+            unsigned char b35 = ((unsigned char *)id)[0x35];
+            if (b35 != last_35[idx]) {
+                last_35[idx] = b35;
+                unsigned char tm = 0;
+                ((unsigned char *(*)(void *, unsigned char *))(g_base + 0x3d1b30))(c, &tm);
+                logf("name test: tag %lld: byte +0x35 now %02x (team %u, state %d)", idx, b35, tm, !IsBadReadPtr(c, 0x740) ? (unsigned char)c[0x710] : -1);
+            }
+            if (g_join_in_world()) {
+                char num[8];
+                int pn = *(int *)((char *(*)(void *, void *))(g_base + 0x66c6f0))(c, num);
+                if (pn == (g_host_player_no >= 0 ? g_host_player_no : 1) && b35) {
+                    static int told;
+                    if (!told) told = 1, logf("name test: host's tag %lld: byte +0x35 %02x -> 00 (experiment, each frame)", idx, b35);
+                    ((unsigned char *)id)[0x35] = 0;
+                }
+            }
         }
     }
     // name-test, host: the over-head name tags (0x7c8a90 fills eight tags at FE +0xca60, lookup 0x7c8c74;
@@ -1279,10 +1302,66 @@ static char *map_model_hook(char *model, unsigned long long a2) {
          (a2 & 0xff) == 2 ? "HUD: compass" : "map screen");
     return r;
 }
+// The map screen (CS::WorldMapDialogBase, built by 0xac53a0, called at 0xad1f00) takes a view model as its
+// 5th argument and draws other players from "Body/Base_1/NetPlayerList", built by 0xacd1f0 over that
+// model's +0xa0 list, the same other-player pins the compass reads (self: "PlayerList" over +0x78).
+// Logged: which model the map screen gets; the pin dump below follows that model.
+static char *volatile g_map_dialog_model;
+static void *map_dialog_hook(void *a, void *b, void *c, unsigned long long d, char *model) {
+    g_map_dialog_model = model;
+    int kind = -1;
+    for (int k = 0; k < 3; k++)
+        if (g_view_models[k] == model) kind = k;
+    logf("marker test: map screen built with view model %p (kind %d of the models seen)", (void *)model, kind);
+    return ((void *(*)(void *, void *, void *, unsigned long long, char *))(g_base + 0xac53a0))(a, b, c, d, model);
+}
+// Map-only hide (decision 19). The map screen's list controls (CS::WorldMapItemControl, built by 0xacd1f0
+// over a pin list) draw through 0xace8e0(control+0x38, list, selected, ...), called at 0xacedf2; the item
+// code reads each pin's +0x0c "shown" and its visibility method. NetPlayerList's list is the view model's
+// other-player list at model+0xa0, the one the compass reads too. So the map rule is applied only around
+// that draw call: the pins that must not be on the map get +0x0c = 0 for the call and their own value
+// back right after, so the compass rule (step hook) is untouched.
+static void map_list_draw(const char *where, char *ctl, char *list, int selected, float f3, float f5, unsigned long long b6);
+static void map_list_draw_hook(char *ctl, char *list, int selected, float f3, float f5, unsigned long long b6) {
+    map_list_draw("acedf2", ctl, list, selected, f3, f5, b6);
+}
+static void map_list_draw(const char *where, char *ctl, char *list, int selected, float f3, float f5, unsigned long long b6) {
+    char *model = list ? list - 0xa0 : NULL;
+    char saved[8];
+    char *pins[8];
+    int n = 0;
+    int ours = model && !IsBadReadPtr(model, 0xc0) && *(char **)model == g_base + 0x2c4a548 &&
+               (g_join_in_world() || g_host_switched);
+    if (ours) {
+        char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
+        char *mb = sm ? *(char **)(sm + SM_PLAYERS_BEGIN) : NULL, *me = sm ? *(char **)(sm + SM_PLAYERS_BEGIN + 8) : NULL;
+        char **b = *(char ***)(model + 0xb0), **e = *(char ***)(model + 0xb8);
+        for (int i = 0; b && b + i < e && i < 8; i++) {
+            char *pin = b[i];
+            if (!pin || IsBadReadPtr(pin, 0x20) || !pin[0xc]) continue;
+            int hide = g_join_in_world();
+            if (!hide)
+                for (char *x = mb; mb && x < me && !IsBadReadPtr(x, SM_PLAYER_SIZE); x += SM_PLAYER_SIZE)
+                    if (!x[0xe1] && *(int *)(x + 0xd4) == *(int *)(pin + 0x1c)) hide = 1;
+            if (!hide) continue;
+            pins[n] = pin, saved[n++] = pin[0xc];
+            pin[0xc] = 0;
+        }
+        static DWORD next[3];
+        int w = where[2] == 'e' ? 0 : where[4] == '7' ? 1 : 2;
+        if (n && (int)(GetTickCount() - next[w]) >= 0) {
+            next[w] = GetTickCount() + 5000;
+            logf("marker test: map screen (call at %s): %d other-player pin(s) left out of the list draw (%s)", where, n,
+                 g_join_in_world() ? "invader: all" : "host: the invader");
+        }
+    }
+    ((void (*)(char *, char *, int, float, float, unsigned long long))(g_base + 0xace8e0))(ctl, list, selected, f3, f5, b6);
+    for (int i = 0; i < n; i++) pins[i][0xc] = saved[i];
+}
 static void marker_tick(void) {
     static DWORD next;
     static char last[2][0x60];
-    char *m = g_view_models[0] ? g_view_models[0] : g_view_models[1];  // the map screen's model
+    char *m = g_map_dialog_model ? g_map_dialog_model : g_view_models[0] ? g_view_models[0] : g_view_models[1];
     if (!m || (int)(GetTickCount() - next) < 0) return;
     next = GetTickCount() + 2000;
     if (IsBadReadPtr(m, 0xc0) || *(char **)m != g_base + 0x2c4a548) {
@@ -1328,7 +1407,7 @@ static unsigned char can_hit_hook(char *module, char *target, char *hit, unsigne
 // Decision 19. Compass (kind 2): the invader keeps only the session host's pin (the member whose Steam id is
 // the lobby owner's), the host drops the invader's. Map screen (kinds 0/1): the invader drops every
 // other-player pin, the host the invader's.
-static int g_host_player_no = -1;
+static int g_host_player_no;
 static void host_player_no_update(char *mb, char *me);  // invader: the session host's player number (member +0xd4), -1 unknown
 // Runs 19-20: these view models (kinds 1 and 0, built at the start of the session by 0x84d840) feed the
 // COMPASS; the map screen draws other players from elsewhere (not found yet). The compass rule, each
@@ -1377,13 +1456,62 @@ static void marker_apply(int map_rule) {
         }
     }
 }
+// name-test (rescue gauge on the invader). A downed player's state reaches the others through the downed
+// event (receiver 0x4f3a98 area): event 1 sets state, timer, gauge (0x66f3b0, 0x66f3a0) and the down count;
+// event 3 (a hit on the gauge) also adds the downed player to the attacker's rescue-target list,
+// 0x3d7610(attacker, downed), which feeds the rescue gauge HUD ("PlayerHUD/Rescue/RescuePointGauge").
+// Logged: every add to a rescue-target list (from the event at 0x4f3a98, and locally from the gauge
+// function at 0x66e03e) with attacker and target; and, on both sides, once a second while another player
+// is downed, its +0x710 state, +0x714 gauge, +0x718 timer and +0x730 count as this machine sees them.
+static void rescue_add_log(const char *where, char *attacker, char *downed) {
+    char *me = local_player();
+    logf("name test: rescue target added (%s): attacker %s (our effect %d), downed %s (our effect %d, state %d, gauge %.1f)", where,
+         attacker == me ? "local" : "remote", attacker && !IsBadReadPtr(attacker, 0x200) ? our_speffect_active(attacker) : -1,
+         downed == me ? "local" : "remote", downed && !IsBadReadPtr(downed, 0x200) ? our_speffect_active(downed) : -1,
+         downed && !IsBadReadPtr(downed, 0x740) ? (unsigned char)downed[0x710] : -1, downed && !IsBadReadPtr(downed, 0x740) ? *(float *)(downed + 0x714) : -1);
+}
+static void rescue_add_event_hook(char *attacker, char *downed) {
+    rescue_add_log("downed event", attacker, downed);
+    ((void (*)(char *, char *))(g_base + 0x3d7610))(attacker, downed);
+}
+static void rescue_add_local_hook(char *attacker, char *downed) {
+    rescue_add_log("local gauge hit", attacker, downed);
+    ((void (*)(char *, char *))(g_base + 0x3d7610))(attacker, downed);
+}
+static void other_downed_watch(const char *side) {
+    static DWORD next;
+    static float last[8][3];
+    if ((int)(GetTickCount() - next) < 0) return;
+    next = GetTickCount() + 1000;
+    char *wcm = *(char **)(g_base + 0x3c0f0a8), *me = wcm ? *(char **)(wcm + 0x174e8) : NULL;
+    if (!wcm) return;
+    void **set = (void **)(wcm + 0x9a40);
+    if (IsBadReadPtr(set, 8) || IsBadReadPtr(*(void ***)set, 16)) return;
+    void **vt = *(void ***)set;
+    int count = ((int (*)(void *))vt[0])(set);
+    for (int i = 0; i < count && i < 8; i++) {
+        char *c = ((char *(*)(void *, unsigned long long))vt[1])(set, (unsigned long long)i);
+        if (!c || c == me || IsBadReadPtr(c, 0x740) || c[0x710] != 1) continue;
+        float now[3] = {*(float *)(c + 0x714), *(float *)(c + 0x718), (float)(unsigned char)c[0x730]};
+        if (!memcmp(now, last[i], sizeof now)) continue;
+        memcpy(last[i], now, sizeof now);
+        logf("name test (%s): other player %d downed as seen here: state %u gauge %.1f timer %.2f count %u (our effect %d)", side, i,
+             (unsigned char)c[0x710], now[0], now[1], (unsigned char)c[0x730], our_speffect_active(c));
+    }
+}
 static void hook_acceptance(void) {
+    if (setting(S_NAME_TEST)) {
+        hook_call(0x4f3a98, 0x3d7610, (void *)rescue_add_event_hook, "name test: rescue target log (event)");
+        hook_call(0x66e03e, 0x3d7610, (void *)rescue_add_local_hook, "name test: rescue target log (local)");
+    }
     if (setting(S_FINISH_TEST))
         for (unsigned i = 0; i < 4; i++) hook_call(CANHIT_SITES[i], 0x436370, (void *)can_hit_hook, "finish test: can-hit log");
     if (setting(S_MARKER_TEST)) {
         hook_call(0x84d8d8, 0x90dc80, (void *)map_model_hook, "marker test: world map");
         hook_call(0x84d91e, 0x90dc80, (void *)map_model_hook, "marker test: world map");
         hook_call(0xa4e3c0, 0x90dc80, (void *)map_model_hook, "marker test: world map");
+        hook_call(0xad1f00, 0xac53a0, (void *)map_dialog_hook, "marker test: map screen");
+        hook_call(0xacedf2, 0xace8e0, (void *)map_list_draw_hook, "marker test: map list draw");
     }
     if (setting(S_FINISH_TEST)) {
         for (unsigned i = 0; i < 5; i++) hook_call(RECV_SITES[i], 0x436530, (void *)recv_hit_hook, "finish test: hit receive log");
@@ -2272,7 +2400,7 @@ static void host_member_sync(char *sm) {
     }
     if (*(int *)(sm + 0x10) == 7) g_host_switched = 1;
     host_death_watch();
-    if (setting(S_NAME_TEST)) name_watch(sm, "host", g_host_switched), slot_hp_watch("host");
+    if (setting(S_NAME_TEST)) name_watch(sm, "host", g_host_switched), slot_hp_watch("host"), other_downed_watch("host");
     if (g_host_switched) remote_chr_log();
     // packet 10 to each newly waiting member, once the role is 7 (requests are answered only then)
     if (*(int *)(sm + 0x10) == 7 && waiting > last_waiting) {
@@ -2980,7 +3108,7 @@ static void enter_watch(char *sm) {
         team_log("enter test, 1 s after the team effect");
     }
     if (setting(S_FINISH_TEST)) other_down_watch("invader");
-    if (setting(S_NAME_TEST)) name_watch(sm, "invader", g_enter_world != 0), slot_hp_watch("invader");
+    if (setting(S_NAME_TEST)) name_watch(sm, "invader", g_enter_world != 0), slot_hp_watch("invader"), other_downed_watch("invader");
     // finish-test guard: the stand-up was refused and the timer set to 0, but the character is still
     // down 10 s later (the behaviour did not take its death): the invader counts as dead.
     if (g_enter_effect && chr && chr == g_finish_chr && g_finish_invader && g_finish_tick && chr[0x710] == 1 &&
