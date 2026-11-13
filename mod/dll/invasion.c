@@ -1067,7 +1067,11 @@ static void loot_pickup_hook(char *module, float value) {  // second argument go
     loot_describe(module, text, sizeof text);
     unsigned bits;
     memcpy(&bits, &value, 4);
-    logf("loot test: pickup taken: %s, second argument %08x", text, bits);
+    static char *last_module;  // run 12: called every frame while a pickup runs; one line per object
+    static DWORD last_tick;
+    if (module != last_module || GetTickCount() - last_tick > 3000)
+        logf("loot test: pickup taken: %s, second argument %08x", text, bits);
+    last_module = module, last_tick = GetTickCount();
     ((void (*)(char *, float))(g_base + 0x7247d0))(module, value);
 }
 static void *loot_dialog_hook(void *a, void *b, char *job, char *j108, char *j148) {
@@ -1082,7 +1086,111 @@ static void *loot_dialog_hook(void *a, void *b, char *job, char *j108, char *j14
     logf("loot test: equipment pickup dialog built (%p): job %s| +108 %s| +148 %s", r, hex[0], hex[1], hex[2]);
     return r;
 }
+// Decision 20 (finish-test). On the downed player's own machine:
+// - going down (0x66f3b0(chr, 1), call at 0x674f37 in 0x674eb0) sets the gauge from the down count
+//   +0x730 (GameSystemCommonParam +0x380/+0x384/+0x388); the gauge refills only up to the count's value,
+//   so a full gauge needs count 3 as well. Who downed the player is not on the character at that moment
+//   (+0x728 is reset to -1 there), so: the invader always (it has no team-mates), the host whenever an
+//   invader has been admitted to its session.
+// - a hit lowers the gauge in 0x66dec0 (call at 0x43dac3 in the hit handler 0x43d260, with the attacker).
+//   At 0 the behaviour asks to stand up. When the other side empties it, the gauge is left at 0.5 (shown
+//   as 1, so no stand-up) and the bleed-out timer +0x718 is set to 0: the bleed-out death the host showed
+//   in run 12 (timer 0 with a non-empty gauge: death animation, state 1 -> 0).
+static float gscp_float(unsigned off) {
+    char tmp[16];
+    char **p = ((char **(*)(void *))(g_base + 0xe76d50))(tmp);
+    return p && *p ? (float)*(int *)(*p + off) : 0;
+}
+static int g_invader_downs;  // the invader's downs in this invasion (decision 22), reset at its end
+static float gscp_u16(unsigned off) {
+    char tmp[16];
+    char **p = ((char **(*)(void *))(g_base + 0xe76d50))(tmp);
+    return p && *p ? (float)*(unsigned short *)(*p + off) : 0;
+}
+static int finish_side_ok(char *chr) {  // a down of this local character counts as by the other side
+    return chr && chr == local_player() && (our_speffect_active(chr) == 1 || g_host_switched);
+}
+static void finish_down_hook(char *chr, char state, float t) {
+    ((void (*)(char *, char, float))(g_base + 0x66f3b0))(chr, state, t);
+    if (state != 1 || chr != local_player() || IsBadReadPtr(chr, 0x740) || chr[0x710] != 1) return;
+    if (!finish_side_ok(chr)) {
+        logf("finish test: went down (count %u, gauge %.1f): left to the game (no invader in the session)", (unsigned char)chr[0x730],
+             *(float *)(chr + 0x714));
+        return;
+    }
+    // Decision 22. The timer +0x718 (seconds, float) is set here by the game from GameSystemCommonParam
+    // +0x2f4 and only counted down by 0x674eb0 (frame time, after the hit grace +0x71c), so one write
+    // holds (except under SpEffect 102120, which resets it to the param every frame). The gauge refills
+    // in the down at +0x38c.. % of its cap per second, capped by the value for the count +0x730, so the
+    // count is set to match. The game lowers +0x730 by one every +0x2ca seconds out of the down (+0x720).
+    float was = *(float *)(chr + 0x714), timer_was = *(float *)(chr + 0x718);
+    unsigned count = (unsigned char)chr[0x730];
+    if (our_speffect_active(chr) == 1) {
+        int n = ++g_invader_downs;
+        if (n >= 4) {
+            *(float *)(chr + 0x714) = 0.5f, *(float *)(chr + 0x718) = 0;
+            logf("finish test: invader down %d (game count %u): the last chance was the third: gauge 0.5, timer %.2f -> 0 (death)", n, count,
+                 timer_was);
+            return;
+        }
+        static const unsigned off[3] = {0x380, 0x384, 0x388};
+        static const float secs[3] = {5, 10, 15};
+        float g = gscp_float(off[n - 1]);
+        if (g > 0) chr[0x730] = (char)n, *(float *)(chr + 0x714) = g;
+        *(float *)(chr + 0x718) = secs[n - 1];
+        logf("finish test: invader down %d (game count %u -> %d): gauge %.1f -> %.1f, timer %.2f -> %.0f s", n, count, n, was,
+             *(float *)(chr + 0x714), timer_was, secs[n - 1]);
+        return;
+    }
+    float full = gscp_float(0x388);
+    if (full > 0) chr[0x730] = 3, *(float *)(chr + 0x714) = full;
+    *(float *)(chr + 0x718) = 15;
+    logf("finish test: host down with an invader in the session: count %u -> 3, gauge %.1f -> %.1f, timer %.2f -> 15 s "
+         "(count decay every %.0f s out of the down)", count, was, *(float *)(chr + 0x714), timer_was, gscp_u16(0x2ca));
+}
+static void finish_hit_hook(char *chr, char *attacker, char *hit) {
+    ((void (*)(char *, char *, char *))(g_base + 0x66dec0))(chr, attacker, hit);
+    if (!chr || chr != local_player() || IsBadReadPtr(chr, 0x740) || chr[0x710] != 1 || *(float *)(chr + 0x714) > 0) return;
+    int ok_attacker = attacker && attacker != chr && !IsBadReadPtr(attacker, 0x200);
+    int by_other = our_speffect_active(chr) == 1 ? ok_attacker && our_speffect_active(attacker) != 1
+                                                 : g_host_switched && ok_attacker && our_speffect_active(attacker) == 1;
+    if (!by_other) {
+        logf("finish test: gauge emptied by a team-mate: left to the game (stand-up)");
+        return;
+    }
+    float timer = *(float *)(chr + 0x718);
+    *(float *)(chr + 0x714) = 0.5f;
+    *(float *)(chr + 0x718) = 0;
+    logf("finish test: emptied by the other side: gauge 0 -> 0.5 (no stand-up), timer %.2f -> 0 (bleed-out death)", timer);
+}
+// Task 2 (finish-test): the team relation table the game asks "is this character an enemy" through
+// (0x52c990 for two characters, 0x52c950 for two teams: 81 x 81 pointers at 0x399a120 to relation
+// objects whose first method answers the query {enemy, friend, neutral}: Friend 0x398d3f0, Enemy
+// 0x398d3f8, Neutral 0x398d408) has 16 -> 77 (our invader against a downed player) Neutral, while 1 -> 77
+// and 2 -> 77 are Enemy. The host's hits land on a downed invader and lower its gauge on the invader's
+// machine (the hit handler 0x43d260 calls 0x66dec0 for any hit on a downed character, no team check);
+// the invader's hits on a downed host never land. Here 16 -> 77 is given the object of 2 -> 77 (Enemy),
+// on both machines (only team 16, our invader, attacks with it).
+// ponytail: inferred that hit detection uses this entry (one of 25 callers of 0x52c990, not traced).
+static void finish_relation_patch(void) {
+    void **table = (void **)(g_base + 0x399a120);
+    void **entry = table + 16 * 0x51 + 77, *enemy = table[2 * 0x51 + 77];
+    if (*entry != (void *)(g_base + 0x398d408) || enemy != (void *)(g_base + 0x398d3f8)) {
+        logf("finish test: relation 16 -> 77 not as expected (%p, enemy %p), not changed", *entry, enemy);
+        return;
+    }
+    DWORD old;
+    if (!VirtualProtect(entry, 8, PAGE_READWRITE, &old)) return;
+    *entry = enemy;
+    VirtualProtect(entry, 8, old, &old);
+    logf("finish test: relation 16 -> 77 (invader against a downed player) Neutral -> Enemy, as 1/2 -> 77");
+}
 static void hook_acceptance(void) {
+    if (setting(S_FINISH_TEST)) {
+        hook_call(0x674f37, 0x66f3b0, (void *)finish_down_hook, "finish test: going down");
+        hook_call(0x43dac3, 0x66dec0, (void *)finish_hit_hook, "finish test: gauge hit");
+        finish_relation_patch();
+    }
     if (setting(S_LOOT_TEST)) {
         hook_call(0x6fd220, 0x724420, (void *)loot_update_hook, "loot test: pickup objects");
         hook_call(0x72464c, 0x7247d0, (void *)loot_pickup_hook, "loot test: pickup");
@@ -1793,6 +1901,92 @@ static void remote_chr_log(void) {
         logf("host: other player characters (%d in the player set):%s", count, text[0] ? text : " none");
     }
 }
+// Decision 21 (finish-test): the host killed while an invader is in its session loses. A down that
+// ends in death goes from state 1 straight to 0 (a revive goes 1 -> 2); with an invader admitted
+// (g_host_switched) such a death ends the host's expedition through the same request the invader's
+// way home uses (gm+0xaf1, 0x6af8f0): InGameStep then runs Result / EndFlow back to the Roundtable
+// Hold, the session closes with the world, and the invader's "no longer a client" path sends it home.
+// ponytail: a solo host only; with squad mates the condition must become "the whole squad is dead".
+// Both sides (finish-test): the downed state of the other player characters as this machine sees it,
+// one line per change (0 none, 1 down, 2 revived; 1 -> 0 is a death).
+static void other_down_watch(const char *side) {
+    static char *chr_[8];
+    static int last_[8];
+    char *wcm = *(char **)(g_base + 0x3c0f0a8), *me = wcm ? *(char **)(wcm + 0x174e8) : NULL;
+    if (!wcm) return;
+    void **set = (void **)(wcm + 0x9a40);
+    if (IsBadReadPtr(set, 8) || IsBadReadPtr(*(void ***)set, 16)) return;
+    void **vt = *(void ***)set;
+    int count = ((int (*)(void *))vt[0])(set);
+    for (int i = 0; i < count && i < 8; i++) {
+        char *c = ((char *(*)(void *, unsigned long long))vt[1])(set, (unsigned long long)i);
+        if (!c || c == me || IsBadReadPtr(c, 0x740)) continue;
+        int st = (unsigned char)c[0x710];
+        if (chr_[i] != c) chr_[i] = c, last_[i] = st;
+        else if (st != last_[i]) {
+            logf("finish test (%s): other player %d (%s): downed state %d -> %d%s", side, i,
+                 our_speffect_active(c) == 1 ? "the invader" : "not ours", last_[i], st, last_[i] == 1 && st == 0 ? " (died)" : "");
+            last_[i] = st;
+        }
+    }
+}
+static void host_death_watch(void) {
+    if (setting(S_FINISH_TEST)) other_down_watch("host");
+    static int last = -1;
+    char *chr = local_player();
+    int now = chr && !IsBadReadPtr(chr, 0x740) ? (unsigned char)chr[0x710] : -1;
+    if (setting(S_FINISH_TEST) && g_host_switched && last == 1 && now == 0) {
+        ((void (*)(void))(g_base + 0x6af8f0))();
+        char *gm = *(char **)(g_base + 0x3c13258);
+        logf("finish test: local player died with an invader admitted: expedition end requested (gm+0xaf1 = %u)",
+             gm ? (unsigned char)gm[0xaf1] : 0);
+    }
+    last = now;
+}
+// name-test: the HUD shows another player's character name only when 0x7b14c0(chr) says so: the
+// game's name option (play state +0x98, 0x207900) and either a local character or a valid platform id
+// at *(chr+0x770)+0x10 (0x66e620) that the block list (0xdcba00) does not name; otherwise "Player"
+// (0x7ade50). Logged per other player on change: the option, the id (16-bit tag), the result, and our
+// session member's Steam id (16-bit tag). The fill: an empty id of a remote player in our session gets
+// that member's Steam id (member +0x10), with a log line before and after.
+// ponytail: one remote member per session (an invasion of one); several invaders need the mapping
+// from character to member (not read).
+static void name_watch(char *sm, const char *side, int fill) {
+    static unsigned long long last_key[8];
+    char *wcm = *(char **)(g_base + 0x3c0f0a8), *me = wcm ? *(char **)(wcm + 0x174e8) : NULL;
+    if (!wcm || !sm) return;
+    unsigned long long member = 0;
+    int remote = 0;
+    char *b = *(char **)(sm + SM_PLAYERS_BEGIN), *e = *(char **)(sm + SM_PLAYERS_BEGIN + 8);
+    for (char *m = b; b && m < e && !IsBadReadPtr(m, SM_PLAYER_SIZE); m += SM_PLAYER_SIZE)
+        if (!m[0xe1]) member = *(unsigned long long *)(m + 0x10), remote++;
+    void **set = (void **)(wcm + 0x9a40);
+    if (IsBadReadPtr(set, 8) || IsBadReadPtr(*(void ***)set, 16)) return;
+    void **vt = *(void ***)set;
+    int count = ((int (*)(void *))vt[0])(set);
+    char *opt = *(char **)(g_base + 0x3c078d0) ? *(char **)(*(char **)(g_base + 0x3c078d0) + 0x98) : NULL;
+    for (int i = 0; i < count && i < 8; i++) {
+        char *c = ((char *(*)(void *, unsigned long long))vt[1])(set, (unsigned long long)i);
+        if (!c || c == me || IsBadReadPtr(c, 0x780)) continue;
+        char *net = *(char **)(c + 0x770);
+        if (!net || IsBadReadPtr(net, 0x18)) continue;
+        unsigned long long *id = (unsigned long long *)(net + 0x10);
+        if (fill && *id == 0 && remote == 1 && member) {
+            logf("name test (%s): player %d: platform id empty; set to our session member's Steam id (tag %04x)", side, i,
+                 (unsigned)(member & 0xffff));
+            *id = member;
+            logf("name test (%s): player %d: platform id now tag %04x", side, i, (unsigned)(*id & 0xffff));
+        }
+        int shown = ((char (*)(void *))(g_base + 0x7b14c0))(c) != 0;
+        unsigned long long key = (*id & 0xffff) | (unsigned long long)shown << 16 | (unsigned long long)(opt ? (unsigned char)opt[0x15] : 0xff) << 17 |
+                                 (member & 0xffff) << 32 | (unsigned long long)remote << 48 | 1ull << 56;
+        if (key == last_key[i]) continue;
+        last_key[i] = key;
+        logf("name test (%s): player %d: name option byte %u (0 = names on), platform id tag %04x, real name shown %d | "
+             "session: %d remote member(s), member Steam id tag %04x", side, i, opt ? (unsigned char)opt[0x15] : 0xff,
+             (unsigned)(*id & 0xffff), shown, remote, (unsigned)(member & 0xffff));
+    }
+}
 static void host_member_sync(char *sm) {
     static unsigned long long for_lobby;
     static int last_waiting;
@@ -1846,6 +2040,8 @@ static void host_member_sync(char *sm) {
         memset(g_hud_invaders, 0, sizeof g_hud_invaders);
     }
     if (*(int *)(sm + 0x10) == 7) g_host_switched = 1;
+    host_death_watch();
+    if (setting(S_NAME_TEST)) name_watch(sm, "host", g_host_switched);
     if (g_host_switched) remote_chr_log();
     // packet 10 to each newly waiting member, once the role is 7 (requests are answered only then)
     if (*(int *)(sm + 0x10) == 7 && waiting > last_waiting) {
@@ -2124,8 +2320,10 @@ static unsigned g_saved_pending[4];  // pending block, +0xaac, type +0xdc0, reas
 static int g_saved_pending_valid;
 #define RVA_QM_UNREGISTER 0xb52ef0  // void (ctrl*): if step != 0, cancel the job chain, set step 25
 static int g_invasion_ended;
+static int g_invader_downs;
 static void join_over(const char *why) {
     g_join = 3;
+    g_invader_downs = 0;
     if (g_saved_pending_valid) {  // the pending map state we set at the forced step goes back
         unsigned blk = g_saved_pending[0];
         ((void (*)(unsigned *))(g_base + 0x6b0610))(&blk);
@@ -2509,7 +2707,20 @@ static void enter_watch(char *sm) {
     // so once it is gone the invader died: decision 3, the invader leaves and returns to its hub.
     static DWORD applied, check_at;
     DWORD nowt = GetTickCount();
-    if (g_enter_world && chr && t - g_enter_world > 10000 && !g_enter_effect) {
+    // Run 13: the effect came 10 s after the world sync (a margin from the first tests, when the player
+    // was still being rebuilt around the sync), and the host saw the invader uncoloured for those
+    // seconds. Now at the sync itself (step 22 or later: the character of the host's world exists);
+    // if the effect is gone again within the first 5 s (a late rebuild) it is put on once more, and
+    // only after that does its loss count as the invader's death.
+    static int reapplied;
+    if (!g_enter_world) reapplied = 0;
+    if (g_enter_effect && chr && !reapplied && nowt - applied < 5000 && nowt - applied > 300 && our_speffect_active(chr) == 0) {
+        reapplied = 1;
+        ((void (*)(void *, int, unsigned char))(g_base + RVA_ADD_SPEFFECT))(chr, TEAM_TEST_SPEFFECT, 0);
+        applied = nowt;
+        team_log("enter test, team effect lost right after the sync: put on again");
+    }
+    if (g_enter_world && chr && !g_enter_effect) {
         team_log("enter test, before the team effect");
         ((void (*)(void *, int, unsigned char))(g_base + RVA_ADD_SPEFFECT))(chr, TEAM_TEST_SPEFFECT, 0);
         g_enter_effect = 1;
@@ -2520,6 +2731,8 @@ static void enter_watch(char *sm) {
         check_at = 0;
         team_log("enter test, 1 s after the team effect");
     }
+    if (setting(S_FINISH_TEST)) other_down_watch("invader");
+    if (setting(S_NAME_TEST)) name_watch(sm, "invader", g_enter_world != 0);
     // finish-test guard: the stand-up was refused and the timer set to 0, but the character is still
     // down 10 s later (the behaviour did not take its death): the invader counts as dead.
     if (g_enter_effect && chr && chr == g_finish_chr && g_finish_invader && g_finish_tick && chr[0x710] == 1 &&
@@ -2530,7 +2743,7 @@ static void enter_watch(char *sm) {
         join_over("invader died (finished while down)");
         return;
     }
-    if (g_enter_effect && chr && nowt - applied > 2000 && our_speffect_active(chr) == 0) {
+    if (g_enter_effect && chr && nowt - applied > 5000 && our_speffect_active(chr) == 0) {
         team_log("enter test, team effect gone");
         g_invasion_ended = 1;
         join_over("invader died (team effect removed)");

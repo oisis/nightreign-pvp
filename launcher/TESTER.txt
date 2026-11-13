@@ -19,6 +19,8 @@ Every setting and who sets it:
                finishes that member. If a downed player stays on the ground, set it back to false.
   loot-test    Both (logging only). Logs what lies on the ground to be picked up, every pickup and
                every equipment pickup dialog, to learn what a killed invader leaves behind.
+  name-test    Both. Logs why the other player's name shows as "Player" and fills in the missing
+               id so the game can show the real character name.
   watch-test   Leave false. Diagnostic that crashed the game in its first form.
   full-sync    Invader (on by default). Ask the host for its full world state. false only for tests.
   team-test    Solo tests only (leave false in a two-player test).
