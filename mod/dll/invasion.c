@@ -61,7 +61,7 @@ static const char *const KEY_LINES[] = {
     "not hooked", "not as expected", "not expected", "cannot", "failed", "NOT ", "not started", "not written",
     "host: session up", "host: expedition reached", "host: expedition over", "host: member admitted", "role: ",
     "host: no member left", "leave done", "join: search started", "joining lobby", "join -> ", "stopping (",
-    "in the host's world", "world sync at step", "invasion won", "invasion lost", "reward test: won", "reward test: lost",
+    "in the host's world", "world sync at step", "invasion won", "invasion lost", "invasion neither", "level: ", "reward test: won", "reward test: lost",
     "expedition end requested", "still down", "watchdog", "no map load", "went back", "code patch", "crash"};
 static void logf(const char *fmt, ...) {
     char line[1024];
@@ -2736,7 +2736,55 @@ static int g_invasion_ended;
 static int g_invader_downs;
 static int g_host_killed;    // the invader saw the session host die in this invasion
 static int g_reward_pending; // 1 won, 2 lost: applied at the expedition's reward computation
+// Decision 24: the invader joins at the host's level, set once on arrival and put back when the invasion
+// ends. The game's own level change (0x670f80, the character's level-effect update) does, for the player
+// data (play state +8): 0x209e20(data, level) (level +0x68 and the stats +0x34..+0x50 from the level
+// table), 0x209ef0 (the expedition's highest level +0x10c), 0x20e170 (level-bound equipment), 0x20dcd0;
+// and recomputes the maxima: 0x502300(character +0x190, bonuses) -> 0x20da60(data, bonuses), then max HP
+// / FP / stamina 0x6c90e0 / 0x6c9180 / 0x6c9290 into +0x18 / +0x24 / +0x30 and onto the character's data
+// module (0x427b70 / 0x427b80 / 0x427b90, 0x428bf0). The same calls here. Runes (+0x6c) are not touched;
+// the highest level +0x10c is put back to its own value when the level is restored.
+static int g_level_set, g_own_level, g_own_top_level;
+static int level_apply(int level, const char *why) {
+    char *ps = *(char **)(g_base + 0x3c078d0), *chr = local_player();
+    char *pd = ps ? *(char **)(ps + 8) : NULL;
+    if (!pd || IsBadReadPtr(pd, 0x860) || !chr || IsBadReadPtr(chr, 0x1c0)) return -1;
+    if (level < 1) level = 1;
+    if (level > 15) level = 15;
+    int before = *(int *)(pd + 0x68);
+    ((void (*)(char *, int))(g_base + 0x209e20))(pd, level);
+    ((void (*)(char *))(g_base + 0x209ef0))(pd);
+    ((void (*)(char *))(g_base + 0x20e170))(pd);
+    ((void (*)(char *))(g_base + 0x20dcd0))(pd);
+    unsigned long long bonus[4] = {0};
+    ((void (*)(void *, void *))(g_base + 0x502300))(*(void **)(chr + 0x190), bonus);
+    if (((char (*)(char *, void *))(g_base + 0x20da60))(pd, bonus)) {
+        *(int *)(pd + 0x18) = ((int (*)(char *))(g_base + 0x6c90e0))(pd);
+        *(int *)(pd + 0x24) = ((int (*)(char *))(g_base + 0x6c9180))(pd);
+        *(int *)(pd + 0x30) = ((int (*)(char *))(g_base + 0x6c9290))(pd);
+        char **mod = *(char ***)(chr + 0x1b8);
+        if (mod && !IsBadReadPtr(mod, 8) && *mod) {
+            ((void (*)(char *, int))(g_base + 0x427b70))(*mod, *(int *)(pd + 0x18));
+            ((void (*)(char *, int))(g_base + 0x427b80))(*mod, *(int *)(pd + 0x24));
+            ((void (*)(char *, int))(g_base + 0x427b90))(*mod, *(int *)(pd + 0x30));
+            ((void (*)(char *, int))(g_base + 0x428bf0))(*mod, 0);
+        }
+    }
+    logf("level: %s: invader level %d -> %d (max HP %d, FP %d, stamina %d)", why, before, *(int *)(pd + 0x68), *(int *)(pd + 0x18),
+         *(int *)(pd + 0x24), *(int *)(pd + 0x30));
+    return before;
+}
+static void level_restore(void) {
+    if (!g_level_set) return;
+    g_level_set = 0;
+    char *ps = *(char **)(g_base + 0x3c078d0);
+    char *pd = ps ? *(char **)(ps + 8) : NULL;
+    if (level_apply(g_own_level, "invasion over, own level back") >= 0 && pd && !IsBadReadPtr(pd, 0x110))
+        *(int *)(pd + 0x10c) = g_own_top_level;
+    logf("level: restore done (own level %d, highest level %d)", g_own_level, g_own_top_level);
+}
 static void join_over(const char *why) {
+    level_restore();
     g_join = 3;
     g_invader_downs = 0;
     if (g_saved_pending_valid) {  // the pending map state we set at the forced step goes back
@@ -2787,9 +2835,16 @@ static void join_over(const char *why) {
             // reward-test (decision 23): the result screens stay (play state +0x368 is left alone); the reward
             // computation at the expedition's end (0x1fd620, call at 0xc32971) is replaced for this ending by
             // ours: murk only on a win, nothing on a loss.
-            g_reward_pending = g_host_killed ? 1 : 2;
-            logf("reward test: invasion %s (%s): reward at the expedition's end: %s", g_host_killed ? "won" : "lost", why,
-                 g_host_killed ? "murk" : "none");
+            // decision 23: won = the host was killed, or the host left the expedition / session on its own;
+            // lost = the invader's own death (finished, bled out, fourth down); anything else (a broken
+            // connection or a watchdog) counts as neither and gives the smaller amount so the screen has content.
+            int died = strstr(why, "invader died") != NULL;
+            int host_left = strstr(why, "host migration") || strstr(why, "no longer a client");
+            const char *kind = died ? "lost: the invader died" : g_host_killed ? "won: the host was killed"
+                             : host_left ? "won: the host left the expedition" : "neither: the session broke off";
+            g_reward_pending = !died && (g_host_killed || host_left) ? 1 : 2;
+            logf("reward test: invasion %s (%s): reward at the expedition's end: %d murk", kind, why,
+                 g_reward_pending == 1 ? REWARD_MURK : REWARD_MURK_LOST);
         }
         {
             ((void (*)(void))(g_base + 0x6af8f0))();
@@ -3142,6 +3197,21 @@ static void enter_watch(char *sm) {
         ((void (*)(void *, int, unsigned char))(g_base + RVA_ADD_SPEFFECT))(chr, TEAM_TEST_SPEFFECT, 0);
         applied = nowt;
         team_log("enter test, team effect lost right after the sync: put on again");
+    }
+    // decision 24: once the world sync is through and the host's slot holds its level, take that level
+    if (g_enter_world && chr && !g_level_set) {
+        char *ps = *(char **)(g_base + 0x3c078d0);
+        char *slots = ps ? *(char **)(ps + 0x10) : NULL, *pd = ps ? *(char **)(ps + 8) : NULL;
+        int host_no = g_host_player_no >= 0 ? g_host_player_no : 1;
+        for (int i = 0; slots && pd && !IsBadReadPtr(slots, 2 * 0x8a0) && !IsBadReadPtr(pd, 0x110) && i < 2; i++) {
+            char *sl = slots + i * 0x8a0;
+            int no = *(int *)(sl + 8), lv = *(int *)(sl + 0x68);
+            if (no != host_no || lv < 1 || lv > 15) continue;
+            g_own_level = *(int *)(pd + 0x68), g_own_top_level = *(int *)(pd + 0x10c);
+            logf("level: host (player %d) is level %d; invader level %d (highest %d)", no, lv, g_own_level, g_own_top_level);
+            if (level_apply(lv, "arrival at the host's level") >= 0) g_level_set = 1;
+            break;
+        }
     }
     if (g_enter_world && chr && !g_enter_effect) {
         team_log("enter test, before the team effect");
@@ -3843,6 +3913,59 @@ static void hook_expedition_start(void) {
     logf("expedition start: hooked");
 }
 
+// Level investigation (debug-log only, logging only). About once a second, the 32-bit words that changed
+// in: the local player data (play state +8, first 0x200 bytes), the local character's data module
+// (*(ChrIns +0x1b8), first 0x200 bytes: HP and maxima), and on the invader each other-player slot (play
+// state +0x10, 0x8a0 bytes). One line per region per check, at most 12 changes on it; a word that has
+// changed 30 times is muted (timers, positions), logged once.
+#define DIFF_WORDS (0x8a0 / 4)
+typedef struct { const char *name; void *base; unsigned n; unsigned old[DIFF_WORDS]; unsigned char hits[DIFF_WORDS]; int primed; } diff_t;
+static void diff_region(diff_t *d, void *base, unsigned bytes) {
+    if (!base || IsBadReadPtr(base, bytes)) { d->primed = 0; return; }
+    unsigned n = bytes / 4;
+    if (base != d->base || n != d->n) d->base = base, d->n = n, d->primed = 0, memset(d->hits, 0, sizeof d->hits);
+    unsigned *now = (unsigned *)base;
+    if (!d->primed) {
+        memcpy(d->old, now, n * 4);
+        d->primed = 1;
+        return;
+    }
+    // run 27: a cap of 12 changes per line hid the rest of a level-up; now every change, 10 per line
+    char line[600];
+    int at = 0, shown = 0;
+    for (unsigned i = 0; i < n; i++) {
+        if (now[i] == d->old[i]) continue;
+        if (d->hits[i] < 255) d->hits[i]++;
+        if (d->hits[i] == 30) logf("level test: %s +0x%03x changes often, muted", d->name, i * 4);
+        if (d->hits[i] < 30) {
+            if (!at) at = snprintf(line, sizeof line, "level test: %s:", d->name);
+            at += snprintf(line + at, sizeof line - at, " +0x%03x %d->%d", i * 4, (int)d->old[i], (int)now[i]);
+            if (++shown % 10 == 0) logf("%s", line), at = 0;
+        }
+        d->old[i] = now[i];
+    }
+    if (at) logf("%s", line);
+}
+static void level_watch(void) {
+    static DWORD next;
+    static diff_t pd, cm, sl[2];
+    pd.name = "player data", cm.name = "character data", sl[0].name = "other slot 0", sl[1].name = "other slot 1";
+    if (!g_debug_log || (int)(GetTickCount() - next) < 0) return;
+    next = GetTickCount() + 1000;
+    char *ps = *(char **)(g_base + 0x3c078d0);
+    if (!ps || IsBadReadPtr(ps, 0x20)) return;
+    diff_region(&pd, *(char **)(ps + 8), 0x800);
+    char *me = local_player();
+    char *mod = me && !IsBadReadPtr(me, 0x1c0) ? *(char **)(me + 0x1b8) : NULL;
+    diff_region(&cm, mod && !IsBadReadPtr(mod, 8) ? *(char **)mod : NULL, 0x400);
+    static diff_t st;  // the play state itself (+0x000..+0x400): an expedition level may live there
+    st.name = "play state";
+    diff_region(&st, ps, 0x400);
+    if (g_join_in_world()) {
+        char *slots = *(char **)(ps + 0x10);
+        for (int i = 0; i < 2; i++) diff_region(&sl[i], slots ? slots + i * 0x8a0 : NULL, 0x8a0);
+    }
+}
 static DWORD WINAPI run(LPVOID self) {
     (void)self;
     IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew);
@@ -3875,6 +3998,7 @@ static DWORD WINAPI run(LPVOID self) {
         watch_network();
         watch_session();
         code_patch_check();
+        level_watch();
         if (1) marker_tick();
         if (1) finish_tick();
     }
