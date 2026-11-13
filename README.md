@@ -1,17 +1,17 @@
 # Nightreign Invasions
 
-A fan-made mod for **ELDEN RING NIGHTREIGN** (PC, Steam) that brings back what Elden Ring had and
-Nightreign doesn't: **other players invading your expedition**.
-
-You set out with your squad as usual. Somewhere in the world, another player may arrive as a red
-invader with one goal: to bring your expedition down. Or you can be the one who invades.
-
 > **Very early stage.** For now this is mostly a proof of concept. Invasions should work, but
 > things break, the game can hang or crash, and many features are still missing. Play with it only
 > if you're fine with that.
 >
 > **Testers welcome!** Try it with your friends and
 > [report the bugs you find](https://github.com/oisis/nightreign-pvp/issues). Every report helps.
+
+A fan-made mod for **ELDEN RING NIGHTREIGN** (PC, Steam) that brings back what Elden Ring had and
+Nightreign doesn't: **other players invading your expedition**.
+
+You set out with your squad as usual. Somewhere in the world, another player may arrive as a red
+invader with one goal: to bring your expedition down. Or you can be the one who invades.
 
 <!-- Screenshot: the Invasion entry in the expedition menu -->
 
