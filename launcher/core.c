@@ -896,6 +896,7 @@ static int read_settings(void) {
     char path[1300], on[200] = "";
     snprintf(path, sizeof path, "%s" SEP "test-settings.toml", g_app);
     int found = load_settings(path, g_set);
+    g_set[S_DEBUG_LOG] = (signed char)core_load_debug();  // the window's "Debug log" box decides
     for (int i = 0; i < SETTINGS_COUNT; i++)
         if (g_set[i]) snprintf(on + strlen(on), sizeof on - strlen(on), " %s", SETTING_NAMES[i]);
     logf_(found ? "Test settings:%s" : "Test settings:%s (no test-settings.toml next to the launcher)", on[0] ? on : " none");
@@ -1245,6 +1246,21 @@ int core_backup_save(const char *save_dir, char *where, size_t cap) {
     return 1;
 }
 
+int core_load_debug(void) {
+    char path[1300];
+    snprintf(path, sizeof path, "%s" SEP "debug-log.txt", g_app);
+    buf b = read_file(path);
+    int on = b.p && b.n && b.p[0] == '1';
+    free(b.p);
+    return on;
+}
+
+void core_save_debug(int on) {
+    char path[1300];
+    snprintf(path, sizeof path, "%s" SEP "debug-log.txt", g_app);
+    write_file(path, (const u8 *)(on ? "1" : "0"), 1);
+}
+
 void core_load_lang(char *code, size_t cap) {
     char path[1300];
     snprintf(path, sizeof path, "%s" SEP "language.txt", g_app);
@@ -1539,13 +1555,13 @@ int core_selftest(void) {
         free(q.p);
     }
     {  // test settings: values, comments, CRLF, case, unknown keys and bad values, a missing file
-        static const char t[] = "# c\r\nhost-test = true\r\n  JOIN-TEST=FALSE # x\r\nslow-time\t= True\r\n"
-                                "nope = true\r\nteam-test = yes\r\n\r\nno-rain = false";
+        static const char t[] = "# c\r\nteam-test = true\r\n  NO-RAIN=FALSE # x\r\nslow-time\t= True\r\n"
+                                "nope = true\r\nloot-test = yes\r\n\r\ndebug-log = false";
         signed char v[SETTINGS_COUNT];
         char bad[64];
-        static const signed char want[SETTINGS_COUNT] = {1, 0, -1, -1, -1, 0, 1, -1, -1, -1, -1, -1, -1, -1};
+        static const signed char want[SETTINGS_COUNT] = {1, 0, 1, -1, -1, 0};
         int good = settings_parse(t, sizeof t - 1, v, bad, sizeof bad) == 2 && !memcmp(v, want, sizeof v) &&
-                   !strcmp(bad, "nope = true, team-test = yes");
+                   !strcmp(bad, "nope = true, loot-test = yes");
         good = good && !load_settings("/nonexistent/test-settings.toml", v);
         for (int i = 0; i < SETTINGS_COUNT; i++) good = good && v[i] == setting_default(i);
         if (!good) { ok = 0; logf_("selftest: test settings parser failed"); }

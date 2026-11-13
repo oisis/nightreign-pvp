@@ -2,15 +2,12 @@ Nightreign Invasions - test build
 =================================
 
 What this is
-  An experimental mod for ELDEN RING NIGHTREIGN (PC, Steam). This build installs the mod's loader
-  and client and changes the expedition menu: "Invasion" is the first entry of the Target list
-  (with its own icon and description) and "Number of Players" has a fourth option.
-  Choosing "Invasion" starts a search for an expedition to invade: a small notice keeps coming
-  back while it runs, and the start button reads "Begin invasion" / "Cancel invasion" while the
-  cursor is on "Invasion". Choosing it again, or starting an ordinary expedition, ends the search.
-  No invasion will be found yet: joining another squad is not built, so do not wait for one.
-  "4 players" asks for a squad of four (the mod lets a session hold up to six players), but a
-  boss expedition with it is still refused: "cannot start a multiplayer session in offline mode".
+  An experimental mod for ELDEN RING NIGHTREIGN (PC, Steam) that adds player invasions between mod
+  players. Every expedition you start opens a session other mod players can invade. In the
+  Roundtable Hold, "Invasion" (the first entry of the Target list) searches for another mod
+  player's expedition and joins it as a red invader. A killed host ends the expedition and sends
+  the invader home with a murk reward; a killed invader goes home with a smaller one.
+  No settings are needed.
 
 How to start
   Windows: run NightreignInvasions.exe
@@ -30,6 +27,8 @@ Other buttons
   Backup: copies your saves (the normal one and the mod's own) into a new folder
   backups/<date_time>/ next to the launcher. It only copies; nothing is deleted or overwritten.
   Help: explains every button in the window's language.
+  Debug log: the mod writes a short log by default; ticked, it logs everything (for bug reports).
+  The log is work/native/invasion.log in this folder: send that file when you report a problem.
   Language: English, Polski, Deutsch, Français or Español; the choice is remembered.
 
 Uninstall
@@ -57,14 +56,14 @@ Po polsku
   uruchomi grę przez me3 w trybie offline z osobnym plikiem zapisu. Folder gry nie jest zmieniany.
   „Odinstaluj” usuwa zbudowane pliki i osobny zapis moda. W menu wyprawy jest nowa pozycja
   „Najazd” (pierwsza na liście „Cel”) i opcja „4 graczy”.
-  Wybranie „Najazdu” rozpoczyna szukanie wyprawy do najechania: w trakcie szukania wraca
-  krótki komunikat, a przycisk startu, gdy kursor stoi na „Najeździe”, brzmi „Rozpocznij najazd”
-  albo „Anuluj najazd”. Ponowne wybranie „Najazdu” albo start zwykłej wyprawy kończy szukanie.
-  Najazd na razie nigdy się nie znajdzie: dołączanie do innej drużyny nie jest jeszcze gotowe,
-  więc nie ma na co czekać. W trakcie szukania mod włącza warstwę sieciową gry, która łączy się
-  wyłącznie przez Steam. „4 graczy” prosi o drużynę czteroosobową (mod pozwala na sesję do sześciu
-  graczy), ale wyprawa na bossa z tą opcją jest nadal odrzucana komunikatem „Nie można
-  rozpocząć sesji wieloosobowej w trybie offline”.
+  Każda Twoja wyprawa otwiera sesję, którą inni gracze z modem mogą najechać. Wybranie
+  „Najazdu” w Twierdzy szuka wyprawy innego gracza z modem i dołącza do niej jako czerwony
+  najeźdźca. Zabity gospodarz kończy wyprawę, a najeźdźca wraca z nagrodą w czerniach; zabity
+  najeźdźca wraca z mniejszą. Żadne ustawienia nie są potrzebne. W trakcie szukania i gry mod
+  włącza warstwę sieciową gry, która łączy się wyłącznie przez Steam.
+  „Kopia zapasowa” kopiuje zapisy do nowego folderu backups/<data_godzina>/ (tylko kopiuje).
+  „Szczegółowy log” zapisuje wszystko do dziennika (do zgłaszania błędów); bez niego dziennik
+  jest krótki. „Pomoc” opisuje wszystkie przyciski.
   Gdy załadowany jest Seamless Co-op, mod niczego w menu nie zmienia.
   Mod nigdy nie łączy się z serwerami FromSoftware: wbudowana w niego blokada odrzuca własne
   połączenia gry z tymi serwerami (zapytania sieciowe, ich adresy i bezpośrednie połączenia gry),

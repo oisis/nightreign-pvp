@@ -32,6 +32,10 @@ int core_backup_save(const char *save_dir, char *where, size_t cap);
 // The language chosen in the window, from <app>/language.txt ("" when none was saved), and saving it.
 void core_load_lang(char *code, size_t cap);
 void core_save_lang(const char *code);
+// The window's "Debug log" box, from <app>/debug-log.txt (0 when none was saved), and saving it. The
+// value goes to the DLL as the debug-log setting at the next "Play with the mod".
+int core_load_debug(void);
+void core_save_debug(int on);
 // Build the mod's files from the player's own game files into <app>/work/build and write the
 // me3 profile. Returns 1 on success.
 int core_build(const char *game_dir);

@@ -1,25 +1,9 @@
-# Nightreign Invasions - test settings (tester builds only). Read at every "Play with the mod".
-#
-# Host:    host-test = true
-# Invader: join-test = true
-#          enter-test = true
-#          move-test = true
-# Both:    finish-test = true (when testing the downed rule)
-# Change the lines for your role below to true, save, then "Play with the mod".
-# PL: Host ustawia host-test = true; najeźdźca join-test, enter-test i move-test = true.
-# PL: Zmień linie swojej roli poniżej na true, zapisz i kliknij "Play with the mod".
+# Nightreign Invasions - optional test settings. Read at every "Play with the mod".
+# Nothing here is needed to play: invasions work with every line false.
+# PL: Opcjonalne ustawienia testowe; do grania nic tu nie trzeba zmieniać.
 
-host-test = false   # host only: your expedition opens a session other mod players can find
-join-test = false   # invader only: "Invasion" in the Roundtable Hold joins the first session it finds
-enter-test = false  # invader only, with join-test: stay after joining and log the way into the host's world
-move-test = false   # invader only, with enter-test: push the game's own map move into the host's world (may hang)
 team-test = false   # solo tests only: 90 s into an expedition you turn red and monsters ignore you for 180 s
-no-rain = false     # both the same: the rain outside the circle does no damage
-slow-time = false   # both the same: day and circle clocks run about ten times slower (the host's counts)
+no-rain = false     # both players the same: the rain outside the circle does no damage
+slow-time = false   # both players the same: day and circle clocks run about ten times slower (the host's counts)
 full-sync = true    # invader: ask the host for its full world state (enemies, events); false only for tests
-finish-test = false # both players: a downed invader whose gauge the host's side empties dies and goes home; an invader can finish a downed squad member
-loot-test = false   # both players, logging only: what lies on the ground, every pickup and equipment dialog
-watch-test = false  # leave false: a diagnostic that crashed the game
-name-test = false   # both players: log and fill the id the game needs to show the other player's name
-reward-test = false # invader: murk on the reward screen after a won invasion, nothing after a lost one
-marker-test = false # both players, logging only: the map markers for the other player
+loot-test = false   # logging only: what lies on the ground, every pickup and equipment dialog

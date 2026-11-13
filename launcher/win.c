@@ -6,7 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 
-enum { ID_FOLDER = 100, ID_BROWSE, ID_PLAY, ID_UNINSTALL, ID_LOG, ID_CLOSE, ID_BACKUP, ID_HELP, ID_LANG, ID_LANG_LABEL };
+enum { ID_FOLDER = 100, ID_BROWSE, ID_PLAY, ID_UNINSTALL, ID_LOG, ID_CLOSE, ID_BACKUP, ID_HELP, ID_LANG, ID_LANG_LABEL, ID_DEBUG };
 static const char *const *T = UI_TEXT[L_EN];
 static HWND g_window, g_folder, g_log;
 
@@ -77,6 +77,7 @@ static void set_texts(void) {
     SetWindowTextW(GetDlgItem(g_window, ID_HELP), wide(T[T_HELP]));
     SetWindowTextW(GetDlgItem(g_window, ID_UNINSTALL), wide(T[T_UNINSTALL]));
     SetWindowTextW(GetDlgItem(g_window, ID_CLOSE), wide(T[T_CLOSE]));
+    SetWindowTextW(GetDlgItem(g_window, ID_DEBUG), wide(T[T_DEBUG_LOG]));
 }
 
 static void uninstall(void) {
@@ -102,7 +103,8 @@ static LRESULT CALLBACK proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         MoveWindow(GetDlgItem(w, ID_LANG), cx - m - 130, m - 3, 130, 200, TRUE);
         MoveWindow(g_folder, m, 34, cx - 3 * m - 90, 24, TRUE);
         MoveWindow(GetDlgItem(w, ID_BROWSE), cx - m - 90, 33, 90, 26, TRUE);
-        MoveWindow(g_log, m, 68, cx - 2 * m, cy - 68 - 50, TRUE);
+        MoveWindow(g_log, m, 68, cx - 2 * m, cy - 68 - 80, TRUE);
+        MoveWindow(GetDlgItem(w, ID_DEBUG), m, cy - 70, cx - 2 * m, 22, TRUE);
         MoveWindow(GetDlgItem(w, ID_PLAY), m, cy - 40, cx - 6 * m - 4 * 110, 30, TRUE);
         MoveWindow(GetDlgItem(w, ID_BACKUP), cx - 4 * m - 4 * 110, cy - 40, 110, 30, TRUE);
         MoveWindow(GetDlgItem(w, ID_UNINSTALL), cx - 3 * m - 3 * 110, cy - 40, 110, 30, TRUE);
@@ -116,6 +118,8 @@ static LRESULT CALLBACK proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (LOWORD(wp) == ID_UNINSTALL) uninstall();
         if (LOWORD(wp) == ID_BACKUP) backup();
         if (LOWORD(wp) == ID_HELP) help();
+        if (LOWORD(wp) == ID_DEBUG && HIWORD(wp) == BN_CLICKED)
+            core_save_debug(SendMessageW(GetDlgItem(w, ID_DEBUG), BM_GETCHECK, 0, 0) == BST_CHECKED);
         if (LOWORD(wp) == ID_LANG && HIWORD(wp) == CBN_SELCHANGE) {
             int l = (int)SendMessageW(GetDlgItem(w, ID_LANG), CB_GETCURSEL, 0, 0);
             if (l >= 0 && l < LANG_COUNT) T = UI_TEXT[l], core_save_lang(LANG_CODE[l]), set_texts();
@@ -170,6 +174,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     child(L"BUTTON", T[T_BACKUP], BS_PUSHBUTTON, ID_BACKUP);
     child(L"BUTTON", T[T_HELP], BS_PUSHBUTTON, ID_HELP);
     child(L"STATIC", T[T_LANGUAGE], SS_RIGHT, ID_LANG_LABEL);
+    HWND debug_box = child(L"BUTTON", T[T_DEBUG_LOG], BS_AUTOCHECKBOX, ID_DEBUG);
+    SendMessageW(debug_box, BM_SETCHECK, core_load_debug() ? BST_CHECKED : BST_UNCHECKED, 0);
     HWND lang_box = child(L"COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL, ID_LANG);
     for (int i = 0; i < LANG_COUNT; i++) SendMessageW(lang_box, CB_ADDSTRING, 0, (LPARAM)wide(LANG_NAME[i]));
     SendMessageW(lang_box, CB_SETCURSEL, lang_index, 0);

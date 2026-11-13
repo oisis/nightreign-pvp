@@ -50,17 +50,35 @@
 static char log_path[MAX_PATH];
 static char *g_base;
 
+// The log. With debug-log off (the default) only the lines a support case needs are written: start
+// and settings, the network guard, session opened / closed, invasion joined / ended with its reason,
+// win / loss and the reward, the end of an expedition, and errors and watchdogs; a line counts as
+// one of those when it contains one of KEY_LINES. With debug-log on, every line. Before the settings
+// are read, every line.
+static int g_debug_log = 1;
+static const char *const KEY_LINES[] = {
+    "loaded, game base", "unsupported game build", "net guard", "settings:", "Seamless Co-op", "guard broken",
+    "not hooked", "not as expected", "not expected", "cannot", "failed", "NOT ", "not started", "not written",
+    "host: session up", "host: expedition reached", "host: expedition over", "host: member admitted", "role: ",
+    "host: no member left", "leave done", "join: search started", "joining lobby", "join -> ", "stopping (",
+    "in the host's world", "world sync at step", "invasion won", "invasion lost", "reward test: won", "reward test: lost",
+    "expedition end requested", "still down", "watchdog", "no map load", "went back", "code patch", "crash"};
 static void logf(const char *fmt, ...) {
+    char line[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    if (!g_debug_log) {
+        size_t k = 0;
+        while (k < sizeof KEY_LINES / sizeof *KEY_LINES && !strstr(line, KEY_LINES[k])) k++;
+        if (k == sizeof KEY_LINES / sizeof *KEY_LINES) return;
+    }
     FILE *f = fopen(log_path, "a");
     if (!f) return;
     SYSTEMTIME t;
     GetLocalTime(&t);
-    fprintf(f, "%02d:%02d:%02d ", t.wHour, t.wMinute, t.wSecond);
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(f, fmt, ap);
-    va_end(ap);
-    fputc('\n', f);
+    fprintf(f, "%02d:%02d:%02d %s\n", t.wHour, t.wMinute, t.wSecond, line);
     fclose(f);
 }
 
@@ -97,6 +115,8 @@ static void settings_load(void) {
             if (GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES) snprintf(old + strlen(old), sizeof old - strlen(old), " %s", name);
         }
     if (old[0]) logf("settings: old marker files ignored (test-settings.toml replaces them):%s", old);
+    g_debug_log = setting(S_DEBUG_LOG);
+    logf("settings: log %s", g_debug_log ? "full (debug-log)" : "short (key lines only; debug-log gives everything)");
 }
 
 // --- network guard -------------------------------------------------------------------------------
@@ -489,9 +509,8 @@ static void host_test_start(void) {
     g_lobby = 0;
     g_someone_joining = 0;
     g_marked_squad = ~0u;
-    g_host_test = setting(S_HOST_TEST);
+    g_host_test = 1;  // every player hosts its own expeditions (no switch since 14c271a)
     g_host_test_tick = 0;
-    if (g_host_test) logf("host test: on: this expedition opens a host session");
 }
 // InGame step, every frame until called: create once the network is ready.
 static void host_test_create(void) {
@@ -874,7 +893,7 @@ static char *hud_lookup_hook(void *wcm, unsigned long long *id) {
     // name-test (run 19, player tag on the invader): the tag list builder 0x7c8a90 looks up each of its 8
     // tag entries (FE +0xca60, 0x70 each; the handle at +0) here. One line per entry when its handle or the
     // lookup result changes: handle, found or not, team, our effect, and the entry's bytes +0x20..+0x38.
-    if (site == 0x7c8c74 && setting(S_NAME_TEST) && id) {
+    if (site == 0x7c8c74 && 1 && id) {
         char *fe = *(char **)(g_base + 0x3c14a70);
         long long idx = fe ? ((char *)id - (fe + 0xca60)) / 0x70 : -1;
         static unsigned long long last_h[8];
@@ -1533,25 +1552,25 @@ static void reward_hook(unsigned long long a1, unsigned a2) {
         logf("reward test: %s: no player data, nothing granted", won ? "won" : "lost");
 }
 static void hook_acceptance(void) {
-    if (setting(S_REWARD_TEST)) hook_call(0xc32971, 0x1fd620, (void *)reward_hook, "reward test: expedition reward");
-    if (setting(S_NAME_TEST)) {
+    if (1) hook_call(0xc32971, 0x1fd620, (void *)reward_hook, "reward test: expedition reward");
+    if (1) {
         hook_call(0x4f3a98, 0x3d7610, (void *)rescue_add_event_hook, "name test: rescue target log (event)");
         hook_call(0x66e03e, 0x3d7610, (void *)rescue_add_local_hook, "name test: rescue target log (local)");
     }
-    if (setting(S_FINISH_TEST))
+    if (1)
         for (unsigned i = 0; i < 4; i++) hook_call(CANHIT_SITES[i], 0x436370, (void *)can_hit_hook, "finish test: can-hit log");
-    if (setting(S_MARKER_TEST)) {
+    if (1) {
         hook_call(0x84d8d8, 0x90dc80, (void *)map_model_hook, "marker test: world map");
         hook_call(0x84d91e, 0x90dc80, (void *)map_model_hook, "marker test: world map");
         hook_call(0xa4e3c0, 0x90dc80, (void *)map_model_hook, "marker test: world map");
         hook_call(0xad1f00, 0xac53a0, (void *)map_dialog_hook, "marker test: map screen");
         hook_call(0xacedf2, 0xace8e0, (void *)map_list_draw_hook, "marker test: map list draw");
     }
-    if (setting(S_FINISH_TEST)) {
+    if (1) {
         for (unsigned i = 0; i < 5; i++) hook_call(RECV_SITES[i], 0x436530, (void *)recv_hit_hook, "finish test: hit receive log");
         hook_call(0x44c6ac, 0x66dec0, (void *)gauge_nohit_hook, "finish test: gauge call log");
     }
-    if (setting(S_FINISH_TEST)) {
+    if (1) {
         hook_call(0x674f37, 0x66f3b0, (void *)finish_down_hook, "finish test: going down");
         hook_call(0x43dac3, 0x66dec0, (void *)finish_hit_hook, "finish test: gauge hit");
     }
@@ -1560,7 +1579,7 @@ static void hook_acceptance(void) {
         hook_call(0x72464c, 0x7247d0, (void *)loot_pickup_hook, "loot test: pickup");
         hook_call(0x85d0b2, 0x9827d0, (void *)loot_dialog_hook, "loot test: equipment dialog");
     }
-    if (setting(S_FINISH_TEST)) {
+    if (1) {
         hook_call(0x67516f, 0x66f3b0, (void *)finish_revive_hook, "finish test: stand-up");
         hook_call(0x6751e1, 0x4f2d50, (void *)finish_event_hook, "finish test: stand-up event");
     }
@@ -2296,11 +2315,11 @@ static void other_down_watch(const char *side) {
     }
 }
 static void host_death_watch(void) {
-    if (setting(S_FINISH_TEST)) other_down_watch("host");
+    if (1) other_down_watch("host");
     static int last = -1;
     char *chr = local_player();
     int now = chr && !IsBadReadPtr(chr, 0x740) ? (unsigned char)chr[0x710] : -1;
-    if (setting(S_FINISH_TEST) && g_host_switched && last == 1 && now == 0) {
+    if (1 && g_host_switched && last == 1 && now == 0) {
         ((void (*)(void))(g_base + 0x6af8f0))();
         char *gm = *(char **)(g_base + 0x3c13258);
         logf("finish test: local player died with an invader admitted: expedition end requested (gm+0xaf1 = %u)",
@@ -2435,7 +2454,7 @@ static void host_member_sync(char *sm) {
     }
     if (*(int *)(sm + 0x10) == 7) g_host_switched = 1;
     host_death_watch();
-    if (setting(S_NAME_TEST)) name_watch(sm, "host", g_host_switched), slot_hp_watch("host"), other_downed_watch("host");
+    if (1) name_watch(sm, "host", g_host_switched), slot_hp_watch("host"), other_downed_watch("host");
     if (g_host_switched) remote_chr_log();
     // packet 10 to each newly waiting member, once the role is 7 (requests are answered only then)
     if (*(int *)(sm + 0x10) == 7 && waiting > last_waiting) {
@@ -2645,15 +2664,9 @@ static int g_enter_test;    // enter-test setting (with join-test): stay a clien
 static void join_test_start(void) {
     g_join = 0;
     g_candidate = 0;
-    g_join_test = setting(S_JOIN_TEST);
-    g_enter_test = g_join_test && setting(S_ENTER_TEST);
-    g_move_test = g_enter_test && setting(S_MOVE_TEST);
-    if (setting(S_MOVE_TEST) && !g_enter_test) logf("move test: needs join-test and enter-test = true as well; off");
-    if (g_move_test) logf("move test: on: at EndLobbyExit the controller is sent to MoveMapStart");
-    if (setting(S_ENTER_TEST) && !g_join_test) logf("enter test: needs join-test = true as well; off");
-    if (g_enter_test) logf("enter test: on: a client stays and the way into the host's world is watched");
-    if (g_join_test) logf("join test: on: the first candidate is joined; controller +0x10d %d",
-                          g_qm_ctrl ? (unsigned char)g_qm_ctrl[QM_CTRL_REFUSED] : -1);
+    g_join_test = g_enter_test = g_move_test = 1;  // "Invasion" always joins (no switches since 14c271a)
+    logf("join: search started, the first candidate is joined; controller +0x10d %d",
+         g_qm_ctrl ? (unsigned char)g_qm_ctrl[QM_CTRL_REFUSED] : -1);
 }
 // Every frame while joining: one line per change of the session's state, with ms since the call.
 static void join_watch(char *sm) {
@@ -2770,7 +2783,7 @@ static void join_over(const char *why) {
         // MoveMap_Update (0xc284b0) goes to Result / EndFlow, which brings the player back to the hub.
         // Every ending, the invader's death included (decision 3: a killed invader returns to the
         // Roundtable Hold and may start another invasion).
-        if (setting(S_REWARD_TEST)) {
+        if (1) {
             // reward-test (decision 23): the result screens stay (play state +0x368 is left alone); the reward
             // computation at the expedition's end (0x1fd620, call at 0xc32971) is replaced for this ending by
             // ours: murk only on a win, nothing on a loss.
@@ -3141,8 +3154,8 @@ static void enter_watch(char *sm) {
         check_at = 0;
         team_log("enter test, 1 s after the team effect");
     }
-    if (setting(S_FINISH_TEST) || setting(S_REWARD_TEST)) other_down_watch("invader");
-    if (setting(S_NAME_TEST)) name_watch(sm, "invader", g_enter_world != 0), slot_hp_watch("invader"), other_downed_watch("invader");
+    if (1 || 1) other_down_watch("invader");
+    if (1) name_watch(sm, "invader", g_enter_world != 0), slot_hp_watch("invader"), other_downed_watch("invader");
     // finish-test guard: the stand-up was refused and the timer set to 0, but the character is still
     // down 10 s later (the behaviour did not take its death): the invader counts as dead.
     if (g_enter_effect && chr && chr == g_finish_chr && g_finish_invader && g_finish_tick && chr[0x710] == 1 &&
@@ -3582,7 +3595,7 @@ static int cursor_on_invasion(char *dialog);
 static char *g_dialog;
 static DWORD g_request_tick;
 static void step_hook(void *ctrl, void *time, int step) {
-    if (setting(S_MARKER_TEST)) marker_clear();
+    if (1) marker_clear();
     static int last_seen_start = -1;
     if (step == QM_STEP_NONE) last_seen_start = -1;
     static int last = -1;
@@ -3600,7 +3613,17 @@ static void step_hook(void *ctrl, void *time, int step) {
             set_network(0);
         }
     }
-    if (g_join != 4) host_expedition(step);  // an enter-test client opens no host session of its own
+    // Both roles live in every player (no switches since 14c271a): its own expeditions host; while it is
+    // an invader in another player's world (g_join 4) it opens and advertises nothing of its own.
+    static int told_invader;
+    if (g_join != 4) {
+        if (told_invader) told_invader = 0, logf("role: no longer an invader; own expeditions host again");
+        host_expedition(step);
+    } else if (!told_invader) {
+        told_invader = 1;
+        logf("role: invader in another player's world: no host session of our own (host role %d, in expedition %d)", g_host_test,
+             g_in_expedition);
+    }
     if (g_host_test == 2 || g_stop_pending) host_test_watch();
     if (g_stop_pending) finish_pending_stop(0);
     if (step != QM_STEP_NONE && g_searching && g_join == 4) {
@@ -3820,88 +3843,6 @@ static void hook_expedition_start(void) {
     logf("expedition start: hooked");
 }
 
-// Who writes lobby_state (session manager +0xc). Run 11: on a repeated join the joiner went to 7 with
-// no logged call of the leave 0xdf1180 from any of its 44 call sites or 2 tail jumps. A hardware write
-// breakpoint (debug register 0, 4 bytes, writes) on the field, armed from this thread on every other
-// thread of the game while our network is up (again every 5 s, for threads started since), names
-// the writer whatever path it takes. The handler only records (no file or heap use there); this
-// thread writes the lines: the code address after the write, the value, the thread, and the stack
-// words that point into the game's code (return addresses among them, nearest first).
-#define LS_RING 32
-static struct { DWORD tick, tid; unsigned value; unsigned long long rip; unsigned n; unsigned long long st[14]; } g_ls_ring[LS_RING];
-static volatile LONG g_ls_head, g_ls_tail;
-static volatile char *g_ls_field;
-static LONG CALLBACK ls_watch_handler(EXCEPTION_POINTERS *e) {
-    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !(e->ContextRecord->Dr6 & 1)) return EXCEPTION_CONTINUE_SEARCH;
-    e->ContextRecord->Dr6 &= ~0xfull;
-    LONG slot = InterlockedIncrement(&g_ls_head) - 1;
-    if (slot - g_ls_tail < LS_RING) {
-        int i = slot % LS_RING;
-        g_ls_ring[i].tick = GetTickCount(), g_ls_ring[i].tid = GetCurrentThreadId();
-        g_ls_ring[i].value = g_ls_field ? *(volatile unsigned *)g_ls_field : 0;
-        g_ls_ring[i].rip = (unsigned long long)((char *)e->ContextRecord->Rip - g_base);
-        unsigned long long *sp = (unsigned long long *)e->ContextRecord->Rsp;
-        unsigned n = 0;
-        for (int k = 0; k < 160 && n < 14; k++) {
-            char *p = (char *)sp[k];
-            if (p > g_base + 0x1000 && p < g_base + 0x2c00000) g_ls_ring[i].st[n++] = (unsigned long long)(p - g_base);
-        }
-        g_ls_ring[i].n = n;
-    }
-    return EXCEPTION_CONTINUE_EXECUTION;
-}
-static void ls_watch_flush(void) {
-    while (g_ls_tail < g_ls_head) {
-        if (g_ls_head - g_ls_tail > LS_RING) {
-            logf("lobby_state watch: %ld writes not recorded (ring full)", g_ls_head - g_ls_tail - LS_RING);
-            g_ls_tail = g_ls_head - LS_RING;
-        }
-        int i = g_ls_tail % LS_RING;
-        char chain[14 * 9 + 1] = "";
-        for (unsigned k = 0; k < g_ls_ring[i].n; k++)
-            snprintf(chain + strlen(chain), sizeof chain - strlen(chain), "%llx ", g_ls_ring[i].st[k]);
-        logf("lobby_state watch: written, now %u, by code before %llx (thread %lu, +%lums since the join); code addresses on the stack: %s",
-             g_ls_ring[i].value, g_ls_ring[i].rip, g_ls_ring[i].tid, g_ls_ring[i].tick - g_join_tick, chain);
-        InterlockedIncrement(&g_ls_tail);
-    }
-}
-static void ls_watch_arm(char *sm) {  // this thread only: it suspends the others one at a time
-    static PVOID handler;
-    static int last_count = -1;
-    if (!handler) handler = AddVectoredExceptionHandler(1, ls_watch_handler);
-    if (!handler) return;
-    g_ls_field = sm + SM_LOBBY_STATE;
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snap == INVALID_HANDLE_VALUE) return;
-    THREADENTRY32 te = {.dwSize = sizeof te};
-    int armed = 0;
-    if (Thread32First(snap, &te)) do {
-        if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == GetCurrentThreadId()) continue;
-        HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, te.th32ThreadID);
-        if (!th) continue;
-        if (SuspendThread(th) != (DWORD)-1) {
-            CONTEXT c = {.ContextFlags = CONTEXT_DEBUG_REGISTERS};
-            if (GetThreadContext(th, &c)) {
-                c.Dr0 = (DWORD64)g_ls_field;
-                c.Dr7 = (c.Dr7 & ~0xF0003ull) | 1 | (1ull << 16) | (3ull << 18);  // breakpoint 0: write, 4 bytes
-                armed += SetThreadContext(th, &c) != 0;
-            }
-            ResumeThread(th);
-        }
-        CloseHandle(th);
-    } while (Thread32Next(snap, &te));
-    CloseHandle(snap);
-    if (armed != last_count) logf("lobby_state watch: write breakpoint on %p armed on %d threads", (void *)g_ls_field, armed);
-    last_count = armed;
-}
-static void ls_watch_tick(void) {
-    static DWORD next;
-    ls_watch_flush();
-    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
-    if (!sm || !g_network_on || (int)(GetTickCount() - next) < 0) return;
-    next = GetTickCount() + 5000;
-    ls_watch_arm(sm);
-}
 static DWORD WINAPI run(LPVOID self) {
     (void)self;
     IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew);
@@ -3933,10 +3874,9 @@ static DWORD WINAPI run(LPVOID self) {
         guard_intact();
         watch_network();
         watch_session();
-        if (setting(S_WATCH_TEST)) ls_watch_tick();
         code_patch_check();
-        if (setting(S_MARKER_TEST)) marker_tick();
-        if (setting(S_FINISH_TEST)) finish_tick();
+        if (1) marker_tick();
+        if (1) finish_tick();
     }
 }
 
@@ -3960,7 +3900,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved) {
             // settings are read here and the entry is changed before the game starts (experiment).
             settings_load();
             g_settings_early = 1;
-            if (setting(S_FINISH_TEST)) finish_relation_patch();
+            if (1) finish_relation_patch();
         }
         CreateThread(NULL, 0, run, self, 0, NULL);
     }

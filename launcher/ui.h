@@ -11,7 +11,7 @@ static const char *const LANG_NAME[LANG_COUNT] = {"English", "Polski", "Deutsch"
 
 enum { T_TITLE, T_GAME_FOLDER, T_BROWSE, T_PLAY, T_BACKUP, T_HELP, T_UNINSTALL, T_CLOSE, T_LANGUAGE, T_NOT_FOUND,
        T_FOUND, T_PICK, T_BAD_FOLDER, T_CONFIRM_UNINSTALL, T_NO_SAVE, T_BACKUP_DONE, T_BACKUP_FAILED, T_HELP_TEXT,
-       T_COUNT };
+       T_DEBUG_LOG, T_COUNT };
 
 static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
     [L_EN] = {
@@ -40,8 +40,13 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "folder backups/<date_time> next to the launcher. It only copies: nothing is deleted or overwritten.\n\n"
         "Uninstall: removes the mod's prepared files from the work folder and the mod's own save file. "
         "Your normal save and the backups stay.\n\n"
+        "Debug log: the mod writes a short log by default; with this box ticked it writes everything it does "
+        "(much longer), which helps when something goes wrong. The choice is remembered and applies from the "
+        "next \"Play with the mod\". The log is the file work/native/invasion.log in the launcher's folder: "
+        "when you report a problem, send that file.\n\n"
         "Language: the language of this window. Your choice is remembered.\n\n"
         "Close: closes this window.",
+        "Debug log"
     },
     [L_PL] = {
         "Nightreign Invasions",
@@ -69,8 +74,13 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "folderu backups/<data_godzina> obok launchera. Tylko kopiuje: niczego nie usuwa ani nie nadpisuje.\n\n"
         "Odinstaluj: usuwa przygotowane pliki moda z folderu roboczego i osobny zapis moda. "
         "Zwykły zapis i kopie zapasowe zostają.\n\n"
+        "Szczegółowy log: domyślnie mod zapisuje krótki log; z zaznaczonym polem zapisuje wszystko, co robi "
+        "(dużo dłuższy), co pomaga, gdy coś nie działa. Wybór jest zapamiętywany i działa od następnego "
+        "\"Graj z modem\". Log to plik work/native/invasion.log w folderze launchera: zgłaszając problem, "
+        "wyślij ten plik.\n\n"
         "Język: język tego okna. Wybór jest zapamiętywany.\n\n"
         "Zamknij: zamyka to okno.",
+        "Szczegółowy log"
     },
     [L_DE] = {
         "Nightreign Invasions",
@@ -101,8 +111,13 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "oder überschrieben.\n\n"
         "Deinstallieren: entfernt die vorbereiteten Dateien des Mods aus dem Arbeitsordner und den eigenen "
         "Spielstand des Mods. Dein normaler Spielstand und die Sicherungen bleiben.\n\n"
+        "Ausführliches Protokoll: standardmäßig schreibt der Mod ein kurzes Protokoll; mit diesem Häkchen schreibt "
+        "er alles, was er tut (viel länger), was bei Problemen hilft. Die Wahl wird gespeichert und gilt ab dem "
+        "nächsten \"Mit dem Mod spielen\". Das Protokoll ist die Datei work/native/invasion.log im Ordner des "
+        "Launchers: wenn du ein Problem meldest, schicke diese Datei.\n\n"
         "Sprache: die Sprache dieses Fensters. Die Wahl wird gespeichert.\n\n"
         "Schließen: schließt dieses Fenster.",
+        "Ausführliches Protokoll"
     },
     [L_FR] = {
         "Nightreign Invasions",
@@ -134,8 +149,13 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "supprimé ni écrasé.\n\n"
         "Désinstaller : supprime les fichiers préparés du mod dans le dossier de travail et la sauvegarde propre "
         "au mod. Votre sauvegarde normale et les copies de sécurité restent.\n\n"
+        "Journal détaillé : par défaut le mod écrit un journal court ; avec cette case cochée il écrit tout ce "
+        "qu'il fait (beaucoup plus long), ce qui aide en cas de problème. Le choix est mémorisé et s'applique à "
+        "partir du prochain \"Jouer avec le mod\". Le journal est le fichier work/native/invasion.log dans le "
+        "dossier du lanceur : pour signaler un problème, envoyez ce fichier.\n\n"
         "Langue : la langue de cette fenêtre. Le choix est mémorisé.\n\n"
         "Fermer : ferme cette fenêtre.",
+        "Journal détaillé"
     },
     [L_ES] = {
         "Nightreign Invasions",
@@ -165,8 +185,13 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "carpeta nueva backups/<fecha_hora> junto al lanzador. Solo copia: no borra ni sobrescribe nada.\n\n"
         "Desinstalar: quita los archivos preparados del mod de la carpeta de trabajo y la partida propia del "
         "mod. Tu partida normal y las copias de seguridad se conservan.\n\n"
+        "Registro detallado: por defecto el mod escribe un registro corto; con esta casilla marcada escribe todo "
+        "lo que hace (mucho más largo), lo que ayuda cuando algo falla. La elección se recuerda y se aplica desde "
+        "el siguiente \"Jugar con el mod\". El registro es el archivo work/native/invasion.log en la carpeta "
+        "del lanzador: al informar de un problema, envía ese archivo.\n\n"
         "Idioma: el idioma de esta ventana. La elección se recuerda.\n\n"
         "Cerrar: cierra esta ventana.",
+        "Registro detallado"
     },
 };
 

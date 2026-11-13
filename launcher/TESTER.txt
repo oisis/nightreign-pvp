@@ -3,37 +3,19 @@ Nightreign Invasions - tester build (not for release)
 
 Both players must use the same package (the same invasion.dll); mixed versions are not supported.
 
-Test settings are in test-settings.toml, next to the launcher. Open it in a text editor, set the
-lines for your role to true, save, and start the game with "Play with the mod". Everything false
-plays like the plain mod. Extracting a new package over an old folder replaces test-settings.toml
-with the all-false one: set your lines again. Old empty switch files in work/native are ignored.
+No settings are needed: every player hosts its own expeditions (other mod players can invade
+them) and "Invasion" in the Roundtable Hold joins another player's expedition. The launcher's
+"Debug log" box makes the mod log everything (for bug reports); off, the log is short.
 
-Every setting and who sets it:
+Optional test settings are in test-settings.toml next to the launcher (all false plays normally):
 
-  host-test    Host only. Your expedition opens a session other mod players can find.
-  join-test    Invader only. "Invasion" in the Roundtable Hold joins the first session it finds.
-  enter-test   Invader only, with join-test. Stay after joining and enter the host's world.
-  move-test    Invader only, with enter-test. The game's own map move into the host's world.
-  finish-test  Both. A downed invader whose gauge is emptied by the host's side dies and goes
-               home instead of standing up; an invader who empties a downed squad member's gauge
-               finishes that member. If a downed player stays on the ground, set it back to false.
-  loot-test    Both (logging only). Logs what lies on the ground to be picked up, every pickup and
-               every equipment pickup dialog, to learn what a killed invader leaves behind.
-  name-test    Both. Logs why the other player's name shows as "Player" and fills in the missing
-               id so the game can show the real character name.
-  reward-test  Invader. After a won invasion a reward screen with murk; after a lost one, no reward.
-  marker-test  Both (logging only). Logs the map's markers for the other player; open the map a few
-               times while the other player is near and far.
-  watch-test   Leave false. Diagnostic that crashed the game in its first form.
-  full-sync    Invader (on by default). Ask the host for its full world state. false only for tests.
   team-test    Solo tests only (leave false in a two-player test).
-  no-rain      Both the same value. The rain outside the circle does no damage.
-  slow-time    Both the same value; the host's counts. Day and circle clocks run ten times slower.
+  no-rain      Both players the same value. The rain outside the circle does no damage.
+  slow-time    Both players the same value; the host's counts. Clocks run ten times slower.
+  full-sync    Invader (on by default). Ask the host for its full world state. false only for tests.
+  loot-test    Logging only. What lies on the ground, every pickup and equipment dialog.
 
-  Host:     host-test = true
-  Invader:  join-test = true, enter-test = true and move-test = true  (not host-test)
-
-enter-test and move-test may end on a stuck loading screen or a crash; quit the game if it hangs.
+An invasion may end on a stuck loading screen or a crash; quit the game if it hangs.
 
 The mod writes its log to work/native/invasion.log (its first lines list the settings it used).
 Send that file after each test session.

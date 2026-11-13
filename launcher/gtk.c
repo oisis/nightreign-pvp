@@ -8,7 +8,7 @@
 
 static const char *const *T = UI_TEXT[L_EN];
 static GtkWidget *g_window, *g_folder, *g_log_view, *g_play, *g_uninstall, *g_backup, *g_help, *g_browse, *g_close, *g_folder_label,
-    *g_lang_label;
+    *g_lang_label, *g_debug;
 
 static void log_line(const char *line) {
     GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(g_log_view));
@@ -81,6 +81,12 @@ static void set_texts(void) {
     gtk_button_set_label(GTK_BUTTON(g_help), T[T_HELP]);
     gtk_button_set_label(GTK_BUTTON(g_uninstall), T[T_UNINSTALL]);
     gtk_button_set_label(GTK_BUTTON(g_close), T[T_CLOSE]);
+    gtk_button_set_label(GTK_BUTTON(g_debug), T[T_DEBUG_LOG]);
+}
+
+static void on_debug(GtkToggleButton *b, gpointer u) {
+    (void)u;
+    core_save_debug(gtk_toggle_button_get_active(b));
 }
 
 static void on_language(GtkComboBox *c, gpointer u) {
@@ -151,6 +157,10 @@ int main(int argc, char **argv) {
     gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(g_log_view), GTK_WRAP_WORD_CHAR);
     gtk_container_add(GTK_CONTAINER(scroll), g_log_view);
     gtk_box_pack_start(GTK_BOX(box), scroll, TRUE, TRUE, 0);
+    g_debug = gtk_check_button_new_with_label(T[T_DEBUG_LOG]);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g_debug), core_load_debug());
+    gtk_box_pack_start(GTK_BOX(box), g_debug, FALSE, FALSE, 0);
+    g_signal_connect(g_debug, "toggled", G_CALLBACK(on_debug), NULL);
 
     GtkWidget *buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     g_play = gtk_button_new_with_label(T[T_PLAY]);
