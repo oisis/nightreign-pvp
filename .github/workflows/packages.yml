@@ -1,5 +1,6 @@
-# Builds the Linux and Windows packages and publishes them as release v<VERSION>.
+# Builds the Linux and Windows packages and publishes them as a new release v<version>.
 # Runs only when the newest pushed commit's message starts with "[build]".
+# VERSION sets major.minor and the first patch; every later [build] takes the next free patch number.
 # Everything is built from this repository plus pinned downloads (zig, me3); no game files are used.
 name: packages
 
@@ -7,6 +8,8 @@ on: push
 
 permissions:
   contents: write
+
+concurrency: packages   # one build at a time, so two pushes never take the same version
 
 jobs:
   packages:
@@ -20,7 +23,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # full history and tags, for the changelog
+          fetch-depth: 0   # full history and tags, for the version and the changelog
+
+      - name: Version
+        run: |
+          V=$(tr -d '[:space:]' < VERSION); P=${V##*.}
+          LAST=$(git tag -l "v${V%.*}.*" --sort=-v:refname | head -n 1)
+          [ -n "$LAST" ] && [ $(( ${LAST##*.} + 1 )) -gt "$P" ] && P=$(( ${LAST##*.} + 1 ))
+          echo "${V%.*}.$P" | tee VERSION
 
       - name: Tools
         run: |
@@ -57,15 +67,9 @@ jobs:
           V=$(tr -d '[:space:]' < VERSION)
           set -- "$NRPVP_WORK"/dist/packages/*.tar.gz "$NRPVP_WORK"/dist/packages/*.zip
           # Changelog: the subjects of the commits since the previous version's tag.
-          PREV=$(git tag -l 'v*' --sort=-v:refname | grep -vx "v$V" | head -n 1)
+          PREV=$(git tag -l 'v*' --sort=-v:refname | head -n 1)
           { echo "## Changes"; echo
             if [ -n "$PREV" ]; then git log --no-merges --format='- %s' "$PREV..HEAD" | sed 's/^- \[build\] */- /'
             else echo "- First test release"; fi
           } > notes.md
-          # ponytail: a second [build] with the same VERSION replaces the assets and notes; bump VERSION for a new release.
-          if gh release view "v$V" >/dev/null 2>&1; then
-            gh release upload "v$V" "$@" --clobber
-            gh release edit "v$V" --notes-file notes.md
-          else
-            gh release create "v$V" "$@" --target "$GITHUB_SHA" --title "$V" --prerelease --notes-file notes.md
-          fi
+          gh release create "v$V" "$@" --target "$GITHUB_SHA" --title "$V" --prerelease --notes-file notes.md
