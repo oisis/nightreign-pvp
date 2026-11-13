@@ -866,6 +866,25 @@ static char *hud_lookup_hook(void *wcm, unsigned long long *id) {
             for (int i = 0; i < 7; i++) fe[0xcf28 + i * 0x98] = 0, fe[0xcf28 + i * 0x98 + 0x90] = 0;
     }
     char *out = c;
+    // name-test (run 19, player tag on the invader): the tag list builder 0x7c8a90 looks up each of its 8
+    // tag entries (FE +0xca60, 0x70 each; the handle at +0) here. One line per entry when its handle or the
+    // lookup result changes: handle, found or not, team, our effect, and the entry's bytes +0x20..+0x38.
+    if (site == 0x7c8c74 && setting(S_NAME_TEST) && id) {
+        char *fe = *(char **)(g_base + 0x3c14a70);
+        long long idx = fe ? ((char *)id - (fe + 0xca60)) / 0x70 : -1;
+        static unsigned long long last_h[8];
+        static char *last_c[8];
+        if (idx >= 0 && idx < 8 && (last_h[idx] != *id || last_c[idx] != c)) {
+            last_h[idx] = *id, last_c[idx] = c;
+            unsigned char team = 0;
+            if (c && !IsBadReadPtr(c, 0x200)) ((unsigned char *(*)(void *, unsigned char *))(g_base + 0x3d1b30))(c, &team);
+            char hex[0x18 * 2 + 1] = "";
+            if (!IsBadReadPtr((char *)id + 0x20, 0x18))
+                for (int k = 0; k < 0x18; k++) sprintf(hex + 2 * k, "%02x", ((unsigned char *)id)[0x20 + k]);
+            logf("name test: tag %lld: handle %llx, character %s (team %u, our effect %d), entry +20: %s", idx, *id,
+                 !c ? "not found" : c == me ? "(local)" : "found", team, c && !IsBadReadPtr(c, 0x200) ? our_speffect_active(c) : -1, hex);
+        }
+    }
     // name-test, host: the over-head name tags (0x7c8a90 fills eight tags at FE +0xca60, lookup 0x7c8c74;
     // an empty lookup builds no name) are left out for a character carrying our effect; the name over
     // its health bar stays.
@@ -1199,6 +1218,17 @@ static void finish_relation_patch(void) {
     *entry = enemy;
     VirtualProtect(entry, 8, old, &old);
     logf("finish test: attack relation 16 -> 77 (invader's attacks against a downed player) Neutral -> Enemy, as 1/2 -> 77");
+    // Lock-on (run 17: the invader cannot lock on to a downed host). The "is it an enemy" table at 0x399a120
+    // (0x52c990 for two characters, raw effective teams) has the same 16 -> 77 Neutral; the lock-on
+    // target search is assumed to ask it (not traced). Same change there.
+    void **t2 = (void **)(g_base + 0x399a120), **e2 = t2 + 16 * 0x51 + 77;
+    void *before = *e2;
+    if (before == (void *)(g_base + 0x398d408) && t2[2 * 0x51 + 77] == (void *)(g_base + 0x398d3f8) && VirtualProtect(e2, 8, PAGE_READWRITE, &old)) {
+        *e2 = t2[2 * 0x51 + 77];
+        VirtualProtect(e2, 8, old, &old);
+        logf("finish test: enemy relation 16 -> 77 (lock-on) was %p (Neutral) -> %p (Enemy), as 1/2 -> 77", before, *e2);
+    } else
+        logf("finish test: enemy relation 16 -> 77 (lock-on) not written: entry %p, 2 -> 77 %p", before, t2[2 * 0x51 + 77]);
 }
 // finish-test diagnostic, second round (run 15: no line from 0x44e190 / 0x44b970 / 0x44bb30 in either
 // direction). The victim's side receives a hit in 0x436530(module, attacker, hit, flag) (5 call sites);
@@ -1236,17 +1266,23 @@ static void gauge_nohit_hook(char *chr, char *attacker, char *hit) {
 // the local player (pointer vector, begin at +0x88) and a fixed two for other players (begin at +0xb0, end
 // +0xb8), 0xb0 bytes each; the code that fills them is protected (0x1473502da). Logged while the map is
 // open, on change: each other-player pin's first 0x60 bytes, to find what makes it visible.
+// Run 18: hiding the pins of the last-built model took the COMPASS markers away, not the map's: the
+// model built at 0xa4e3c0 (kind 2, inside the HUD at +0xb1c8, built once when the HUD is) is the
+// compass's; the map screen's models are the ones of kinds 0/1 (0x84d8d8, 0x84d91e). Each kind is kept.
 static char *volatile g_map_model;
+static char *volatile g_view_models[3];
 static char *map_model_hook(char *model, unsigned long long a2) {
     char *r = ((char *(*)(char *, unsigned long long))(g_base + 0x90dc80))(model, a2);
     g_map_model = model;
-    logf("marker test: world map opened (view model %p)", (void *)model);
+    if ((a2 & 0xff) < 3) g_view_models[a2 & 0xff] = model;
+    logf("marker test: world map view model %p built, kind %u (%s)", (void *)model, (unsigned)(a2 & 0xff),
+         (a2 & 0xff) == 2 ? "HUD: compass" : "map screen");
     return r;
 }
 static void marker_tick(void) {
     static DWORD next;
     static char last[2][0x60];
-    char *m = g_map_model;
+    char *m = g_view_models[0] ? g_view_models[0] : g_view_models[1];  // the map screen's model
     if (!m || (int)(GetTickCount() - next) < 0) return;
     next = GetTickCount() + 2000;
     if (IsBadReadPtr(m, 0xc0) || *(char **)m != g_base + 0x2c4a548) {
@@ -1283,6 +1319,63 @@ static unsigned char can_hit_hook(char *module, char *target, char *hit, unsigne
          (unsigned)((char *)__builtin_return_address(0) - g_base) - 5, ta, our_speffect_active(attacker), tt,
          (unsigned char)target[0x710], atk && !IsBadReadPtr(atk + 0x81, 1) ? (unsigned char)atk[0x81] : 0xff, (unsigned)(flag & 0xff), r);
     return r;
+}
+// marker-test (decision 19), from run 17's dumps: an other-player pin has +0x0c "shown" (1/0), +0x10..+0x18
+// the position (moves with that player), +0x1c the player's session number (member +0xd4: host 1,
+// invader 2; -1 unused). Each frame (game thread, from the step hook) while the map is open: on the
+// invader every other-player pin is set not shown; on the host a pin is set not shown when its number
+// belongs to a remote member of our session (in our sessions every remote member is an invader).
+// Decision 19. Compass (kind 2): the invader keeps only the session host's pin (the member whose Steam id is
+// the lobby owner's), the host drops the invader's. Map screen (kinds 0/1): the invader drops every
+// other-player pin, the host the invader's.
+static int g_host_player_no = -1;
+static void host_player_no_update(char *mb, char *me);  // invader: the session host's player number (member +0xd4), -1 unknown
+// Runs 19-20: these view models (kinds 1 and 0, built at the start of the session by 0x84d840) feed the
+// COMPASS; the map screen draws other players from elsewhere (not found yet). The compass rule, each
+// frame from the step hook: the invader keeps only the session host's pin, the host drops the
+// invader's. (Run 20 removed the menu-time map rule: the game step runs while the map is open.)
+static volatile DWORD g_last_step_tick;
+static void marker_apply(int map_rule);
+static void marker_clear(void) {
+    g_last_step_tick = GetTickCount();
+    marker_apply(0);
+}
+static void marker_apply(int map_rule) {
+    int invader = g_join_in_world();
+    if (!invader && !g_host_switched) return;
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
+    char *mb = sm ? *(char **)(sm + SM_PLAYERS_BEGIN) : NULL, *me = sm ? *(char **)(sm + SM_PLAYERS_BEGIN + 8) : NULL;
+    if (invader) host_player_no_update(mb, me);
+    for (int k = 0; k < 3; k++) {
+        char *m = g_view_models[k];
+        if (!m || IsBadReadPtr(m, 0xc0) || *(char **)m != g_base + 0x2c4a548) continue;
+        char **b = *(char ***)(m + 0xb0), **e = *(char ***)(m + 0xb8);
+        for (int i = 0; b && b + i < e && i < 2; i++) {
+            char *pin = b[i];
+            if (!pin || IsBadReadPtr(pin, 0x20) || !pin[0xc]) continue;
+            int no = *(int *)(pin + 0x1c), hide = 0;
+            if (invader) {
+                int host_no = g_host_player_no;
+                if (host_no < 0) {  // not found from the lobby owner: the host has been player 1 in every run
+                    host_no = 1;
+                    static int told;
+                    if (!told) told = 1, logf("marker test: session host's player number not found, player 1 assumed");
+                }
+                hide = map_rule || no != host_no;
+            }
+            else
+                for (char *x = mb; mb && x < me && !IsBadReadPtr(x, SM_PLAYER_SIZE); x += SM_PLAYER_SIZE)
+                    if (!x[0xe1] && *(int *)(x + 0xd4) == no) hide = 1;
+            if (!hide) continue;
+            static DWORD next[3];
+            if ((int)(GetTickCount() - next[k]) >= 0) {
+                next[k] = GetTickCount() + 5000;
+                logf("marker test: pin of player %d (model kind %d) set not shown by the %s rule (%s; session host is player %d)", no, k,
+                     map_rule ? "map (game step idle)" : "compass (game stepping)", invader ? "invader" : "host", g_host_player_no);
+            }
+            pin[0xc] = 0;
+        }
+    }
 }
 static void hook_acceptance(void) {
     if (setting(S_FINISH_TEST))
@@ -2096,6 +2189,35 @@ static void name_watch(char *sm, const char *side, int fill) {
              (unsigned)(*id & 0xffff), shown, remote, (unsigned)(member & 0xffff));
     }
 }
+// name-test diagnostic (player tag on the invader): the front end adds a player's tag (bar, name,
+// rescue gauge) when that player's HP in the play state's other-player slot drops (0x7c5710: slot =
+// 0x1fe530(i) = *(play state +0x10) + i * 0x8a0; +8 handle, +0x10 HP) and the local player counts it as an
+// enemy. The slots are filled from the session's packets (0xddad10 packet 0xc, 0xddd680 packet 0xb,
+// 0xde32a0 packet 0x62, ...) into the slot named by the member's +0xd0. Logged every 2 s on change, both
+// sides: each slot's handle and HP, and the HP of the character with that handle as this machine sees it.
+static void slot_hp_watch(const char *side) {
+    static DWORD next;
+    static int last[2][2] = {{-9, -9}, {-9, -9}};
+    if ((int)(GetTickCount() - next) < 0) return;
+    next = GetTickCount() + 2000;
+    char *ps = *(char **)(g_base + 0x3c078d0), *wcm = *(char **)(g_base + 0x3c0f0a8);
+    char *slots = ps ? *(char **)(ps + 0x10) : NULL;
+    if (!slots || !wcm || IsBadReadPtr(slots, 2 * 0x8a0)) return;
+    for (int i = 0; i < 2; i++) {
+        char *sl = slots + i * 0x8a0;
+        int hp = *(int *)(sl + 0x10), chp = -1;
+        unsigned long long h = *(unsigned long long *)(sl + 8);  // run 19: the player number, not a handle
+        char *c = ((char *(*)(void *, int))(g_base + 0x5197e0))(wcm, (int)h);  // lookup by player number, as 0x7c5710
+        if (c && !IsBadReadPtr(c, 0x1c0)) {
+            char **pd = *(char ***)(c + 0x1b8);
+            if (pd && !IsBadReadPtr(pd, 8) && *pd && !IsBadReadPtr(*pd, 0x148)) chp = *(int *)(*pd + 0x140);
+        }
+        if (hp == last[i][0] && chp == last[i][1]) continue;
+        last[i][0] = hp, last[i][1] = chp;
+        logf("name test (%s): other-player slot %d: player number %lld, slot HP %d, character %s HP %d", side, i, (long long)(int)h, hp,
+             c ? (c == *(char **)(wcm + 0x174e8) ? "(local)" : "found") : "not found", chp);
+    }
+}
 static void host_member_sync(char *sm) {
     static unsigned long long for_lobby;
     static int last_waiting;
@@ -2150,7 +2272,7 @@ static void host_member_sync(char *sm) {
     }
     if (*(int *)(sm + 0x10) == 7) g_host_switched = 1;
     host_death_watch();
-    if (setting(S_NAME_TEST)) name_watch(sm, "host", g_host_switched);
+    if (setting(S_NAME_TEST)) name_watch(sm, "host", g_host_switched), slot_hp_watch("host");
     if (g_host_switched) remote_chr_log();
     // packet 10 to each newly waiting member, once the role is 7 (requests are answered only then)
     if (*(int *)(sm + 0x10) == 7 && waiting > last_waiting) {
@@ -2184,6 +2306,12 @@ static DWORD g_list_tick;
 static unsigned g_list_count;
 static int g_self_check;  // host: 0 not yet, 1 request done
 static u64 g_candidate;    // invader: the lobby the last list picked, 0 = none
+static void host_player_no_update(char *mb, char *me) {  // the member whose Steam id is the lobby owner's
+    if (!g_diag.owner || !g_steam.mm || !g_candidate) return;
+    u64 owner = g_diag.owner(g_steam.mm, g_candidate);
+    for (char *x = mb; owner && mb && x < me && !IsBadReadPtr(x, SM_PLAYER_SIZE); x += SM_PLAYER_SIZE)
+        if (!x[0xe1] && *(u64 *)(x + 0x10) == owner) g_host_player_no = *(int *)(x + 0xd4);
+}
 static int g_join_test;    // invader: join-test setting, taken when the search started
 static unsigned g_squad;   // host: the expedition's squad size, fixed when the lobby is first marked
 
@@ -2852,7 +2980,7 @@ static void enter_watch(char *sm) {
         team_log("enter test, 1 s after the team effect");
     }
     if (setting(S_FINISH_TEST)) other_down_watch("invader");
-    if (setting(S_NAME_TEST)) name_watch(sm, "invader", g_enter_world != 0);
+    if (setting(S_NAME_TEST)) name_watch(sm, "invader", g_enter_world != 0), slot_hp_watch("invader");
     // finish-test guard: the stand-up was refused and the timer set to 0, but the character is still
     // down 10 s later (the behaviour did not take its death): the invader counts as dead.
     if (g_enter_effect && chr && chr == g_finish_chr && g_finish_invader && g_finish_tick && chr[0x710] == 1 &&
@@ -3292,6 +3420,7 @@ static int cursor_on_invasion(char *dialog);
 static char *g_dialog;
 static DWORD g_request_tick;
 static void step_hook(void *ctrl, void *time, int step) {
+    if (setting(S_MARKER_TEST)) marker_clear();
     static int last_seen_start = -1;
     if (step == QM_STEP_NONE) last_seen_start = -1;
     static int last = -1;
