@@ -3,10 +3,11 @@
 #include "ui.h"
 #include <windows.h>
 #include <shlobj.h>
+#include <stdio.h>
 #include <string.h>
 
-enum { ID_FOLDER = 100, ID_BROWSE, ID_PLAY, ID_UNINSTALL, ID_LOG, ID_CLOSE };
-static const char *const *T = UI_EN;
+enum { ID_FOLDER = 100, ID_BROWSE, ID_PLAY, ID_UNINSTALL, ID_LOG, ID_CLOSE, ID_BACKUP, ID_HELP, ID_LANG, ID_LANG_LABEL };
+static const char *const *T = UI_TEXT[L_EN];
 static HWND g_window, g_folder, g_log;
 
 static wchar_t *wide(const char *utf8) {
@@ -48,14 +49,34 @@ static void browse(void) {
     if (pid) CoTaskMemFree(pid);
 }
 
+// Backup of the saves; a line in the window either way.
+static void backup(void) {
+    char save[1024] = "", where[256], line[600];
+    int r = core_find_save_dir(game_dir(), save, sizeof save) ? core_backup_save(save, where, sizeof where) : 0;
+    if (r > 0) snprintf(line, sizeof line, T[T_BACKUP_DONE], where), log_line(line);
+    else log_line(r < 0 ? T[T_BACKUP_FAILED] : T[T_NO_SAVE]);
+}
+
 static void play(void) {
-    char save[1024];
     if (!core_check_game(game_dir())) { log_line(T[T_BAD_FOLDER]); return; }
     EnableWindow(GetDlgItem(g_window, ID_PLAY), FALSE);
-    if (core_find_save_dir(game_dir(), save, sizeof save)) core_backup_save(save);
-    else log_line(T[T_NO_SAVE]);
+    backup();
     if (core_build(game_dir())) core_launch();
     EnableWindow(GetDlgItem(g_window, ID_PLAY), TRUE);
+}
+
+static void help(void) { MessageBoxW(g_window, wide(T[T_HELP_TEXT]), wide(T[T_HELP]), MB_OK | MB_ICONINFORMATION); }
+
+static void set_texts(void) {
+    SetWindowTextW(g_window, wide(T[T_TITLE]));
+    SetWindowTextW(GetDlgItem(g_window, 1), wide(T[T_GAME_FOLDER]));
+    SetWindowTextW(GetDlgItem(g_window, ID_LANG_LABEL), wide(T[T_LANGUAGE]));
+    SetWindowTextW(GetDlgItem(g_window, ID_BROWSE), wide(T[T_BROWSE]));
+    SetWindowTextW(GetDlgItem(g_window, ID_PLAY), wide(T[T_PLAY]));
+    SetWindowTextW(GetDlgItem(g_window, ID_BACKUP), wide(T[T_BACKUP]));
+    SetWindowTextW(GetDlgItem(g_window, ID_HELP), wide(T[T_HELP]));
+    SetWindowTextW(GetDlgItem(g_window, ID_UNINSTALL), wide(T[T_UNINSTALL]));
+    SetWindowTextW(GetDlgItem(g_window, ID_CLOSE), wide(T[T_CLOSE]));
 }
 
 static void uninstall(void) {
@@ -76,12 +97,16 @@ static LRESULT CALLBACK proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_SIZE: {  // label, folder row, log, button row
         int cx = LOWORD(lp), cy = HIWORD(lp), m = 10;
-        MoveWindow(GetDlgItem(w, 1), m, m, cx - 2 * m, 18, TRUE);
+        MoveWindow(GetDlgItem(w, 1), m, m, cx - 3 * m - 230, 18, TRUE);
+        MoveWindow(GetDlgItem(w, ID_LANG_LABEL), cx - m - 230, m, 90, 18, TRUE);
+        MoveWindow(GetDlgItem(w, ID_LANG), cx - m - 130, m - 3, 130, 200, TRUE);
         MoveWindow(g_folder, m, 34, cx - 3 * m - 90, 24, TRUE);
         MoveWindow(GetDlgItem(w, ID_BROWSE), cx - m - 90, 33, 90, 26, TRUE);
         MoveWindow(g_log, m, 68, cx - 2 * m, cy - 68 - 50, TRUE);
-        MoveWindow(GetDlgItem(w, ID_PLAY), m, cy - 40, cx - 4 * m - 220, 30, TRUE);
-        MoveWindow(GetDlgItem(w, ID_UNINSTALL), cx - 2 * m - 220, cy - 40, 110, 30, TRUE);
+        MoveWindow(GetDlgItem(w, ID_PLAY), m, cy - 40, cx - 6 * m - 4 * 110, 30, TRUE);
+        MoveWindow(GetDlgItem(w, ID_BACKUP), cx - 4 * m - 4 * 110, cy - 40, 110, 30, TRUE);
+        MoveWindow(GetDlgItem(w, ID_UNINSTALL), cx - 3 * m - 3 * 110, cy - 40, 110, 30, TRUE);
+        MoveWindow(GetDlgItem(w, ID_HELP), cx - 2 * m - 2 * 110, cy - 40, 110, 30, TRUE);
         MoveWindow(GetDlgItem(w, ID_CLOSE), cx - m - 110, cy - 40, 110, 30, TRUE);
         return 0;
     }
@@ -89,6 +114,12 @@ static LRESULT CALLBACK proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (LOWORD(wp) == ID_BROWSE) browse();
         if (LOWORD(wp) == ID_PLAY) play();
         if (LOWORD(wp) == ID_UNINSTALL) uninstall();
+        if (LOWORD(wp) == ID_BACKUP) backup();
+        if (LOWORD(wp) == ID_HELP) help();
+        if (LOWORD(wp) == ID_LANG && HIWORD(wp) == CBN_SELCHANGE) {
+            int l = (int)SendMessageW(GetDlgItem(w, ID_LANG), CB_GETCURSEL, 0, 0);
+            if (l >= 0 && l < LANG_COUNT) T = UI_TEXT[l], core_save_lang(LANG_CODE[l]), set_texts();
+        }
         if (LOWORD(wp) == ID_CLOSE) DestroyWindow(w);
         return 0;
     case WM_DESTROY:
@@ -100,7 +131,6 @@ static LRESULT CALLBACK proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
 
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     (void)prev; (void)cmd;
-    if (PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_POLISH) T = UI_PL;
     CoInitialize(NULL);
 
     char exe[MAX_PATH];
@@ -109,6 +139,18 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     if (slash) *slash = 0;
     core_set_app_dir(exe);
     core_set_log(log_line);
+    // the saved choice, else the system language, else English
+    char saved[8];
+    core_load_lang(saved, sizeof saved);
+    int lang_index = L_EN;
+    switch (PRIMARYLANGID(GetUserDefaultUILanguage())) {
+    case LANG_POLISH: lang_index = L_PL; break;
+    case LANG_GERMAN: lang_index = L_DE; break;
+    case LANG_FRENCH: lang_index = L_FR; break;
+    case LANG_SPANISH: lang_index = L_ES; break;
+    }
+    if (*saved) lang_index = ui_lang_from_code(saved);
+    T = UI_TEXT[lang_index];
 
     WNDCLASSW wc = {0};
     wc.lpfnWndProc = proc;
@@ -125,6 +167,12 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     g_log = child(L"EDIT", "", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, ID_LOG);
     child(L"BUTTON", T[T_PLAY], BS_DEFPUSHBUTTON, ID_PLAY);
     child(L"BUTTON", T[T_UNINSTALL], BS_PUSHBUTTON, ID_UNINSTALL);
+    child(L"BUTTON", T[T_BACKUP], BS_PUSHBUTTON, ID_BACKUP);
+    child(L"BUTTON", T[T_HELP], BS_PUSHBUTTON, ID_HELP);
+    child(L"STATIC", T[T_LANGUAGE], SS_RIGHT, ID_LANG_LABEL);
+    HWND lang_box = child(L"COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL, ID_LANG);
+    for (int i = 0; i < LANG_COUNT; i++) SendMessageW(lang_box, CB_ADDSTRING, 0, (LPARAM)wide(LANG_NAME[i]));
+    SendMessageW(lang_box, CB_SETCURSEL, lang_index, 0);
     child(L"BUTTON", T[T_CLOSE], BS_PUSHBUTTON, ID_CLOSE);
     ShowWindow(g_window, show);
     RECT rc;

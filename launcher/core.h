@@ -23,8 +23,15 @@ int core_check_game(const char *dir);
 // Find the folder with the player's save file (NR0000.sl2). game_dir helps under Proton.
 int core_find_save_dir(const char *game_dir, char *out, size_t cap);
 
-// Copy the save files into <app>/work/backups/<timestamp>/. Returns 1 on success.
-int core_backup_save(const char *save_dir);
+// Copy the save files (the game's own save and the mod's separate save, whichever exist) into a new
+// folder <app>/backups/<YYYY-MM-DD_HHMMSS>[_N]/<save folder name>/. Only copies: never deletes or
+// overwrites (a folder name already taken gets a suffix; a file already there is never written).
+// Returns 1 and the folder (relative to the launcher) in where, 0 when no save file was found, -1 on
+// an error.
+int core_backup_save(const char *save_dir, char *where, size_t cap);
+// The language chosen in the window, from <app>/language.txt ("" when none was saved), and saving it.
+void core_load_lang(char *code, size_t cap);
+void core_save_lang(const char *code);
 // Build the mod's files from the player's own game files into <app>/work/build and write the
 // me3 profile. Returns 1 on success.
 int core_build(const char *game_dir);

@@ -14,7 +14,12 @@ int main(int argc, char **argv) {
     const char *cmd = argv[2];
     if (!strcmp(cmd, "selftest")) return !core_selftest();
     if (!strcmp(cmd, "find")) return printf("game: %s\nsave: %s\n", game, save), !*game;
-    if (!strcmp(cmd, "backup")) return !core_backup_save(save);
+    if (!strcmp(cmd, "backup")) {
+        char where[256];
+        int r = core_backup_save(save, where, sizeof where);
+        if (r > 0) printf("backup: %s\n", where);
+        return r <= 0;
+    }
     if (!strcmp(cmd, "build")) return !core_build(game);
     if (!strcmp(cmd, "launch")) return !core_launch();
     if (!strcmp(cmd, "uninstall")) return !core_uninstall(save);

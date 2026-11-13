@@ -104,6 +104,16 @@ static void make_dir(const char *path) {
 #endif
 }
 
+static int dir_exists(const char *path) {
+#ifdef _WIN32
+    DWORD a = GetFileAttributesA(path);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+#else
+    struct stat st;
+    return !stat(path, &st) && S_ISDIR(st.st_mode);
+#endif
+}
+
 // Create every directory on the way to a file path.
 static void make_parents(const char *file) {
     char tmp[1024];
@@ -867,6 +877,7 @@ static int no_rain(buf p) {
 // (each "Play with the mod"). A missing file means all false. no-rain and slow-time act here; the
 // resolved values of all of them go to work/native/test-settings.toml, which the DLL reads.
 #include "../mod/dll/settings.h"
+#include "ui.h"
 static signed char g_set[SETTINGS_COUNT];
 static int setting(int i) { return g_set[i] > 0; }
 static int load_settings(const char *path, signed char v[SETTINGS_COUNT]) {  // 0: no file
@@ -1198,23 +1209,56 @@ int core_find_save_dir(const char *game_dir, char *out, size_t cap) {
 
 static void remove_tree(const char *dir);
 
-int core_backup_save(const char *save_dir) {
+int core_backup_save(const char *save_dir, char *where, size_t cap) {
     static const char *names[] = {"NR0000.sl2", "NR0000.sl2.bak", MOD_SAVE_NAME, MOD_SAVE_NAME ".bak"};
-    char stamp[32], from[1300], to[1300];
+    char stamp[48], folder[64], dir[1300], from[1400], to[1500];
+    if (where && cap) where[0] = 0;
+    if (!save_dir || !*save_dir) return 0;
+    int any = 0;
+    for (size_t i = 0; i < sizeof names / sizeof *names; i++) {
+        snprintf(from, sizeof from, "%s" SEP "%s", save_dir, names[i]);
+        any |= exists(from);
+    }
+    if (!any) return 0;
     time_t now = time(NULL);
-    strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", localtime(&now));
+    strftime(stamp, sizeof stamp, "%Y-%m-%d_%H%M%S", localtime(&now));
+    // a new folder: the time stamp, or with _2, _3 ... when that name is taken
+    for (int n = 1;; n++) {
+        if (n == 1) snprintf(folder, sizeof folder, "%s", stamp);
+        else snprintf(folder, sizeof folder, "%s_%d", stamp, n);
+        snprintf(dir, sizeof dir, "%s" SEP "backups" SEP "%s", g_app, folder);
+        if (!dir_exists(dir)) break;
+        if (n > 999) return -1;
+    }
+    const char *base = save_dir + strlen(save_dir);
+    while (base > save_dir && base[-1] != '/' && base[-1] != '\\') base--;
     int copied = 0;
     for (size_t i = 0; i < sizeof names / sizeof *names; i++) {
         snprintf(from, sizeof from, "%s" SEP "%s", save_dir, names[i]);
-        snprintf(to, sizeof to, "%s" SEP "work" SEP "backups" SEP "%s" SEP "%s", g_app, stamp, names[i]);
-        if (exists(from)) {
-            if (!copy_file(from, to)) return logf_("backup failed for %s", names[i]), 0;
-            copied++;
-        }
+        snprintf(to, sizeof to, "%s" SEP "%s" SEP "%s", dir, base, names[i]);
+        if (!exists(from)) continue;
+        if (exists(to) || !copy_file(from, to)) return -1;  // never write over a file
+        copied++;
     }
-    if (!copied) return logf_("no save file found in %s", save_dir), 0;
-    logf_("Save backed up (%d files) to work" SEP "backups" SEP "%s", copied, stamp);
+    if (where) snprintf(where, cap, "backups" SEP "%s", folder);
+    logf_("Save backed up (%d files) to backups" SEP "%s", copied, folder);
     return 1;
+}
+
+void core_load_lang(char *code, size_t cap) {
+    char path[1300];
+    snprintf(path, sizeof path, "%s" SEP "language.txt", g_app);
+    buf b = read_file(path);
+    size_t n = 0;
+    while (b.p && n < b.n && n + 1 < cap && b.p[n] >= 'a' && b.p[n] <= 'z') code[n] = (char)b.p[n], n++;
+    if (cap) code[n] = 0;
+    free(b.p);
+}
+
+void core_save_lang(const char *code) {
+    char path[1300];
+    snprintf(path, sizeof path, "%s" SEP "language.txt", g_app);
+    write_file(path, (const u8 *)code, strlen(code));
 }
 
 static int build_text(const char *game_dir, buf bhd, const char *bdt, const char *lang) {
@@ -1505,6 +1549,47 @@ int core_selftest(void) {
         good = good && !load_settings("/nonexistent/test-settings.toml", v);
         for (int i = 0; i < SETTINGS_COUNT; i++) good = good && v[i] == setting_default(i);
         if (!good) { ok = 0; logf_("selftest: test settings parser failed"); }
+    }
+    {  // window texts: every key in every language, none empty; T_BACKUP_DONE has exactly one %s
+        int good = 1;
+        for (int l = 0; l < LANG_COUNT; l++)
+            for (int t = 0; t < T_COUNT; t++) {
+                const char *x = UI_TEXT[l][t];
+                if (!x || !*x) good = 0;
+                if (t == T_BACKUP_DONE && (!x || !strstr(x, "%s") || strstr(strstr(x, "%s") + 2, "%"))) good = 0;
+            }
+        good = good && ui_lang_from_code("pl_PL.UTF-8") == L_PL && ui_lang_from_code("xx") == L_EN && ui_lang_from_code(NULL) == L_EN;
+        if (!good) { ok = 0; logf_("selftest: window texts incomplete"); }
+    }
+    {  // backup: into a scratch app folder; copies only, a second backup goes to a new folder, nothing
+       // already there is written over, the save files are unchanged
+        char keep[sizeof g_app], tmp[900], save[1000], path[1500], w1[256], w2[256];
+        snprintf(keep, sizeof keep, "%s", g_app);
+        snprintf(tmp, sizeof tmp, "%.800s" SEP "selftest-backup", keep);
+        remove_tree(tmp);
+        snprintf(g_app, sizeof g_app, "%s", tmp);
+        snprintf(save, sizeof save, "%.900s" SEP "save" SEP "76500000000000000", tmp);
+        snprintf(path, sizeof path, "%s" SEP "NR0000.sl2", save);
+        int good = write_file(path, (const u8 *)"vanilla", 7);
+        snprintf(path, sizeof path, "%s" SEP MOD_SAVE_NAME, save);
+        good = good && write_file(path, (const u8 *)"modded", 6);
+        good = good && core_backup_save(save, w1, sizeof w1) == 1 && core_backup_save(save, w2, sizeof w2) == 1 && strcmp(w1, w2);
+        snprintf(path, sizeof path, "%s" SEP "%s" SEP "76500000000000000" SEP "NR0000.sl2", tmp, w1);
+        buf a = read_file(path);
+        snprintf(path, sizeof path, "%s" SEP "%s" SEP "76500000000000000" SEP MOD_SAVE_NAME, tmp, w2);
+        buf b = read_file(path);
+        good = good && a.n == 7 && !memcmp(a.p, "vanilla", 7) && b.n == 6 && !memcmp(b.p, "modded", 6);
+        free(a.p), free(b.p);
+        snprintf(path, sizeof path, "%s" SEP "NR0000.sl2", save);
+        buf c = read_file(path);
+        good = good && c.n == 7 && !memcmp(c.p, "vanilla", 7);
+        free(c.p);
+        char empty[1000];
+        snprintf(empty, sizeof empty, "%.900s" SEP "nosave", tmp);
+        good = good && core_backup_save(empty, w1, sizeof w1) == 0;
+        snprintf(g_app, sizeof g_app, "%s", keep);
+        remove_tree(tmp);
+        if (!good) { ok = 0; logf_("selftest: backup failed"); }
     }
     if (ok) logf_("selftest ok");
     return ok;

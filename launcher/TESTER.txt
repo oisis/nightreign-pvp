@@ -21,7 +21,7 @@ Every setting and who sets it:
                every equipment pickup dialog, to learn what a killed invader leaves behind.
   name-test    Both. Logs why the other player's name shows as "Player" and fills in the missing
                id so the game can show the real character name.
-  reward-test  Invader. Skips the broken second end screen (rewards) after an invasion.
+  reward-test  Invader. After a won invasion a reward screen with murk; after a lost one, no reward.
   marker-test  Both (logging only). Logs the map's markers for the other player; open the map a few
                times while the other player is near and far.
   watch-test   Leave false. Diagnostic that crashed the game in its first form.
@@ -37,3 +37,7 @@ enter-test and move-test may end on a stuck loading screen or a crash; quit the 
 
 The mod writes its log to work/native/invasion.log (its first lines list the settings it used).
 Send that file after each test session.
+
+Launcher buttons: "Backup" copies your saves into backups/<date_time>/ next to the launcher (only
+copies, never deletes or overwrites); "Help" explains every button; the language box switches the
+window between English, Polski, Deutsch, Français and Español (remembered in language.txt).

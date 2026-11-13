@@ -799,6 +799,10 @@ static int our_speffect_active(char *chr);
 // in this session.
 static int g_join_in_world(void);
 #define FINISH_GUARD_MS 10000  // ponytail: a guess at death animation + fade; the bleed-out death was never timed
+// decision 23: the invader's reward for a won invasion. Provisional amount (the user sets the real one).
+#define REWARD_MURK 5000
+#define REWARD_MURK_LOST 1000  // a lost invasion (decision 23, updated): the reward screen always has content
+static int g_host_killed, g_reward_pending;  // decision 23, defined with join_over
 static int g_host_player_no = -1;  // invader: the session host's player number (member +0xd4), -1 unknown
 static char *g_hud_invaders[4];
 static int g_host_switched, g_host_old_dc;
@@ -1499,7 +1503,37 @@ static void other_downed_watch(const char *side) {
              (unsigned char)c[0x710], now[0], now[1], (unsigned char)c[0x730], our_speffect_active(c));
     }
 }
+// The play state's reward part, as STEP_Result's reward screen reads it (0x1fc5e0): +0x36c amount of kind
+// 0x8000000a, +0x36e kind 0x8000000b (bit 0 an extra entry), +0x372/+0x374 up to five goods, +0x373/+0x388
+// relics. The game's computation 0x1fd620 grants (relics 0x1f0160, goods, currency 0x209730 on the player
+// data at play state +8: +0xd0, capped at 999999999) and records what it granted there; +0x36c is the
+// amount given to 0x209730. For the invader's ending it is replaced: every reward field emptied, and on a
+// win REWARD_MURK granted through 0x209730 and recorded in +0x36c.
+static void reward_hook(unsigned long long a1, unsigned a2) {
+    char *ps = *(char **)(g_base + 0x3c078d0);
+    if (!g_reward_pending || !ps) {
+        ((void (*)(unsigned long long, unsigned))(g_base + 0x1fd620))(a1, a2);
+        return;
+    }
+    int won = g_reward_pending == 1;
+    g_reward_pending = 0, g_host_killed = 0;
+    logf("reward test: game's reward computation skipped; was +0x36c %u +0x36e %u goods %u relics %u (result id %u)",
+         *(unsigned short *)(ps + 0x36c), *(unsigned short *)(ps + 0x36e), (unsigned char)ps[0x372], (unsigned char)ps[0x373],
+         *(unsigned *)(ps + 0x368));
+    *(unsigned short *)(ps + 0x36c) = 0, *(unsigned short *)(ps + 0x36e) = 0;
+    ps[0x372] = 0, ps[0x373] = 0;
+    char *pd = *(char **)(ps + 8);
+    if (pd && !IsBadReadPtr(pd, 0x1a0)) {
+        int before = *(int *)(pd + 0xd0);
+        int added = ((int (*)(char *, int))(g_base + 0x209730))(pd, won ? REWARD_MURK : REWARD_MURK_LOST);
+        *(unsigned short *)(ps + 0x36c) = (unsigned short)added;
+        logf("reward test: %s: murk %d -> %d (+%d), reward screen amount +0x36c = %d", won ? "won" : "lost", before, *(int *)(pd + 0xd0),
+             added, added);
+    } else
+        logf("reward test: %s: no player data, nothing granted", won ? "won" : "lost");
+}
 static void hook_acceptance(void) {
+    if (setting(S_REWARD_TEST)) hook_call(0xc32971, 0x1fd620, (void *)reward_hook, "reward test: expedition reward");
     if (setting(S_NAME_TEST)) {
         hook_call(0x4f3a98, 0x3d7610, (void *)rescue_add_event_hook, "name test: rescue target log (event)");
         hook_call(0x66e03e, 0x3d7610, (void *)rescue_add_local_hook, "name test: rescue target log (local)");
@@ -2254,6 +2288,7 @@ static void other_down_watch(const char *side) {
         int st = (unsigned char)c[0x710];
         if (chr_[i] != c) chr_[i] = c, last_[i] = st;
         else if (st != last_[i]) {
+            if (last_[i] == 1 && st == 0 && g_join_in_world() && our_speffect_active(c) != 1) g_host_killed = 1;
             logf("finish test (%s): other player %d (%s): downed state %d -> %d%s", side, i,
                  our_speffect_active(c) == 1 ? "the invader" : "not ours", last_[i], st, last_[i] == 1 && st == 0 ? " (died)" : "");
             last_[i] = st;
@@ -2686,6 +2721,8 @@ static int g_saved_pending_valid;
 #define RVA_QM_UNREGISTER 0xb52ef0  // void (ctrl*): if step != 0, cancel the job chain, set step 25
 static int g_invasion_ended;
 static int g_invader_downs;
+static int g_host_killed;    // the invader saw the session host die in this invasion
+static int g_reward_pending; // 1 won, 2 lost: applied at the expedition's reward computation
 static void join_over(const char *why) {
     g_join = 3;
     g_invader_downs = 0;
@@ -2734,15 +2771,12 @@ static void join_over(const char *why) {
         // Every ending, the invader's death included (decision 3: a killed invader returns to the
         // Roundtable Hold and may start another invasion).
         if (setting(S_REWARD_TEST)) {
-            // reward-test: the invader's play state holds no result of this session (it never ran the
-            // expedition's own start), and the second end screen (rewards, 05_110_Reward) came out half
-            // drawn. STEP_Result (0xc29340) builds the reward chain only when the session result id
-            // (play state +0x368) is not 0: clearing it skips that screen; the summary stays.
-            char *ps = *(char **)(g_base + 0x3c078d0);
-            if (ps) {
-                logf("reward test: session result id (play state +0x368) %u -> 0: the reward screen is skipped", *(unsigned *)(ps + 0x368));
-                *(unsigned *)(ps + 0x368) = 0;
-            }
+            // reward-test (decision 23): the result screens stay (play state +0x368 is left alone); the reward
+            // computation at the expedition's end (0x1fd620, call at 0xc32971) is replaced for this ending by
+            // ours: murk only on a win, nothing on a loss.
+            g_reward_pending = g_host_killed ? 1 : 2;
+            logf("reward test: invasion %s (%s): reward at the expedition's end: %s", g_host_killed ? "won" : "lost", why,
+                 g_host_killed ? "murk" : "none");
         }
         {
             ((void (*)(void))(g_base + 0x6af8f0))();
@@ -3107,7 +3141,7 @@ static void enter_watch(char *sm) {
         check_at = 0;
         team_log("enter test, 1 s after the team effect");
     }
-    if (setting(S_FINISH_TEST)) other_down_watch("invader");
+    if (setting(S_FINISH_TEST) || setting(S_REWARD_TEST)) other_down_watch("invader");
     if (setting(S_NAME_TEST)) name_watch(sm, "invader", g_enter_world != 0), slot_hp_watch("invader"), other_downed_watch("invader");
     // finish-test guard: the stand-up was refused and the timer set to 0, but the character is still
     // down 10 s later (the behaviour did not take its death): the invader counts as dead.
