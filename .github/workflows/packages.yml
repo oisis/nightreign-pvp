@@ -19,6 +19,8 @@ jobs:
       ME3: "v0.13.0 f31579deebf75b4702059694b664bdd8917c4773ab0c266715ca8f92e1e93fc1 a8b693c574106f20532ab1e8b58b2452f37370679b938a884fe75f87f9b68c2b"
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history and tags, for the changelog
 
       - name: Tools
         run: |
@@ -54,9 +56,16 @@ jobs:
         run: |
           V=$(tr -d '[:space:]' < VERSION)
           set -- "$NRPVP_WORK"/dist/packages/*.tar.gz "$NRPVP_WORK"/dist/packages/*.zip
-          # ponytail: a second [build] with the same VERSION replaces the assets; bump VERSION for a new release.
+          # Changelog: the subjects of the commits since the previous version's tag.
+          PREV=$(git tag -l 'v*' --sort=-v:refname | grep -vx "v$V" | head -n 1)
+          { echo "## Changes"; echo
+            if [ -n "$PREV" ]; then git log --no-merges --format='- %s' "$PREV..HEAD" | sed 's/^- \[build\] */- /'
+            else echo "- First test release"; fi
+          } > notes.md
+          # ponytail: a second [build] with the same VERSION replaces the assets and notes; bump VERSION for a new release.
           if gh release view "v$V" >/dev/null 2>&1; then
             gh release upload "v$V" "$@" --clobber
+            gh release edit "v$V" --notes-file notes.md
           else
-            gh release create "v$V" "$@" --target "$GITHUB_SHA" --title "$V" --prerelease --notes "Commit $GITHUB_SHA"
+            gh release create "v$V" "$@" --target "$GITHUB_SHA" --title "$V" --prerelease --notes-file notes.md
           fi
