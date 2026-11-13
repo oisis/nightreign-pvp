@@ -67,7 +67,7 @@ These are the rules the mod is built towards. Not all of them work yet:
 
 1. Download the package for your system from the
    [Releases](https://github.com/oisis/nightreign-pvp/releases) page:
-   `NightreignInvasions-<version>-windows.zip` or `NightreignInvasions-<version>-linux.tar.gz`.
+   `NightreignInvasions-<version>-windows.zip` or `NightreignInvasions-<version>-linux.zip`.
 2. Unpack it to any folder.
 3. Start the launcher: `NightreignInvasions.exe` on Windows, `nightreign-invasions` on Linux.
 4. Press **Play with the mod**. The first start takes a moment while the mod's files are built.

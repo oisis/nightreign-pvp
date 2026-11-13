@@ -65,7 +65,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           V=$(tr -d '[:space:]' < VERSION)
-          set -- "$NRPVP_WORK"/dist/packages/*.tar.gz "$NRPVP_WORK"/dist/packages/*.zip
+          set -- "$NRPVP_WORK"/dist/packages/*.zip
           # Changelog: the subjects of the commits since the previous version's tag.
           PREV=$(git tag -l 'v*' --sort=-v:refname | head -n 1)
           { echo "## Changes"; echo

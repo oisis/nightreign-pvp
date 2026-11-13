@@ -21,5 +21,5 @@ cp -r "$D/windows/data" "$OUT/$WIN/"
 bsdtar -xf "$W/tools/dl/me3-windows-amd64.zip" -C "$OUT/$WIN/me3" bin LICENSE-APACHE LICENSE-MIT
 
 for d in "$LIN" "$WIN"; do cp "$R/launcher/README.txt" "$R/VERSION" "$OUT/$d/"; done
-(cd "$OUT" && tar czf "$LIN.tar.gz" "$LIN" && bsdtar -a -cf "$WIN.zip" "$WIN")
-ls -la "$OUT"/*.tar.gz "$OUT"/*.zip
+(cd "$OUT" && bsdtar -a -cf "$LIN.zip" "$LIN" && bsdtar -a -cf "$WIN.zip" "$WIN")
+ls -la "$OUT"/*.zip
