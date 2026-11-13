@@ -8,11 +8,25 @@ lines for your role to true, save, and start the game with "Play with the mod". 
 plays like the plain mod. Extracting a new package over an old folder replaces test-settings.toml
 with the all-false one: set your lines again. Old empty switch files in work/native are ignored.
 
+Every setting and who sets it:
+
+  host-test    Host only. Your expedition opens a session other mod players can find.
+  join-test    Invader only. "Invasion" in the Roundtable Hold joins the first session it finds.
+  enter-test   Invader only, with join-test. Stay after joining and enter the host's world.
+  move-test    Invader only, with enter-test. The game's own map move into the host's world.
+  finish-test  Both. A downed invader whose gauge is emptied by the host's side dies and goes
+               home instead of standing up; an invader who empties a downed squad member's gauge
+               finishes that member. If a downed player stays on the ground, set it back to false.
+  loot-test    Both (logging only). Logs what lies on the ground to be picked up, every pickup and
+               every equipment pickup dialog, to learn what a killed invader leaves behind.
+  watch-test   Leave false. Diagnostic that crashed the game in its first form.
+  full-sync    Invader (on by default). Ask the host for its full world state. false only for tests.
+  team-test    Solo tests only (leave false in a two-player test).
+  no-rain      Both the same value. The rain outside the circle does no damage.
+  slow-time    Both the same value; the host's counts. Day and circle clocks run ten times slower.
+
   Host:     host-test = true
   Invader:  join-test = true, enter-test = true and move-test = true  (not host-test)
-
-The other settings (team-test, no-rain, slow-time) are explained in the file. For no-rain and
-slow-time both players should use the same value; for slow-time the host's counts.
 
 enter-test and move-test may end on a stuck loading screen or a crash; quit the game if it hangs.
 

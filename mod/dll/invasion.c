@@ -16,6 +16,7 @@
 // ponytail: addresses are hard-coded for nightreign.exe 1.3.3 (PE timestamp below) and the DLL does
 // nothing on any other build. Replace with signature scans when a second game version has to work.
 #include <windows.h>
+#include <tlhelp32.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -796,7 +797,9 @@ static int our_speffect_active(char *chr);
 // invasion (in the host's world), and the host hides every character that has once carried our effect
 // in this session.
 static int g_join_in_world(void);
+#define FINISH_GUARD_MS 10000  // ponytail: a guess at death animation + fade; the bleed-out death was never timed
 static char *g_hud_invaders[4];
+static int g_host_switched, g_host_old_dc;
 // Who ends a session: every readable call of the session leave (0xdf1180, 44 call sites) and of the
 // client's role-1 timeout leave (0xdf5840) is logged with its call site (the return address) and
 // arguments, before the game's function runs.
@@ -817,7 +820,8 @@ static unsigned long long leave_timeout_hook(char *sm, unsigned long long arg) {
     return ((unsigned long long (*)(char *, unsigned long long))(g_base + 0xdf5840))(sm, arg);
 }
 // Every front-end lookup of a character by id (0x518f30 from the HUD code at 0x7c..-0x7d..). Only the
-// party bar panel's lookup hides anything on the host (0x7daaa4: a character that carries our effect);
+// party bar panel's lookups hide anything on the host (0x7daaa4, the slot fill, and 0x7ced59, the
+// slot draw, every frame: a character that carries our effect);
 // on the invader the three party-list displays hide every other player. All other sites are passed
 // through and only counted, logged on the invader every 10 s, to name the display that still shows
 // the host's bar.
@@ -825,6 +829,25 @@ static const unsigned HUD_SITES[] = {0x7c6fe1, 0x7c817b, 0x7c84cb, 0x7c8c74, 0x7
                                      0x7d9242, 0x7d93fb, 0x7d9484, 0x7da1f9, 0x7daaa4, 0x7dae8d, 0x7db44b, 0x7db636, 0x7dbb1f};
 #define HUD_SITE_COUNT (sizeof HUD_SITES / sizeof *HUD_SITES)
 static unsigned g_hud_calls[HUD_SITE_COUNT], g_hud_hidden[HUD_SITE_COUNT];
+// Run 11: the slot the draw loop 0x7ceca0 reads was drawn every frame although every lookup in it
+// came back empty and the panel's slots at CSFeMan +0xcf28 were cleared: the draw does not stop at an
+// empty lookup, it renders the slot (0x7cfe40, call at 0x7cef6b) with the slot's text and an empty bar.
+// The lookup at 0x7ced59 receives the slot's id (slot +0x50, rsi); the render call gets rsi + 0x10 as
+// its fourth argument and the element (rdi + 0xa8, whose visible word is at rdi - 0xa8) as its third.
+// For a slot whose lookup we emptied, the render is skipped and the element's visible word cleared,
+// as the loop itself does for a slot with no flags (0x7c3940 writes 0 there first).
+static unsigned long long *g_hud_skip;
+static unsigned g_hud_renders, g_hud_render_skips;
+static void hud_render_hook(char *fe, unsigned long long frame, char *element, char *slot_text) {
+    g_hud_renders++;
+    if (g_hud_skip && slot_text == (char *)g_hud_skip + 0x10) {
+        g_hud_render_skips++;
+        *(unsigned short *)(element - 0x150) = 0;
+        g_hud_skip = NULL;
+        return;
+    }
+    ((void (*)(char *, unsigned long long, char *, char *))(g_base + 0x7cfe40))(fe, frame, element, slot_text);
+}
 static char *hud_lookup_hook(void *wcm, unsigned long long *id) {
     unsigned site = (unsigned)((char *)__builtin_return_address(0) - g_base) - 5;
     char *c = ((char *(*)(void *, unsigned long long *))(g_base + 0x518f30))(wcm, id);
@@ -832,12 +855,20 @@ static char *hud_lookup_hook(void *wcm, unsigned long long *id) {
     while (k < HUD_SITE_COUNT && HUD_SITES[k] != site) k++;
     if (k < HUD_SITE_COUNT) g_hud_calls[k]++;
     char *me = wcm ? *(char **)((char *)wcm + 0x174e8) : NULL;
-    int party = site == 0x7daaa4 || site == 0x7da1f9 || site == 0x7dbb1f;
+    int party = site == 0x7daaa4 || site == 0x7da1f9 || site == 0x7dbb1f || site == 0x7ced59;
+    // 0x7ceca0 (lookup 0x7ced59) draws the party panel from the seven slots 0x7da8b0 fills (CSFeMan
+    // +0xcf28, 0x98 each): a slot is drawn while its +0 (shown) or +0x90 (kept) flag is set, so hiding
+    // the lookup in 0x7da8b0 alone left a kept slot on screen. On the invader both flags go to 0.
+    if (site == 0x7ced59 && (g_join_in_world() || (me && !IsBadReadPtr(me, 0x200) && our_speffect_active(me) == 1))) {
+        char *fe = *(char **)(g_base + 0x3c14a70);
+        if (fe && !IsBadReadPtr(fe + 0xcf28, 7 * 0x98))
+            for (int i = 0; i < 7; i++) fe[0xcf28 + i * 0x98] = 0, fe[0xcf28 + i * 0x98 + 0x90] = 0;
+    }
     char *out = c;
     if (c && c != me && party) {
         int invading = g_join_in_world() || (me && !IsBadReadPtr(me, 0x200) && our_speffect_active(me) == 1);
         if (invading) out = NULL;
-        else if (site == 0x7daaa4) {
+        else if (site == 0x7daaa4 || site == 0x7ced59) {
             for (int i = 0; i < 4; i++)
                 if (g_hud_invaders[i] == c) out = NULL;
             if (out && !IsBadReadPtr(c, 0x200) && our_speffect_active(c) == 1) {
@@ -852,7 +883,13 @@ static char *hud_lookup_hook(void *wcm, unsigned long long *id) {
         }
     }
     if (!out && c && k < HUD_SITE_COUNT) g_hud_hidden[k]++;
-    if (g_join_in_world()) {
+    if (site == 0x7ced59) {
+        // the draw goes on for this frame with no character (name and empty bar): the slot's render
+        // call is skipped below, and its flags are cleared in the slot the draw reads (id - 0x50)
+        g_hud_skip = !out && c ? id : NULL;
+        if (g_hud_skip) ((char *)id)[-0x50] = 0, ((char *)id)[0x40] = 0;
+    }
+    if (g_join_in_world() || g_host_switched) {
         static DWORD next;
         if ((int)(GetTickCount() - next) >= 0) {
             next = GetTickCount() + 10000;
@@ -860,17 +897,209 @@ static char *hud_lookup_hook(void *wcm, unsigned long long *id) {
             for (unsigned i = 0; i < HUD_SITE_COUNT; i++)
                 if (g_hud_calls[i])
                     snprintf(text + strlen(text), sizeof text - strlen(text), " %x:%u/%u", HUD_SITES[i], g_hud_calls[i], g_hud_hidden[i]);
-            logf("party HUD (invader): lookups per site calls/hidden:%s", text);
+            logf("party HUD (%s): lookups per site calls/hidden:%s | slot renders %u, skipped %u", g_host_switched ? "host" : "invader",
+                 text, g_hud_renders, g_hud_render_skips);
+            g_hud_renders = g_hud_render_skips = 0;
             memset(g_hud_calls, 0, sizeof g_hud_calls), memset(g_hud_hidden, 0, sizeof g_hud_hidden);
         }
     }
     return out;
 }
+// Who sets controller step 12 (SingleStart): the controller's set-step (vtable 0x2c76bd8 entry 4) is
+// wrapped in the vtable itself (a data entry, like the step table), and a request for step 12 is
+// logged with its return address. The game's own function then runs unchanged.
+static int g_invasion_pending;
+static void (*g_set_step_original)(void *, int);
+static void set_step_wrap(void *ctrl, int step) {
+    if (step == 12)
+        logf("controller: set-step(12) called from %x (a start request seen: %d)",
+             (unsigned)((char *)__builtin_return_address(0) - g_base), g_invasion_pending);
+    g_set_step_original(ctrl, step);
+}
+static void hook_set_step(void) {
+    void **entry = (void **)(g_base + 0x2c76bd8) + 4;
+    if (*entry != (void *)(g_base + 0xb5d840)) {
+        logf("controller: set-step vtable entry not as expected, not wrapped");
+        return;
+    }
+    DWORD old;
+    if (!VirtualProtect(entry, 8, PAGE_READWRITE, &old)) return;
+    g_set_step_original = (void (*)(void *, int))*entry;
+    *entry = (void *)set_step_wrap;
+    VirtualProtect(entry, 8, old, &old);
+    logf("controller: set-step wrapped (requests for SingleStart are logged)");
+}
+// The two tail jumps into the leave (not calls, so not in LEAVE_SITES): 0xdf19c0 (a session manager
+// method: leaves when the Steam implementation's flag 8 at +0xc70 is clear and the quick-match
+// controller is in steps 1-11, or idle with its +0x108 set, 0xb66fe0) and 0xdf2910 (role 8).
+static int g_qm_step;
+static unsigned long long leave_tail_19c0(char *sm, unsigned long long arg) {
+    char *impl = sm ? *(char **)(sm + 0x60) : NULL;
+    logf("session leave (0xdf1180) by tail jump from 0xdf19c0 (caller %x), argument %llu, lobby_state %u role %u | impl +0xc70 %x, controller step %d +0x108 %u",
+         (unsigned)((char *)__builtin_return_address(0) - g_base), arg & 0xff, sm ? *(unsigned *)(sm + 0xc) : 0,
+         sm ? *(unsigned *)(sm + 0x10) : 0, impl && !IsBadReadPtr(impl + 0xc70, 4) ? *(unsigned *)(impl + 0xc70) : 0, g_qm_step,
+         g_qm_ctrl ? (unsigned char)g_qm_ctrl[0x108] : 0xff);
+    return ((unsigned long long (*)(char *, unsigned long long))(g_base + 0xdf1180))(sm, arg);
+}
+static unsigned long long leave_tail_2910(char *sm, unsigned long long arg) {
+    logf("session leave (0xdf1180) by tail jump from 0xdf2910 (role 8, every member waiting), caller %x, lobby_state %u",
+         (unsigned)((char *)__builtin_return_address(0) - g_base), sm ? *(unsigned *)(sm + 0xc) : 0);
+    return ((unsigned long long (*)(char *, unsigned long long))(g_base + 0xdf1180))(sm, arg);
+}
+static void hook_jump(unsigned rva_site, unsigned rva_target, void *hook, const char *what) {
+    unsigned char *site = (unsigned char *)g_base + rva_site;
+    int expected = (int)(rva_target - (rva_site + 5));
+    unsigned char *stub = near_alloc(12);
+    if (site[0] != 0xE9 || memcmp(site + 1, &expected, 4) || !stub) {
+        logf("%s: jump site %x does not look as expected, not hooked", what, rva_site);
+        return;
+    }
+    stub[0] = 0x48; stub[1] = 0xB8;
+    memcpy(stub + 2, &hook, 8);
+    stub[10] = 0xFF; stub[11] = 0xE0;
+    if (patch_rel32(site + 1, site + 5, stub)) logf("%s: hooked (%x)", what, rva_site);
+}
+// finish-test: a downed player whose rescue gauge is emptied by the other side dies instead of standing
+// up (decisions 3 and 16). The downed state lives on the character: +0x710 state (0 none, 1 down,
+// 2 revived), +0x714 gauge (float, required GameSystemCommonParam +0x380/+0x384/+0x388 by down count),
+// +0x718 bleed-out timer, +0x728 handle of the character whose hit emptied the gauge (0x66dec0 writes
+// attacker+8 there when the gauge reaches 0), +0x730 down count, +0x731/+0x732 "still down" / "stand
+// up" set every frame by the behaviour (0x40d390 cases 0x90/0x91). Hits lower the gauge on the downed
+// player's own machine (0x43d260, behind 0x3d3fe0); the stand-up is decided there too: 0x674eb0 calls
+// 0x66f3b0(chr, 2) at 0x67516f (state 2, HP back) and sends event 2 to the others at 0x6751e1. Here,
+// for our local player when (a) it carries our effect (a downed invader) or (b) the character that
+// emptied its gauge carries our effect (an invader finishing a squad member), the stand-up is refused
+// and the bleed-out timer is set to 0, so the behaviour takes its bleed-out death; event 2 is not
+// sent, so the others see no revive. Every other revive is passed through unchanged.
+static char *g_finish_chr;
+static DWORD g_finish_tick;
+static int g_finish_invader;
+static char *local_player(void);
+static int finish_wanted(char *chr, char **by) {
+    *by = NULL;
+    if (!chr || chr != local_player() || IsBadReadPtr(chr, 0x740)) return 0;
+    if (our_speffect_active(chr) == 1) return 1;
+    unsigned long long h = *(unsigned long long *)(chr + 0x728);
+    char *wcm = *(char **)(g_base + 0x3c0f0a8);
+    if (h == ~0ull || !wcm) return 0;
+    char *a = ((char *(*)(void *, unsigned long long *))(g_base + 0x518f30))(wcm, &h);
+    *by = a;
+    return a && a != chr && !IsBadReadPtr(a, 0x200) && our_speffect_active(a) == 1 ? 2 : 0;
+}
+static void finish_revive_hook(char *chr, char state, float t) {
+    char *by;
+    int why = state == 2 ? finish_wanted(chr, &by) : 0;
+    if (!why) {
+        ((void (*)(char *, char, float))(g_base + 0x66f3b0))(chr, state, t);
+        return;
+    }
+    if (g_finish_chr != chr || !g_finish_tick) {
+        logf("finish test: stand-up refused for %s: gauge %.1f, down count %u, bleed-out timer %.2f -> 0, event 2 not sent",
+             why == 1 ? "the downed invader (our effect on us)" : "a squad member whose gauge an invader emptied",
+             *(float *)(chr + 0x714), (unsigned char)chr[0x730], *(float *)(chr + 0x718));
+        g_finish_chr = chr, g_finish_tick = GetTickCount(), g_finish_invader = why == 1;
+    }
+    *(float *)(chr + 0x718) = 0;
+}
+static void finish_event_hook(void *msg, char *chr, unsigned long long kind, unsigned long long arg) {
+    if (chr && chr == g_finish_chr && g_finish_tick && (unsigned char)kind == 2) return;
+    ((void (*)(void *, char *, unsigned long long, unsigned long long))(g_base + 0x4f2d50))(msg, chr, kind, arg);
+}
+// Once a second while our local player is down (this thread, reads only): the fields above.
+static void finish_tick(void) {
+    static DWORD next;
+    char *chr = local_player();
+    if (!chr || IsBadReadPtr(chr, 0x740) || (int)(GetTickCount() - next) < 0) return;
+    if (chr[0x710] != 1 && !(g_finish_tick && chr == g_finish_chr)) return;
+    next = GetTickCount() + 1000;
+    logf("finish test: state %u gauge %.1f timer %.2f still-down %u stand-up %u down count %u%s", (unsigned char)chr[0x710],
+         *(float *)(chr + 0x714), *(float *)(chr + 0x718), (unsigned char)chr[0x731], (unsigned char)chr[0x732],
+         (unsigned char)chr[0x730], g_finish_tick && chr == g_finish_chr ? " (stand-up refused)" : "");
+    if (chr == g_finish_chr && chr[0x710] != 1) g_finish_tick = 0, g_finish_chr = NULL;
+}
+// loot-test (logging only): what a killed invader leaves and what the local player can take.
+// CSGeomPickUpItemModule::Update (0x724420, called per module from 0x6fd220 with the module at
+// rbx+0x540) offers a pickup prompt; taking it runs 0x7247d0(module, action) (call at 0x72464c), which
+// gives the item lot. A module: +0 the asset (geometry instance: +8 its handle, +0x18 its parts, whose
+// +8 is the param row: +0xb4 the pickup action id), +9/+0xa/+0xb/+0xd state bytes. The equipment
+// dialog CS::PickupEquipDialog is built by 0x9827d0 from the menu job 0x85d060 (call at 0x85d0b2: job
+// at r8, job+0x108 at r9, job+0x148 on the stack). Every 5 s the set of pickup modules that ran is
+// compared with the last one and the differences are logged; each pickup and each dialog is logged.
+static void loot_describe(char *module, char *out, size_t cap) {
+    char *geom = module && !IsBadReadPtr(module, 0x10) ? *(char **)module : NULL;
+    char *row = geom && !IsBadReadPtr(geom, 0x28) && *(char **)(geom + 0x20) && !IsBadReadPtr(*(char **)(geom + 0x20), 0xc0)
+                    ? *(char **)(geom + 0x20) : NULL;
+    snprintf(out, cap, "module %p asset %p handle %llx action %d (row +b0 %d +b8 %d +bc %d) state %u/%u/%u/%u", (void *)module,
+             (void *)geom, geom && !IsBadReadPtr(geom, 0x28) ? *(unsigned long long *)(geom + 8) : 0, row ? *(int *)(row + 0xb4) : -1,
+             row ? *(int *)(row + 0xb0) : 0, row ? *(int *)(row + 0xb8) : 0, row ? *(int *)(row + 0xbc) : 0,
+             module ? (unsigned char)module[9] : 0, module ? (unsigned char)module[10] : 0, module ? (unsigned char)module[11] : 0,
+             module ? (unsigned char)module[13] : 0);
+}
+#define LOOT_MAX 256
+static char *g_loot_seen[LOOT_MAX], *g_loot_last[LOOT_MAX];
+static int g_loot_seen_n, g_loot_last_n;
+static int loot_in(char **set, int n, char *m) {
+    for (int i = 0; i < n; i++) if (set[i] == m) return 1;
+    return 0;
+}
+static void loot_update_hook(char *module) {
+    if (g_loot_seen_n < LOOT_MAX && !loot_in(g_loot_seen, g_loot_seen_n, module)) g_loot_seen[g_loot_seen_n++] = module;
+    ((void (*)(char *))(g_base + 0x724420))(module);
+    static DWORD next;
+    if ((int)(GetTickCount() - next) < 0) return;
+    next = GetTickCount() + 5000;
+    int shown = 0;
+    char text[200];
+    for (int i = 0; i < g_loot_seen_n; i++)
+        if (!loot_in(g_loot_last, g_loot_last_n, g_loot_seen[i]) && shown++ < 16) {
+            loot_describe(g_loot_seen[i], text, sizeof text);
+            logf("loot test: pickup object appeared: %s", text);
+        }
+    for (int i = 0; i < g_loot_last_n; i++)
+        if (!loot_in(g_loot_seen, g_loot_seen_n, g_loot_last[i]) && shown++ < 32)
+            logf("loot test: pickup object gone: module %p", (void *)g_loot_last[i]);
+    if (shown) logf("loot test: %d pickup objects running now (%d changes)", g_loot_seen_n, shown);
+    memcpy(g_loot_last, g_loot_seen, sizeof g_loot_last);
+    g_loot_last_n = g_loot_seen_n, g_loot_seen_n = 0;
+}
+static void loot_pickup_hook(char *module, float value) {  // second argument goes in xmm1 (movss at 0x724643)
+    char text[200];
+    loot_describe(module, text, sizeof text);
+    unsigned bits;
+    memcpy(&bits, &value, 4);
+    logf("loot test: pickup taken: %s, second argument %08x", text, bits);
+    ((void (*)(char *, float))(g_base + 0x7247d0))(module, value);
+}
+static void *loot_dialog_hook(void *a, void *b, char *job, char *j108, char *j148) {
+    char hex[3][100];
+    char *p[3] = {job, j108, j148};
+    for (int k = 0; k < 3; k++) {
+        hex[k][0] = 0;
+        if (p[k] && !IsBadReadPtr(p[k], 32))
+            for (int i = 0; i < 32; i += 4) snprintf(hex[k] + strlen(hex[k]), sizeof hex[k] - strlen(hex[k]), "%08x ", *(unsigned *)(p[k] + i));
+    }
+    void *r = ((void *(*)(void *, void *, char *, char *, char *))(g_base + 0x9827d0))(a, b, job, j108, j148);
+    logf("loot test: equipment pickup dialog built (%p): job %s| +108 %s| +148 %s", r, hex[0], hex[1], hex[2]);
+    return r;
+}
 static void hook_acceptance(void) {
+    if (setting(S_LOOT_TEST)) {
+        hook_call(0x6fd220, 0x724420, (void *)loot_update_hook, "loot test: pickup objects");
+        hook_call(0x72464c, 0x7247d0, (void *)loot_pickup_hook, "loot test: pickup");
+        hook_call(0x85d0b2, 0x9827d0, (void *)loot_dialog_hook, "loot test: equipment dialog");
+    }
+    if (setting(S_FINISH_TEST)) {
+        hook_call(0x67516f, 0x66f3b0, (void *)finish_revive_hook, "finish test: stand-up");
+        hook_call(0x6751e1, 0x4f2d50, (void *)finish_event_hook, "finish test: stand-up event");
+    }
+    hook_jump(0xdf1a6f, 0xdf1180, (void *)leave_tail_19c0, "session leave log (0xdf19c0)");
+    hook_jump(0xdf29e2, 0xdf1180, (void *)leave_tail_2910, "session leave log (0xdf2910)");
+    hook_set_step();
     for (unsigned i = 0; i < sizeof LEAVE_SITES / sizeof *LEAVE_SITES; i++)
         hook_call(LEAVE_SITES[i], 0xdf1180, (void *)leave_hook, "session leave log");
     hook_call(0xdf3ebd, 0xdf5840, (void *)leave_timeout_hook, "session leave log (timeout)");
     for (unsigned i = 0; i < HUD_SITE_COUNT; i++) hook_call(HUD_SITES[i], 0x518f30, (void *)hud_lookup_hook, "party HUD lookup");
+    hook_call(0x7cef6b, 0x7cfe40, (void *)hud_render_hook, "party HUD slot render");
     hook_call(0xdde88b, RVA_SESSION_SEND_TO, (void *)answer_send_hook, "host join answer send");
     hook_call(0xb4bce6, RVA_GENERATE, (void *)generate_hook_setup, "expedition generation (SingleSetup)");
     hook_call(0xb4d937, RVA_GENERATE, (void *)generate_hook_other, "expedition generation (0xb4cc40)");
@@ -1111,14 +1340,43 @@ static unsigned char *near_alloc(unsigned size) {
 
 // Overwrite a 32-bit displacement in the game's code so that it refers to `target`.
 // `next` is the address of the instruction after the one being patched.
+// Every displacement we write is remembered and checked once a second (code_patch_check): runs 9-11
+// lost the fill-context hook after the first full invasion of a game session (no "start request"
+// line, the start caught only by the safety net), although nothing of ours undoes it and the only
+// way to the start (0x9eb363 -> 0xb67190 -> fill context at 0xb67199 -> 0xb50b70 -> set-step 12 at
+// 0xb51035) goes through that call. A changed displacement is logged with what is there now and
+// written again.
+#define CODE_PATCH_MAX 160
+static struct { unsigned char *field; int rel; } g_code_patch[CODE_PATCH_MAX];
+static int g_code_patch_count, g_code_patch_rewriting;
 static int patch_rel32(unsigned char *field, unsigned char *next, unsigned char *target) {
     int rel = (int)(target - next);
+    if (!g_code_patch_rewriting && g_code_patch_count < CODE_PATCH_MAX)
+        g_code_patch[g_code_patch_count].field = field, g_code_patch[g_code_patch_count++].rel = rel;
     DWORD old;
     if (!VirtualProtect(field, 4, PAGE_EXECUTE_READWRITE, &old)) return 0;
     memcpy(field, &rel, 4);
     VirtualProtect(field, 4, old, &old);
     FlushInstructionCache(GetCurrentProcess(), field, 4);
     return 1;
+}
+
+static void code_patch_check(void) {
+    static DWORD next;
+    if ((int)(GetTickCount() - next) < 0) return;
+    next = GetTickCount() + 1000;
+    for (int i = 0; i < g_code_patch_count; i++) {
+        int now;
+        memcpy(&now, g_code_patch[i].field, 4);
+        if (now == g_code_patch[i].rel) continue;
+        unsigned char *f = g_code_patch[i].field;
+        logf("code patch: the displacement at %llx (instruction %02x at %llx) was changed back: now goes to %llx, ours %llx; written again",
+             (unsigned long long)(f - (unsigned char *)g_base), f[-1], (unsigned long long)(f - 1 - (unsigned char *)g_base),
+             (unsigned long long)(f + 4 + now - (unsigned char *)g_base), (unsigned long long)(f + 4 + g_code_patch[i].rel - (unsigned char *)g_base));
+        g_code_patch_rewriting = 1;
+        patch_rel32(f, f + 4, f + 4 + g_code_patch[i].rel);
+        g_code_patch_rewriting = 0;
+    }
 }
 
 // Point the game's one "call _CreateBossList" at our function, through a 12-byte stub:
@@ -1549,7 +1807,20 @@ static void host_member_sync(char *sm) {
     // the session the role goes back to 5, so the next arrival is admitted in role 5 again.
     // The join check is enough: a member who was in this session before sends no new player data 0x60
     // (run 0a6833c2: second arrival, no 0x60, no player-data check), its data is already there.
-    if (waiting && *(int *)(sm + 0x10) == 5 && (g_admit_kind & 1) && GetTickCount() - g_admit_tick > 1000) {
+    // Admission: the join check passed a second ago, or (run 10b: an arrival for which the game ran no
+    // join check we could see) the waiting member has stayed in the session for two seconds. Every
+    // new arrival gets one line with the state of this decision.
+    static DWORD waiting_since;
+    if (!waiting) waiting_since = 0;
+    else if (!waiting_since) {
+        waiting_since = GetTickCount();
+        logf("host: admission: a member waits (role %d, join check %s)", *(int *)(sm + 0x10),
+             (g_admit_kind & 1) ? "passed" : "not seen yet");
+    }
+    int admitted = ((g_admit_kind & 1) && GetTickCount() - g_admit_tick > 1000) ||
+                   (waiting_since && GetTickCount() - waiting_since > 2000);
+    if (waiting && *(int *)(sm + 0x10) == 5 && admitted) {
+        logf("host: admission: switching (%s)", (g_admit_kind & 1) ? "join check passed" : "member stayed 2 s in the session");
         ((void (*)(void *))(g_base + RVA_SM_SET_INGAME))(sm);
         logf("host: member admitted; session role 5 -> %d (0xdf28e0, as a map load inside the session sets it)",
              *(int *)(sm + 0x10));
@@ -1808,10 +2079,11 @@ static void join_watch(char *sm) {
     last_end = end_code;
     char *eac = *(char **)(g_base + RVA_EAC_MAN_PTR);
     logf("join test: +%lums lobby_state %u handle %u join %u role %u players %u leaving %u end_code %llx | eac error %u (0x%x) | "
-         "sm +1a %u +1b %u +1d %u +1f %u | sync phase %u step %u",
+         "sm +1a %u +1b %u +1d %u +1f %u | sync phase %u step %u | impl +0xc70 %x controller +0x108 %u",
          GetTickCount() - g_join_tick, now[0], now[1], now[2], now[3], now[4], now[5], end_code,
          eac ? *(unsigned *)(eac + EAC_ERROR) : 0, eac ? *(unsigned *)(eac + EAC_ERROR) : 0, now[6], now[7], now[8], now[9],
-         now[10], now[11]);
+         now[10], now[11], *(char **)(sm + 0x60) && !IsBadReadPtr(*(char **)(sm + 0x60) + 0xc70, 4) ? *(unsigned *)(*(char **)(sm + 0x60) + 0xc70) : 0,
+         g_qm_ctrl ? (unsigned char)g_qm_ctrl[0x108] : 0xff);
     if (members_changed) log_members(sm, "join test");
 }
 // The game manager's pending multiplayer state: where a joining player is put on the next map
@@ -2248,6 +2520,16 @@ static void enter_watch(char *sm) {
         check_at = 0;
         team_log("enter test, 1 s after the team effect");
     }
+    // finish-test guard: the stand-up was refused and the timer set to 0, but the character is still
+    // down 10 s later (the behaviour did not take its death): the invader counts as dead.
+    if (g_enter_effect && chr && chr == g_finish_chr && g_finish_invader && g_finish_tick && chr[0x710] == 1 &&
+        nowt - g_finish_tick > FINISH_GUARD_MS) {
+        logf("finish test: still down %u s after the refused stand-up: the invader counts as dead", FINISH_GUARD_MS / 1000);
+        g_finish_tick = 0, g_finish_chr = NULL;
+        g_invasion_ended = 1;
+        join_over("invader died (finished while down)");
+        return;
+    }
     if (g_enter_effect && chr && nowt - applied > 2000 && our_speffect_active(chr) == 0) {
         team_log("enter test, team effect gone");
         g_invasion_ended = 1;
@@ -2567,7 +2849,12 @@ static int move_force(char *ctrl) {
     g_move_tick = GetTickCount();
     void **vt = *(void ***)ctrl;
     char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR), *gm = *(char **)(g_base + RVA_GAME_MAN_PTR);
-    if ((char *)vt != g_base + RVA_QM_CTRL_VTABLE || vt[QM_CTRL_VT_SET_STEP] != (void *)(g_base + RVA_QM_SET_STEP) || !sm || !gm) {
+    // vt[4] is the game's set-step, or our logging wrapper around it (hook_set_step), which calls the
+    // game's function exactly once through the saved pointer.
+    void *set_step = vt[QM_CTRL_VT_SET_STEP];
+    int set_step_ok = set_step == (void *)(g_base + RVA_QM_SET_STEP) ||
+                      (set_step == (void *)set_step_wrap && g_set_step_original == (void (*)(void *, int))(g_base + RVA_QM_SET_STEP));
+    if ((char *)vt != g_base + RVA_QM_CTRL_VTABLE || !set_step_ok || !sm || !gm) {
         join_over("move test: controller or managers not as expected");
         return 0;
     }
@@ -2909,6 +3196,88 @@ static void hook_expedition_start(void) {
     logf("expedition start: hooked");
 }
 
+// Who writes lobby_state (session manager +0xc). Run 11: on a repeated join the joiner went to 7 with
+// no logged call of the leave 0xdf1180 from any of its 44 call sites or 2 tail jumps. A hardware write
+// breakpoint (debug register 0, 4 bytes, writes) on the field, armed from this thread on every other
+// thread of the game while our network is up (again every 5 s, for threads started since), names
+// the writer whatever path it takes. The handler only records (no file or heap use there); this
+// thread writes the lines: the code address after the write, the value, the thread, and the stack
+// words that point into the game's code (return addresses among them, nearest first).
+#define LS_RING 32
+static struct { DWORD tick, tid; unsigned value; unsigned long long rip; unsigned n; unsigned long long st[14]; } g_ls_ring[LS_RING];
+static volatile LONG g_ls_head, g_ls_tail;
+static volatile char *g_ls_field;
+static LONG CALLBACK ls_watch_handler(EXCEPTION_POINTERS *e) {
+    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !(e->ContextRecord->Dr6 & 1)) return EXCEPTION_CONTINUE_SEARCH;
+    e->ContextRecord->Dr6 &= ~0xfull;
+    LONG slot = InterlockedIncrement(&g_ls_head) - 1;
+    if (slot - g_ls_tail < LS_RING) {
+        int i = slot % LS_RING;
+        g_ls_ring[i].tick = GetTickCount(), g_ls_ring[i].tid = GetCurrentThreadId();
+        g_ls_ring[i].value = g_ls_field ? *(volatile unsigned *)g_ls_field : 0;
+        g_ls_ring[i].rip = (unsigned long long)((char *)e->ContextRecord->Rip - g_base);
+        unsigned long long *sp = (unsigned long long *)e->ContextRecord->Rsp;
+        unsigned n = 0;
+        for (int k = 0; k < 160 && n < 14; k++) {
+            char *p = (char *)sp[k];
+            if (p > g_base + 0x1000 && p < g_base + 0x2c00000) g_ls_ring[i].st[n++] = (unsigned long long)(p - g_base);
+        }
+        g_ls_ring[i].n = n;
+    }
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+static void ls_watch_flush(void) {
+    while (g_ls_tail < g_ls_head) {
+        if (g_ls_head - g_ls_tail > LS_RING) {
+            logf("lobby_state watch: %ld writes not recorded (ring full)", g_ls_head - g_ls_tail - LS_RING);
+            g_ls_tail = g_ls_head - LS_RING;
+        }
+        int i = g_ls_tail % LS_RING;
+        char chain[14 * 9 + 1] = "";
+        for (unsigned k = 0; k < g_ls_ring[i].n; k++)
+            snprintf(chain + strlen(chain), sizeof chain - strlen(chain), "%llx ", g_ls_ring[i].st[k]);
+        logf("lobby_state watch: written, now %u, by code before %llx (thread %lu, +%lums since the join); code addresses on the stack: %s",
+             g_ls_ring[i].value, g_ls_ring[i].rip, g_ls_ring[i].tid, g_ls_ring[i].tick - g_join_tick, chain);
+        InterlockedIncrement(&g_ls_tail);
+    }
+}
+static void ls_watch_arm(char *sm) {  // this thread only: it suspends the others one at a time
+    static PVOID handler;
+    static int last_count = -1;
+    if (!handler) handler = AddVectoredExceptionHandler(1, ls_watch_handler);
+    if (!handler) return;
+    g_ls_field = sm + SM_LOBBY_STATE;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te = {.dwSize = sizeof te};
+    int armed = 0;
+    if (Thread32First(snap, &te)) do {
+        if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == GetCurrentThreadId()) continue;
+        HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, te.th32ThreadID);
+        if (!th) continue;
+        if (SuspendThread(th) != (DWORD)-1) {
+            CONTEXT c = {.ContextFlags = CONTEXT_DEBUG_REGISTERS};
+            if (GetThreadContext(th, &c)) {
+                c.Dr0 = (DWORD64)g_ls_field;
+                c.Dr7 = (c.Dr7 & ~0xF0003ull) | 1 | (1ull << 16) | (3ull << 18);  // breakpoint 0: write, 4 bytes
+                armed += SetThreadContext(th, &c) != 0;
+            }
+            ResumeThread(th);
+        }
+        CloseHandle(th);
+    } while (Thread32Next(snap, &te));
+    CloseHandle(snap);
+    if (armed != last_count) logf("lobby_state watch: write breakpoint on %p armed on %d threads", (void *)g_ls_field, armed);
+    last_count = armed;
+}
+static void ls_watch_tick(void) {
+    static DWORD next;
+    ls_watch_flush();
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
+    if (!sm || !g_network_on || (int)(GetTickCount() - next) < 0) return;
+    next = GetTickCount() + 5000;
+    ls_watch_arm(sm);
+}
 static DWORD WINAPI run(LPVOID self) {
     (void)self;
     IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew);
@@ -2940,6 +3309,9 @@ static DWORD WINAPI run(LPVOID self) {
         guard_intact();
         watch_network();
         watch_session();
+        if (setting(S_WATCH_TEST)) ls_watch_tick();
+        code_patch_check();
+        if (setting(S_FINISH_TEST)) finish_tick();
     }
 }
 

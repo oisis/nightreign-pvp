@@ -1253,6 +1253,9 @@ static int write_profile(void) {
     fprintf(f, "profileVersion = \"v1\"\n");
     // Seamless Co-op keeps its own save file; without it the mod uses a save of its own.
     if (!exists(seamless)) fprintf(f, "savefile = \"" MOD_SAVE_NAME "\"\n");
+    // me3's own option ("Neutralize Arxan"), as in the dev profile: with the game's code protection
+    // active, hooked calls were restored behind the mod's back (owner's decision).
+    fprintf(f, "disable_arxan = true\n");
     fprintf(f, "\n[[supports]]\ngame = \"nightreign\"\n\n[[packages]]\npath = \"build\"\n");
     if (exists(seamless)) {
         fprintf(f, "\n[[natives]]\npath = \"../SeamlessCoop/nrsc.dll\"\nload_early = true\n");
@@ -1496,7 +1499,7 @@ int core_selftest(void) {
                                 "nope = true\r\nteam-test = yes\r\n\r\nno-rain = false";
         signed char v[SETTINGS_COUNT];
         char bad[64];
-        static const signed char want[SETTINGS_COUNT] = {1, 0, -1, -1, -1, 0, 1, -1};
+        static const signed char want[SETTINGS_COUNT] = {1, 0, -1, -1, -1, 0, 1, -1, -1, -1, -1};
         int good = settings_parse(t, sizeof t - 1, v, bad, sizeof bad) == 2 && !memcmp(v, want, sizeof v) &&
                    !strcmp(bad, "nope = true, team-test = yes");
         good = good && !load_settings("/nonexistent/test-settings.toml", v);
