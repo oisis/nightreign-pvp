@@ -74,6 +74,7 @@ static void next_to_dll(char *path, size_t cap, const char *name) {
     char *a = strrchr(path, '\\'), *b = strrchr(path, '/'), *dir = a > b ? a : b;
     if (dir) snprintf(dir + 1, cap - (size_t)(dir + 1 - path), "%s", name);
 }
+static int g_settings_early;  // read in DllMain already
 static void settings_load(void) {
     char path[MAX_PATH], text[4096], bad[300], old[200] = "";
     next_to_dll(path, sizeof path, "test-settings.toml");
@@ -868,9 +869,8 @@ static char *hud_lookup_hook(void *wcm, unsigned long long *id) {
     // name-test, host: the over-head name tags (0x7c8a90 fills eight tags at FE +0xca60, lookup 0x7c8c74;
     // an empty lookup builds no name) are left out for a character carrying our effect; the name over
     // its health bar stays.
-    if (site == 0x7c8c74 && c && c != me && setting(S_NAME_TEST) && !g_join_in_world() && !IsBadReadPtr(c, 0x200) &&
-        our_speffect_active(c) == 1)
-        out = NULL;
+    // (run 15: an empty lookup here drops the whole tag, the HP bar with it: 0x7c8a90 fills a tag's HP,
+    // name and render only for a found character. Not filtered any more; the over-head name comes back.)
     if (c && c != me && party) {
         int invading = g_join_in_world() || (me && !IsBadReadPtr(me, 0x200) && our_speffect_active(me) == 1);
         if (invading) out = NULL;
@@ -1155,7 +1155,11 @@ static void finish_down_hook(char *chr, char state, float t) {
          "(count decay every %.0f s out of the down)", count, was, *(float *)(chr + 0x714), timer_was, gscp_u16(0x2ca));
 }
 static void finish_hit_hook(char *chr, char *attacker, char *hit) {
+    float before = chr && !IsBadReadPtr(chr, 0x740) ? *(float *)(chr + 0x714) : -1;
     ((void (*)(char *, char *, char *))(g_base + 0x66dec0))(chr, attacker, hit);
+    logf("finish test: gauge call (0x43dac3): %s character, attacker %p (ours %d), gauge %.1f -> %.1f", chr == local_player() ? "local" : "remote",
+         (void *)attacker, attacker && !IsBadReadPtr(attacker, 0x200) ? our_speffect_active(attacker) : -1, before,
+         chr ? *(float *)(chr + 0x714) : -1);
     if (!chr || chr != local_player() || IsBadReadPtr(chr, 0x740) || chr[0x710] != 1 || *(float *)(chr + 0x714) > 0) return;
     int ok_attacker = attacker && attacker != chr && !IsBadReadPtr(attacker, 0x200);
     int by_other = our_speffect_active(chr) == 1 ? ok_attacker && our_speffect_active(attacker) != 1
@@ -1173,39 +1177,99 @@ static void finish_hit_hook(char *chr, char *attacker, char *hit) {
     *(float *)(chr + 0x718) = 0;
     logf("finish test: emptied by the other side: gauge 0 -> 0.5 (no stand-up), timer %.2f -> 0 (bleed-out death)", timer);
 }
-// Task 2 (finish-test): the team relation table the game asks "is this character an enemy" through
-// (0x52c990 for two characters, 0x52c950 for two teams: 81 x 81 pointers at 0x399a120 to relation
-// objects whose first method answers the query {enemy, friend, neutral}: Friend 0x398d3f0, Enemy
-// 0x398d3f8, Neutral 0x398d408) has 16 -> 77 (our invader against a downed player) Neutral, while 1 -> 77
-// and 2 -> 77 are Enemy. The host's hits land on a downed invader and lower its gauge on the invader's
-// machine (the hit handler 0x43d260 calls 0x66dec0 for any hit on a downed character, no team check);
-// the invader's hits on a downed host never land. Here 16 -> 77 is given the object of 2 -> 77 (Enemy),
-// on both machines (only team 16, our invader, attacks with it).
-// ponytail: inferred that hit detection uses this entry (one of 25 callers of 0x52c990, not traced).
+// Task 2 (finish-test). Whether an attack may hit a character is decided on the attacker's machine in
+// 0x436370 (called from the hit dispatch 0x43ed80 before the target's damage module, slot 7 = 0x437010,
+// registers the hit): 0x52cb90(attacker, target, hit) asks the ATTACK relation table at 0x398d410
+// (81 x 81, raw effective teams, no 77 -> 2 conversion) with the attack's own flags (AtkParam byte
+// +0x81: bit 0 enemies, bit 1 friends, bit 2 neutral). There 1/2 -> 77 (a squad member against a
+// downed player) is Enemy, so the host's blows land on a downed invader; 16 -> 77 (our invader against
+// a downed player) is Neutral, so its blows never land on a downed host (run 16: no hit registered at
+// all). Here [16][77] of that table gets the Enemy object of [2][77]. Only team 16, our invader, attacks
+// with that row. (Runs 13-16 changed the same entry of the other table, 0x399a120, the "is it an
+// enemy" table of the HUD and the hit-source checks, which this path does not ask.)
 static void finish_relation_patch(void) {
-    void **table = (void **)(g_base + 0x399a120);
+    void **table = (void **)(g_base + 0x398d410);
     void **entry = table + 16 * 0x51 + 77, *enemy = table[2 * 0x51 + 77];
     if (*entry != (void *)(g_base + 0x398d408) || enemy != (void *)(g_base + 0x398d3f8)) {
-        logf("finish test: relation 16 -> 77 not as expected (%p, enemy %p), not changed", *entry, enemy);
+        logf("finish test: attack relation 16 -> 77 not as expected (%p, enemy %p), not changed", *entry, enemy);
         return;
     }
     DWORD old;
     if (!VirtualProtect(entry, 8, PAGE_READWRITE, &old)) return;
     *entry = enemy;
     VirtualProtect(entry, 8, old, &old);
-    logf("finish test: relation 16 -> 77 (invader against a downed player) Neutral -> Enemy, as 1/2 -> 77");
+    logf("finish test: attack relation 16 -> 77 (invader's attacks against a downed player) Neutral -> Enemy, as 1/2 -> 77");
 }
-// finish-test diagnostic (run 14: the invader's hits still do nothing to a downed host although
-// 16 -> 77 is Enemy now). 0x44e190, 0x44b970 and 0x44bb30 all read a downed target (team 77) as team 2
-// before asking the relation table, so the [16][77] entry is never consulted for a downed target; the
-// pair actually asked is 16 -> 2 (Enemy), while the host's hits ask 2 -> 2 (Friend). Logged here, once
-// a second at most: each 0x44e190 call with a downed target or attacker carrying our effect (8 sites),
-// and the results of 0x44b970 ("an enemy among the attackers") / 0x44bb30 ("a friend among them")
-// at 0x438610's sites, whose combination gates 0x43aea0 (a writer of the reward/... fields) and the
-// rest of that hit path.
-static const unsigned HITREL_SITES[] = {0x44bf7f, 0x44c0ef, 0x44ce77, 0x44cfdd, 0x44b6bf, 0x450594, 0x451421, 0x45167d};
-static unsigned char hitrel_log_hook(char *attacker, char *target, unsigned long long f1, unsigned long long f2) {
-    unsigned char r = ((unsigned char (*)(void *, void *, unsigned long long, unsigned long long))(g_base + 0x44e190))(attacker, target, f1, f2);
+// finish-test diagnostic, second round (run 15: no line from 0x44e190 / 0x44b970 / 0x44bb30 in either
+// direction). The victim's side receives a hit in 0x436530(module, attacker, hit, flag) (5 call sites);
+// for a downed victim it goes on to 0x43d260, which lowers the gauge through 0x66dec0 (calls at 0x43dac3
+// with the attacker, 0x44c6ac without). Logged: every received hit whose victim is downed or whose
+// attacker carries our effect (once a second per call site), and every gauge call.
+static const unsigned RECV_SITES[] = {0x4373d9, 0x437518, 0x441157, 0x51f2cd, 0x53420b};
+static void recv_hit_hook(char *module, char *attacker, char *hit, unsigned long long flag) {
+    char *victim = module ? ((char *(*)(void *))(g_base + 0x42c120))(module) : NULL;
+    unsigned site = (unsigned)((char *)__builtin_return_address(0) - g_base) - 5;
+    int vdown = victim && !IsBadReadPtr(victim, 0x740) && victim[0x710] == 1;
+    int aours = attacker && !IsBadReadPtr(attacker, 0x200) && our_speffect_active(attacker) == 1;
+    if (vdown || aours) {
+        static DWORD next[5];
+        unsigned k = 0;
+        while (k < 5 && RECV_SITES[k] != site) k++;
+        if (k < 5 && (int)(GetTickCount() - next[k]) >= 0) {
+            next[k] = GetTickCount() + 1000;
+            logf("finish test: hit received at %x: victim %s state %d (ours %d), attacker %p (ours %d), hit +0x121 %u +0x280 %d",
+                 site, victim == local_player() ? "local" : "remote", victim ? (unsigned char)victim[0x710] : -1,
+                 victim ? our_speffect_active(victim) : -1, (void *)attacker, aours, hit ? (unsigned char)hit[0x121] : 0,
+                 hit ? *(int *)(hit + 0x280) : 0);
+        }
+    }
+    ((void (*)(char *, char *, char *, unsigned long long))(g_base + 0x436530))(module, attacker, hit, flag);
+}
+static void gauge_nohit_hook(char *chr, char *attacker, char *hit) {
+    float before = chr && !IsBadReadPtr(chr, 0x740) ? *(float *)(chr + 0x714) : -1;
+    ((void (*)(char *, char *, char *))(g_base + 0x66dec0))(chr, attacker, hit);
+    logf("finish test: gauge call (0x44c6ac, no attacker): %s character, gauge %.1f -> %.1f", chr == local_player() ? "local" : "remote",
+         before, chr ? *(float *)(chr + 0x714) : -1);
+}
+// marker-test (logging first): the world map's pins. CS::WorldMapViewModel (vtable 0x2c4a548, built by
+// 0x90dc80 when the map opens, called at 0x84d8d8, 0x84d91e, 0xa4e3c0) holds one WorldMapPlayerData pin for
+// the local player (pointer vector, begin at +0x88) and a fixed two for other players (begin at +0xb0, end
+// +0xb8), 0xb0 bytes each; the code that fills them is protected (0x1473502da). Logged while the map is
+// open, on change: each other-player pin's first 0x60 bytes, to find what makes it visible.
+static char *volatile g_map_model;
+static char *map_model_hook(char *model, unsigned long long a2) {
+    char *r = ((char *(*)(char *, unsigned long long))(g_base + 0x90dc80))(model, a2);
+    g_map_model = model;
+    logf("marker test: world map opened (view model %p)", (void *)model);
+    return r;
+}
+static void marker_tick(void) {
+    static DWORD next;
+    static char last[2][0x60];
+    char *m = g_map_model;
+    if (!m || (int)(GetTickCount() - next) < 0) return;
+    next = GetTickCount() + 2000;
+    if (IsBadReadPtr(m, 0xc0) || *(char **)m != g_base + 0x2c4a548) {
+        g_map_model = NULL;
+        return;
+    }
+    char **b = *(char ***)(m + 0xb0), **e = *(char ***)(m + 0xb8);
+    for (int i = 0; b && b + i < e && i < 2; i++) {
+        char *pin = b[i];
+        if (!pin || IsBadReadPtr(pin, 0x60) || !memcmp(last[i], pin, 0x60)) continue;
+        memcpy(last[i], pin, 0x60);
+        char hex[0x60 * 2 + 1];
+        for (int k = 0; k < 0x60; k++) sprintf(hex + 2 * k, "%02x", (unsigned char)pin[k]);
+        logf("marker test: other-player pin %d %p: %s", i, (void *)pin, hex);
+    }
+}
+// finish-test log at that gate: each 0x436370 call (4 sites) with a downed target or an attacker
+// carrying our effect, at most once a second: teams, the attack's relation flags (hit +0x10 -> +0x81)
+// and the result.
+static const unsigned CANHIT_SITES[] = {0x43f1de, 0x43f306, 0x43f452, 0x33c318};
+static unsigned char can_hit_hook(char *module, char *target, char *hit, unsigned long long flag) {
+    unsigned char r = ((unsigned char (*)(char *, char *, char *, unsigned long long))(g_base + 0x436370))(module, target, hit, flag);
+    char *attacker = module ? ((char *(*)(void *))(g_base + 0x42c120))(module) : NULL;
     if (!attacker || !target || IsBadReadPtr(attacker, 0x740) || IsBadReadPtr(target, 0x740)) return r;
     if (target[0x710] != 1 && our_speffect_active(attacker) != 1) return r;
     static DWORD next;
@@ -1214,38 +1278,27 @@ static unsigned char hitrel_log_hook(char *attacker, char *target, unsigned long
     unsigned char ta = 0, tt = 0;
     ((unsigned char *(*)(void *, unsigned char *))(g_base + 0x3d1b30))(attacker, &ta);
     ((unsigned char *(*)(void *, unsigned char *))(g_base + 0x3d1b30))(target, &tt);
-    logf("finish test: hit check 0x44e190 from %x: attacker team %u (ours %d, local %d), target team %u state %u (ours %d, local %d) -> %u",
-         (unsigned)((char *)__builtin_return_address(0) - g_base) - 5, ta, our_speffect_active(attacker), attacker == local_player(), tt,
-         (unsigned char)target[0x710], our_speffect_active(target), target == local_player(), r);
+    char *atk = hit && !IsBadReadPtr(hit, 0x18) ? *(char **)(hit + 0x10) : NULL;
+    logf("finish test: can-hit 0x436370 from %x: attacker team %u (ours %d), target team %u state %u, attack flags %02x, mode %u -> %u",
+         (unsigned)((char *)__builtin_return_address(0) - g_base) - 5, ta, our_speffect_active(attacker), tt,
+         (unsigned char)target[0x710], atk && !IsBadReadPtr(atk + 0x81, 1) ? (unsigned char)atk[0x81] : 0xff, (unsigned)(flag & 0xff), r);
     return r;
-}
-static unsigned long long hitlist_log(unsigned long long r, const char *what, char *module) {
-    char *owner = module ? ((char *(*)(void *))(g_base + 0x42c120))(module) : NULL;
-    if (!owner || IsBadReadPtr(owner, 0x740) || owner[0x710] != 1) return r;
-    static DWORD next;
-    if ((int)(GetTickCount() - next) < 0) return r;
-    next = GetTickCount() + 1000;
-    logf("finish test: %s for a downed %s character: %u", what, owner == local_player() ? "local" : "remote", (unsigned)(r & 0xff));
-    return r;
-}
-static unsigned long long enemy_list_hook(char *module) {
-    return hitlist_log(((unsigned long long (*)(char *))(g_base + 0x44b970))(module), "enemy among its hit sources (0x44b970)", module);
-}
-static unsigned long long friend_list_hook(char *module) {
-    return hitlist_log(((unsigned long long (*)(char *))(g_base + 0x44bb30))(module), "friend among its hit sources (0x44bb30)", module);
 }
 static void hook_acceptance(void) {
+    if (setting(S_FINISH_TEST))
+        for (unsigned i = 0; i < 4; i++) hook_call(CANHIT_SITES[i], 0x436370, (void *)can_hit_hook, "finish test: can-hit log");
+    if (setting(S_MARKER_TEST)) {
+        hook_call(0x84d8d8, 0x90dc80, (void *)map_model_hook, "marker test: world map");
+        hook_call(0x84d91e, 0x90dc80, (void *)map_model_hook, "marker test: world map");
+        hook_call(0xa4e3c0, 0x90dc80, (void *)map_model_hook, "marker test: world map");
+    }
     if (setting(S_FINISH_TEST)) {
-        for (unsigned i = 0; i < sizeof HITREL_SITES / sizeof *HITREL_SITES; i++)
-            hook_call(HITREL_SITES[i], 0x44e190, (void *)hitrel_log_hook, "finish test: hit check log");
-        hook_call(0x43772a, 0x44b970, (void *)enemy_list_hook, "finish test: hit list log");
-        hook_call(0x4386d0, 0x44b970, (void *)enemy_list_hook, "finish test: hit list log");
-        hook_call(0x4386f7, 0x44bb30, (void *)friend_list_hook, "finish test: hit list log");
+        for (unsigned i = 0; i < 5; i++) hook_call(RECV_SITES[i], 0x436530, (void *)recv_hit_hook, "finish test: hit receive log");
+        hook_call(0x44c6ac, 0x66dec0, (void *)gauge_nohit_hook, "finish test: gauge call log");
     }
     if (setting(S_FINISH_TEST)) {
         hook_call(0x674f37, 0x66f3b0, (void *)finish_down_hook, "finish test: going down");
         hook_call(0x43dac3, 0x66dec0, (void *)finish_hit_hook, "finish test: gauge hit");
-        finish_relation_patch();
     }
     if (setting(S_LOOT_TEST)) {
         hook_call(0x6fd220, 0x724420, (void *)loot_update_hook, "loot test: pickup objects");
@@ -3566,7 +3619,7 @@ static DWORD WINAPI run(LPVOID self) {
         return 0;
     }
     logf("loaded, game base %p", g_base);
-    settings_load();
+    if (!g_settings_early) settings_load();
     if (g_guard_ok) logf("net guard: installed, %u of %u imports patched (outbound %s)", (unsigned)GUARDED_COUNT,
                          (unsigned)GUARDED_COUNT, NET_GUARD_REFUSE_OUTBOUND ? "refused" : "logged only");
     else logf("net guard: NOT installed (%s); the network will not be started", g_guard_msg);
@@ -3591,6 +3644,7 @@ static DWORD WINAPI run(LPVOID self) {
         watch_session();
         if (setting(S_WATCH_TEST)) ls_watch_tick();
         code_patch_check();
+        if (setting(S_MARKER_TEST)) marker_tick();
         if (setting(S_FINISH_TEST)) finish_tick();
     }
 }
@@ -3607,7 +3661,16 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved) {
         IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew);
         // The guard goes in first, here rather than in run(): this runs before me3 lets the game go
         // on, while run() starts only later, alongside the game's own start-up.
-        if (nt->FileHeader.TimeDateStamp == GAME_TIMESTAMP) install_net_guard();
+        if (nt->FileHeader.TimeDateStamp == GAME_TIMESTAMP) {
+            install_net_guard();
+            // Run 16: the invader's hits are dropped on its own machine before the hit is even registered,
+            // although 16 -> 77 had been made Enemy at hook time. If the game derives its hit filters
+            // from the relation table while it starts, a change made later is never seen; so the
+            // settings are read here and the entry is changed before the game starts (experiment).
+            settings_load();
+            g_settings_early = 1;
+            if (setting(S_FINISH_TEST)) finish_relation_patch();
+        }
         CreateThread(NULL, 0, run, self, 0, NULL);
     }
     return TRUE;

@@ -22,6 +22,8 @@ Every setting and who sets it:
   name-test    Both. Logs why the other player's name shows as "Player" and fills in the missing
                id so the game can show the real character name.
   reward-test  Invader. Skips the broken second end screen (rewards) after an invasion.
+  marker-test  Both (logging only). Logs the map's markers for the other player; open the map a few
+               times while the other player is near and far.
   watch-test   Leave false. Diagnostic that crashed the game in its first form.
   full-sync    Invader (on by default). Ask the host for its full world state. false only for tests.
   team-test    Solo tests only (leave false in a two-player test).

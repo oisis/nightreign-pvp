@@ -6,10 +6,10 @@
 #include <stddef.h>
 #include <string.h>
 
-enum { S_HOST_TEST, S_JOIN_TEST, S_ENTER_TEST, S_MOVE_TEST, S_TEAM_TEST, S_NO_RAIN, S_SLOW_TIME, S_FULL_SYNC, S_FINISH_TEST, S_LOOT_TEST, S_WATCH_TEST, S_NAME_TEST, S_REWARD_TEST, SETTINGS_COUNT };
+enum { S_HOST_TEST, S_JOIN_TEST, S_ENTER_TEST, S_MOVE_TEST, S_TEAM_TEST, S_NO_RAIN, S_SLOW_TIME, S_FULL_SYNC, S_FINISH_TEST, S_LOOT_TEST, S_WATCH_TEST, S_NAME_TEST, S_REWARD_TEST, S_MARKER_TEST, SETTINGS_COUNT };
 static const char *const SETTING_NAMES[SETTINGS_COUNT] = {"host-test", "join-test", "enter-test", "move-test",
                                                           "team-test", "no-rain",   "slow-time", "full-sync",
-                                                          "finish-test", "loot-test", "watch-test", "name-test", "reward-test"};
+                                                          "finish-test", "loot-test", "watch-test", "name-test", "reward-test", "marker-test"};
 // Settings that are on when the file does not mention them.
 static int setting_default(int i) { return i == S_FULL_SYNC; }
 
