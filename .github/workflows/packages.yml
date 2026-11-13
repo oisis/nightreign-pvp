@@ -1,0 +1,62 @@
+# Builds the Linux and Windows packages and publishes them as release v<VERSION>.
+# Runs only when the newest pushed commit's message starts with "[build]".
+# Everything is built from this repository plus pinned downloads (zig, me3); no game files are used.
+name: packages
+
+on: push
+
+permissions:
+  contents: write
+
+jobs:
+  packages:
+    if: startsWith(github.event.head_commit.message, '[build]')
+    # Oldest supported runner: the Linux launcher then runs on systems with glibc 2.35 or newer.
+    runs-on: ubuntu-22.04
+    env:
+      NRPVP_WORK: ${{ github.workspace }}/../work
+      ZIG: "0.17.1 3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a"
+      ME3: "v0.13.0 f31579deebf75b4702059694b664bdd8917c4773ab0c266715ca8f92e1e93fc1 a8b693c574106f20532ab1e8b58b2452f37370679b938a884fe75f87f9b68c2b"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: |
+          sudo apt-get update -q && sudo apt-get install -yq libgtk-3-dev libarchive-tools
+          python3 -m pip install -q pillow
+          W="$NRPVP_WORK"; mkdir -p "$W/tools/zig" "$W/tools/me3" "$W/tools/dl"
+          set -- $ZIG
+          curl -fsSL -o zig.tar.xz "https://ziglang.org/download/$1/zig-x86_64-linux-$1.tar.xz"
+          echo "$2  zig.tar.xz" | sha256sum -c
+          tar xJf zig.tar.xz -C "$W/tools/zig" --strip-components=1
+          set -- $ME3
+          curl -fsSL -o me3.tar.gz "https://github.com/garyttierney/me3/releases/download/$1/me3-linux-amd64.tar.gz"
+          curl -fsSL -o "$W/tools/dl/me3-windows-amd64.zip" "https://github.com/garyttierney/me3/releases/download/$1/me3-windows-amd64.zip"
+          echo "$2  me3.tar.gz" | sha256sum -c
+          echo "$3  $W/tools/dl/me3-windows-amd64.zip" | sha256sum -c
+          tar xzf me3.tar.gz -C "$W/tools/me3"
+          rm zig.tar.xz me3.tar.gz
+
+      # The parts of mod/build.sh the launcher ships; the rest of it needs the game's files.
+      - name: Mod DLL and icons
+        run: |
+          W="$NRPVP_WORK"; ZIG="$W/tools/zig/zig"; mkdir -p "$W/build/native"
+          "$ZIG" cc -target x86_64-windows-gnu -shared -O2 -Wall -Wextra -o "$W/build/native/invasion.dll" mod/dll/invasion.c
+          "$ZIG" cc -target x86_64-windows-gnu -O2 -o "$W/build/unkrak.exe" mod/tools/unkrak.c
+          python3 mod/build_icon.py --blocks "$W/build-launcher-data"
+
+      - name: Launcher and packages
+        run: sh launcher/build.sh && sh launcher/package.sh
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V=$(tr -d '[:space:]' < VERSION)
+          set -- "$NRPVP_WORK"/dist/packages/*.tar.gz "$NRPVP_WORK"/dist/packages/*.zip
+          # ponytail: a second [build] with the same VERSION replaces the assets; bump VERSION for a new release.
+          if gh release view "v$V" >/dev/null 2>&1; then
+            gh release upload "v$V" "$@" --clobber
+          else
+            gh release create "v$V" "$@" --target "$GITHUB_SHA" --title "$V" --prerelease --notes "Commit $GITHUB_SHA"
+          fi

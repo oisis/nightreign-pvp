@@ -1,6 +1,0 @@
-apiVersion: v2
-name: nightreign-invasions
-description: Info page and downloads for the Nightreign Invasions mod (static site on nginx)
-type: application
-version: 0.1.0
-appVersion: "0.1.0"
