@@ -865,6 +865,12 @@ static char *hud_lookup_hook(void *wcm, unsigned long long *id) {
             for (int i = 0; i < 7; i++) fe[0xcf28 + i * 0x98] = 0, fe[0xcf28 + i * 0x98 + 0x90] = 0;
     }
     char *out = c;
+    // name-test, host: the over-head name tags (0x7c8a90 fills eight tags at FE +0xca60, lookup 0x7c8c74;
+    // an empty lookup builds no name) are left out for a character carrying our effect; the name over
+    // its health bar stays.
+    if (site == 0x7c8c74 && c && c != me && setting(S_NAME_TEST) && !g_join_in_world() && !IsBadReadPtr(c, 0x200) &&
+        our_speffect_active(c) == 1)
+        out = NULL;
     if (c && c != me && party) {
         int invading = g_join_in_world() || (me && !IsBadReadPtr(me, 0x200) && our_speffect_active(me) == 1);
         if (invading) out = NULL;
@@ -1159,6 +1165,10 @@ static void finish_hit_hook(char *chr, char *attacker, char *hit) {
         return;
     }
     float timer = *(float *)(chr + 0x718);
+    if (timer <= 0) {  // run 14: a second hit after the finish logged it again; already finished
+        *(float *)(chr + 0x714) = 0.5f;
+        return;
+    }
     *(float *)(chr + 0x714) = 0.5f;
     *(float *)(chr + 0x718) = 0;
     logf("finish test: emptied by the other side: gauge 0 -> 0.5 (no stand-up), timer %.2f -> 0 (bleed-out death)", timer);
@@ -1185,7 +1195,53 @@ static void finish_relation_patch(void) {
     VirtualProtect(entry, 8, old, &old);
     logf("finish test: relation 16 -> 77 (invader against a downed player) Neutral -> Enemy, as 1/2 -> 77");
 }
+// finish-test diagnostic (run 14: the invader's hits still do nothing to a downed host although
+// 16 -> 77 is Enemy now). 0x44e190, 0x44b970 and 0x44bb30 all read a downed target (team 77) as team 2
+// before asking the relation table, so the [16][77] entry is never consulted for a downed target; the
+// pair actually asked is 16 -> 2 (Enemy), while the host's hits ask 2 -> 2 (Friend). Logged here, once
+// a second at most: each 0x44e190 call with a downed target or attacker carrying our effect (8 sites),
+// and the results of 0x44b970 ("an enemy among the attackers") / 0x44bb30 ("a friend among them")
+// at 0x438610's sites, whose combination gates 0x43aea0 (a writer of the reward/... fields) and the
+// rest of that hit path.
+static const unsigned HITREL_SITES[] = {0x44bf7f, 0x44c0ef, 0x44ce77, 0x44cfdd, 0x44b6bf, 0x450594, 0x451421, 0x45167d};
+static unsigned char hitrel_log_hook(char *attacker, char *target, unsigned long long f1, unsigned long long f2) {
+    unsigned char r = ((unsigned char (*)(void *, void *, unsigned long long, unsigned long long))(g_base + 0x44e190))(attacker, target, f1, f2);
+    if (!attacker || !target || IsBadReadPtr(attacker, 0x740) || IsBadReadPtr(target, 0x740)) return r;
+    if (target[0x710] != 1 && our_speffect_active(attacker) != 1) return r;
+    static DWORD next;
+    if ((int)(GetTickCount() - next) < 0) return r;
+    next = GetTickCount() + 1000;
+    unsigned char ta = 0, tt = 0;
+    ((unsigned char *(*)(void *, unsigned char *))(g_base + 0x3d1b30))(attacker, &ta);
+    ((unsigned char *(*)(void *, unsigned char *))(g_base + 0x3d1b30))(target, &tt);
+    logf("finish test: hit check 0x44e190 from %x: attacker team %u (ours %d, local %d), target team %u state %u (ours %d, local %d) -> %u",
+         (unsigned)((char *)__builtin_return_address(0) - g_base) - 5, ta, our_speffect_active(attacker), attacker == local_player(), tt,
+         (unsigned char)target[0x710], our_speffect_active(target), target == local_player(), r);
+    return r;
+}
+static unsigned long long hitlist_log(unsigned long long r, const char *what, char *module) {
+    char *owner = module ? ((char *(*)(void *))(g_base + 0x42c120))(module) : NULL;
+    if (!owner || IsBadReadPtr(owner, 0x740) || owner[0x710] != 1) return r;
+    static DWORD next;
+    if ((int)(GetTickCount() - next) < 0) return r;
+    next = GetTickCount() + 1000;
+    logf("finish test: %s for a downed %s character: %u", what, owner == local_player() ? "local" : "remote", (unsigned)(r & 0xff));
+    return r;
+}
+static unsigned long long enemy_list_hook(char *module) {
+    return hitlist_log(((unsigned long long (*)(char *))(g_base + 0x44b970))(module), "enemy among its hit sources (0x44b970)", module);
+}
+static unsigned long long friend_list_hook(char *module) {
+    return hitlist_log(((unsigned long long (*)(char *))(g_base + 0x44bb30))(module), "friend among its hit sources (0x44bb30)", module);
+}
 static void hook_acceptance(void) {
+    if (setting(S_FINISH_TEST)) {
+        for (unsigned i = 0; i < sizeof HITREL_SITES / sizeof *HITREL_SITES; i++)
+            hook_call(HITREL_SITES[i], 0x44e190, (void *)hitrel_log_hook, "finish test: hit check log");
+        hook_call(0x43772a, 0x44b970, (void *)enemy_list_hook, "finish test: hit list log");
+        hook_call(0x4386d0, 0x44b970, (void *)enemy_list_hook, "finish test: hit list log");
+        hook_call(0x4386f7, 0x44bb30, (void *)friend_list_hook, "finish test: hit list log");
+    }
     if (setting(S_FINISH_TEST)) {
         hook_call(0x674f37, 0x66f3b0, (void *)finish_down_hook, "finish test: going down");
         hook_call(0x43dac3, 0x66dec0, (void *)finish_hit_hook, "finish test: gauge hit");
@@ -2368,6 +2424,17 @@ static void join_over(const char *why) {
         // MoveMap_Update (0xc284b0) goes to Result / EndFlow, which brings the player back to the hub.
         // Every ending, the invader's death included (decision 3: a killed invader returns to the
         // Roundtable Hold and may start another invasion).
+        if (setting(S_REWARD_TEST)) {
+            // reward-test: the invader's play state holds no result of this session (it never ran the
+            // expedition's own start), and the second end screen (rewards, 05_110_Reward) came out half
+            // drawn. STEP_Result (0xc29340) builds the reward chain only when the session result id
+            // (play state +0x368) is not 0: clearing it skips that screen; the summary stays.
+            char *ps = *(char **)(g_base + 0x3c078d0);
+            if (ps) {
+                logf("reward test: session result id (play state +0x368) %u -> 0: the reward screen is skipped", *(unsigned *)(ps + 0x368));
+                *(unsigned *)(ps + 0x368) = 0;
+            }
+        }
         {
             ((void (*)(void))(g_base + 0x6af8f0))();
             char *gm = *(char **)(g_base + 0x3c13258);

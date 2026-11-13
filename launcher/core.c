@@ -1499,7 +1499,7 @@ int core_selftest(void) {
                                 "nope = true\r\nteam-test = yes\r\n\r\nno-rain = false";
         signed char v[SETTINGS_COUNT];
         char bad[64];
-        static const signed char want[SETTINGS_COUNT] = {1, 0, -1, -1, -1, 0, 1, -1, -1, -1, -1, -1};
+        static const signed char want[SETTINGS_COUNT] = {1, 0, -1, -1, -1, 0, 1, -1, -1, -1, -1, -1, -1};
         int good = settings_parse(t, sizeof t - 1, v, bad, sizeof bad) == 2 && !memcmp(v, want, sizeof v) &&
                    !strcmp(bad, "nope = true, team-test = yes");
         good = good && !load_settings("/nonexistent/test-settings.toml", v);

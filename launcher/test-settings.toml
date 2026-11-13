@@ -21,3 +21,4 @@ finish-test = false # both players: a downed invader whose gauge the host's side
 loot-test = false   # both players, logging only: what lies on the ground, every pickup and equipment dialog
 watch-test = false  # leave false: a diagnostic that crashed the game
 name-test = false   # both players: log and fill the id the game needs to show the other player's name
+reward-test = false # invader: skip the reward screen after an invasion
