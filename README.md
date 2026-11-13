@@ -6,8 +6,12 @@ Nightreign doesn't: **other players invading your expedition**.
 You set out with your squad as usual. Somewhere in the world, another player may arrive as a red
 invader with one goal: to bring your expedition down. Or you can be the one who invades.
 
-> **Experimental.** The mod is in early testing. Things break, the game can hang or crash, and
-> features are still missing. Play with it only if you're fine with that.
+> **Very early stage.** For now this is mostly a proof of concept. Invasions should work, but
+> things break, the game can hang or crash, and many features are still missing. Play with it only
+> if you're fine with that.
+>
+> **Testers welcome!** Try it with your friends and
+> [report the bugs you find](https://github.com/oisis/nightreign-pvp/issues). Every report helps.
 
 <!-- Screenshot: the Invasion entry in the expedition menu -->
 
@@ -72,8 +76,9 @@ These are the rules the mod is built towards. Not all of them work yet:
 
 ## Something went wrong?
 
-The mod writes a log to `work/native/invasion.log` inside the launcher's folder. Attach that file
-when you report a problem.
+Please [open an issue](https://github.com/oisis/nightreign-pvp/issues) and describe what happened
+and what you were doing at the time. The mod writes a log to `work/native/invasion.log` inside the
+launcher's folder. Attach that file to your report.
 
 ---
 
