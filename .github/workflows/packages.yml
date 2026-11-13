@@ -73,3 +73,19 @@ jobs:
             else echo "- First test release"; fi
           } > notes.md
           gh release create "v$V" "$@" --target "$GITHUB_SHA" --title "$V" --prerelease --notes-file notes.md
+
+      # Announces the release on Discord. Needs the repository secret DISCORD_WEBHOOK (the channel's
+      # webhook URL); without it the step does nothing. A failed announcement does not fail the build.
+      - name: Discord
+        continue-on-error: true
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          [ -n "$DISCORD_WEBHOOK" ] || { echo "DISCORD_WEBHOOK not set, skipping"; exit 0; }
+          V=$(tr -d '[:space:]' < VERSION)
+          URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/v$V"
+          # Embed descriptions hold at most 4096 characters.
+          jq -n --arg v "$V" --arg url "$URL" --rawfile notes notes.md '{embeds: [{
+              title: ("Nightreign Invasions " + $v), url: $url, color: 13632027,
+              description: (($notes | sub("^## Changes\n\n"; "") | .[0:3900]) + "\n\n[Download](" + $url + ")")}]}' |
+            curl -fsS -H 'Content-Type: application/json' -d @- "$DISCORD_WEBHOOK"
