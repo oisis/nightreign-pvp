@@ -597,12 +597,20 @@ static unsigned char expected_data_hook(void *qm, unsigned long long *id, int a,
 #define RVA_READ_ANSWER        0xdde8a0  // bool (ctx*, int *answer, u64 *member id)
 #define RVA_READ_ANSWER_CALL1  0xdf37e3
 #define RVA_READ_ANSWER_CALL2  0xdf3922
+static int g_move_test;
 static unsigned char read_answer_hook(void *ctx, int *answer, unsigned long long *member) {
     unsigned char got = ((unsigned char (*)(void *, int *, unsigned long long *))(g_base + RVA_READ_ANSWER))(ctx, answer, member);
     if (got && answer)
         logf("join test: answer from a member: %d (%s)", *answer,
              *answer == 0 ? "ready" : *answer == 1 ? "refused: blocked / host closed (notice 0x2789)" :
              *answer == 2 ? "refused: not an expected member (notice 0x27a7)" : "unknown");
+    // Run 98a15ff1: second and third arrivals in one host expedition got answer 2 while the host wrote no
+    // join check at all and kept the member (it went only when this side left). The host now logs every
+    // answer it sends; until the cause is known, a move-test joiner takes 2 as 0 (logged).
+    if (got && answer && *answer == 2 && g_move_test) {
+        logf("join test: answer 2 taken as 0 (move test; compare with the host's 'join answer' lines)");
+        *answer = 0;
+    }
     return got;
 }
 static void hook_call(unsigned rva_site, unsigned rva_target, void *hook, const char *what) {
@@ -661,7 +669,7 @@ static int match_value_hook(void *mgr) {
 #define RVA_SESSION_READ   0xdf1de0  // int (sm, packet, buffer, size, u64 *sender)
 static const unsigned SYNC_SEND_SITES[] = {0xdcd60b, 0xdcdbf0, 0xdce787, 0xdcec70, 0xdceff0, 0xdcf1b3, 0xdcf530, 0xdcf6eb, 0xdd0565, 0xdd0f62};
 static void sync_send_hook(void *sm, int packet, unsigned char *data, void *a4) {
-    logf("sync: request 0x%x subtype %d sent to the host", packet, data ? data[0] : -1);
+    if (packet == 0x51) logf("sync: request 0x%x subtype %d sent to the host", packet, data ? data[0] : -1);
     ((void (*)(void *, int, void *, void *))(g_base + RVA_SESSION_SEND))(sm, packet, data, a4);
 }
 static int sync_read_hook(void *sm, int packet, unsigned char *buf, int size, unsigned long long *sender) {
@@ -690,6 +698,14 @@ static void vec_text(char *out, size_t cap, void **v, int wide) {
 // +0xda/+0xdb (context vt+0x198), +0xdc/+0xdd (context mode: 2 multiplayer) current/requested;
 // +0xde. RequestMoveMap (0xc27870) copies requested to current when they differ (0x202160, 0x202290,
 // 0x2022b0, 0x202230). Equipment (packet 0xc) is sent only with +0xdc == 2 (0xddfca0, 0xde20e0).
+// The current expedition as 0x6b06f0 sets it from the generator's result: +0xb4c pattern, +0xb50,
+// +0xb58, +0xb60, +0xb64; and the result itself +0xb48 / +0xb54 / +0xb5c.
+static void expedition_log(const char *who) {
+    char *gm = *(char **)(g_base + 0x3c13258);
+    if (gm) logf("%s: expedition: result %x,%x,%x | current +b4c %x +b50 %x +b58 %x +b60 %x +b64 %u", who,
+                 *(unsigned *)(gm + 0xb48), *(unsigned *)(gm + 0xb54), *(unsigned *)(gm + 0xb5c), *(unsigned *)(gm + 0xb4c),
+                 *(unsigned *)(gm + 0xb50), *(unsigned *)(gm + 0xb58), *(unsigned *)(gm + 0xb60), (unsigned char)gm[0xb64]);
+}
 static void play_state_log(const char *who) {
     char *pd = *(char **)(g_base + 0x3c078d0), *gm = *(char **)(g_base + 0x3c13258);
     if (!pd) return;
@@ -747,7 +763,15 @@ static void generate_hook_other(unsigned long long a1, unsigned long long a2, un
     g_generate_where = "0xb4cc40";
     generate_hook(a1, a2, a3, a4, v1, v2, v3, v4, a9);
 }
+// Host: every join answer 0x49 as it is sent (0xdde430 -> 0xdf2380 at 0xdde88b), so a refusal is
+// never silent whatever path produced it.
+#define RVA_SESSION_SEND_TO 0xdf2380  // (sm, u64 *to, packet, data, size)
+static void answer_send_hook(void *sm, unsigned long long *to, int packet, int *data, unsigned long long size) {
+    logf("host: join answer 0x%x = %d sent to a member (0 ready, 1 blocked, 2 not expected)", packet, data ? *data : -1);
+    ((void (*)(void *, void *, int, void *, unsigned long long))(g_base + RVA_SESSION_SEND_TO))(sm, to, packet, data, size);
+}
 static void hook_acceptance(void) {
+    hook_call(0xdde88b, RVA_SESSION_SEND_TO, (void *)answer_send_hook, "host join answer send");
     hook_call(0xb4bce6, RVA_GENERATE, (void *)generate_hook_setup, "expedition generation (SingleSetup)");
     hook_call(0xb4d937, RVA_GENERATE, (void *)generate_hook_other, "expedition generation (0xb4cc40)");
     for (unsigned i = 0; i < sizeof SYNC_SEND_SITES / sizeof *SYNC_SEND_SITES; i++)
@@ -1175,6 +1199,7 @@ static DWORD g_request_tick;  // when the last start request arrived
 #define LOBBY_FREE_KEY   "nrpvp_free"
 #define LOBBY_BLOCK_KEY  "nrpvp_block"   // host's map block id, 8 hex digits (ChrIns+0x38)
 #define LOBBY_POS_KEY    "nrpvp_pos"     // host's position "x,y,z" from the game's getter 0x3d0fd0
+#define LOBBY_GEN_KEY    "nrpvp_gen"     // host's generator results gm +0xb48,+0xb54,+0xb5c (hex)
 #define LOBBY_START_KEY  "nrpvp_start"   // host's expedition start block (game manager +0xa74), 8 hex digits
 #define LOBBY_EQUAL      0               // ELobbyComparison
 #define LOBBY_WORLDWIDE  3               // ELobbyDistanceFilter
@@ -1338,6 +1363,29 @@ static void member_flags_log(const char *who, char *sm) {
 #define RVA_SM_SET_INGAME     0xdf28e0  // sm+0x10 = 7, sm+0x74c = 0
 #define RVA_SM_REQUEST_STATE  0xdf20c0  // packet 10 to every member with +0xe2
 static int g_host_switched, g_host_old_dc;
+// Host: the invader's character, once it exists. Read only: the world character manager keeps the
+// local player at +0x174e8; the slots after it are tried as other players' ChrIns, accepted only with
+// the same vtable as the local player's. Team byte +0x74 and whether our team SpEffect is on it.
+static int our_speffect_active(char *chr);
+static void remote_chr_log(void) {
+    static DWORD next;
+    static char last[200];
+    if ((int)(GetTickCount() - next) < 0) return;
+    next = GetTickCount() + 5000;
+    char *wcm = *(char **)(g_base + 0x3c0f0a8), *me = wcm ? *(char **)(wcm + 0x174e8) : NULL;
+    if (!me || IsBadReadPtr(me, 8)) return;
+    char text[200] = "";
+    for (int k = 1; k < 6; k++) {
+        char *c = *(char **)(wcm + 0x174e8 + 8 * k);
+        if (!c || IsBadReadPtr(c, 0x200) || *(void **)c != *(void **)me) continue;
+        snprintf(text + strlen(text), sizeof text - strlen(text), " [slot %d team %u effect %d]", k,
+                 (unsigned char)c[0x74], our_speffect_active(c));
+    }
+    if (strcmp(text, last)) {
+        snprintf(last, sizeof last, "%s", text);
+        logf("host: other player characters:%s", text[0] ? text : " none found");
+    }
+}
 static void host_member_sync(char *sm) {
     static unsigned long long for_lobby;
     static int last_waiting;
@@ -1350,7 +1398,9 @@ static void host_member_sync(char *sm) {
     // its player data 0x60 checked and applied (bit 2), and a second later. The run of b593722b showed
     // that switching as soon as the member appears refuses it (answer 2). With nobody of ours left in
     // the session the role goes back to 5, so the next arrival is admitted in role 5 again.
-    if (waiting && *(int *)(sm + 0x10) == 5 && g_admit_kind == 3 && GetTickCount() - g_admit_tick > 1000) {
+    // The join check is enough: a member who was in this session before sends no new player data 0x60
+    // (run 0a6833c2: second arrival, no 0x60, no player-data check), its data is already there.
+    if (waiting && *(int *)(sm + 0x10) == 5 && (g_admit_kind & 1) && GetTickCount() - g_admit_tick > 1000) {
         ((void (*)(void *))(g_base + RVA_SM_SET_INGAME))(sm);
         logf("host: member admitted; session role 5 -> %d (0xdf28e0, as a map load inside the session sets it)",
              *(int *)(sm + 0x10));
@@ -1375,6 +1425,7 @@ static void host_member_sync(char *sm) {
         logf("host: no member left; session role back to 5 for the next arrival");
     }
     if (*(int *)(sm + 0x10) == 7) g_host_switched = 1;
+    if (g_host_switched) remote_chr_log();
     // packet 10 to each newly waiting member, once the role is 7 (requests are answered only then)
     if (*(int *)(sm + 0x10) == 7 && waiting > last_waiting) {
         ((void (*)(void *))(g_base + RVA_SM_REQUEST_STATE))(sm);
@@ -1444,6 +1495,12 @@ static void lobby_mark(void) {
             if (gm) {
                 snprintf(text, sizeof text, "%08x", *(unsigned *)(gm + 0xa74));
                 lobby_set(LOBBY_START_KEY, text);
+                // what the expedition generator (0x6aec40) changed in the game manager on the host's solo
+                // start: +0xb48, +0xb54, +0xb5c (run of 5c775057); published to compare with the invader's
+                char gen[40];
+                snprintf(gen, sizeof gen, "%x,%x,%x", *(unsigned *)(gm + 0xb48), *(unsigned *)(gm + 0xb54), *(unsigned *)(gm + 0xb5c));
+                lobby_set(LOBBY_GEN_KEY, gen);
+                expedition_log("host");
             }
         }
         g_squad = members;
@@ -1637,8 +1694,14 @@ static void log_pending_state(const char *who) {
 static void toggle_search(const char *where);
 static int g_move, g_move_online;
 #define RVA_QM_UNREGISTER 0xb52ef0  // void (ctrl*): if step != 0, cancel the job chain, set step 25
+static int g_invasion_ended;
 static void join_over(const char *why) {
     g_join = 3;
+    {  // a clean start for the next invasion: our +0xe5 on the world sync object goes
+        char *sm0 = *(char **)(g_base + RVA_SESSION_MAN_PTR), *sy = sm0 ? *(char **)(sm0 + 0x1b8) : NULL;
+        if (sy && !IsBadReadPtr(sy, 0xe8) && sy[0xe5]) sy[0xe5] = 0, logf("join test: sync +0xe5 cleared");
+    }
+    if (g_move >= 3) g_invasion_ended = 1;
     logf("join test: stopping (%s), leaving and ending the search", why);
     // A forced MoveMapStart / MoveMap would be left behind with no session: back to None, the call
     // our expedition-start cancel makes. FailedStartMultiplay and Unregister are the game's own exits.
@@ -1654,6 +1717,18 @@ static void join_over(const char *why) {
         logf("move test: map was loaded; controller step %d -> Unregister (0xb52ef0)", g_qm_step);
         ((void (*)(void *))(g_base + RVA_QM_UNREGISTER))(g_qm_ctrl);
         logf("move test: controller +0x40 %d +0x44 %d after Unregister", *(int *)(g_qm_ctrl + 0x40), *(int *)(g_qm_ctrl + 0x44));
+        // The way an expedition ends: MoveMapStep's _CheckEndingRequest (0xc37420) turns ending event
+        // flags into the game manager requests +0xaf1 / +0xaf2 / +0xaf3 (0x6af8f0, 0x6af900, 0x6af8d0);
+        // with one set, MoveMapStep's ending sequence (0xc37850, +0x132 1..4) runs and InGameStep's
+        // MoveMap_Update (0xc284b0) goes to Result / EndFlow, which brings the player back to the hub.
+        // Every ending, the invader's death included (decision 3: a killed invader returns to the
+        // Roundtable Hold and may start another invasion).
+        {
+            ((void (*)(void))(g_base + 0x6af8f0))();
+            char *gm = *(char **)(g_base + 0x3c13258);
+            logf("move test: expedition end requested (gm+0xaf1 = %u, 0x6af8f0): back to the Roundtable Hold (%s)",
+                 gm ? (unsigned char)gm[0xaf1] : 0, strstr(why, "died") ? "invader died" : "invasion over");
+        }
     } else if (g_move >= 2 && g_qm_ctrl && (g_qm_step == 21 || g_qm_step == 22)) {
         ((void (*)(void *, int))(*(void ***)g_qm_ctrl)[QM_CTRL_VT_SET_STEP])(g_qm_ctrl, QM_STEP_NONE);
         logf("move test: controller step %d set back to None", g_qm_step);
@@ -1726,7 +1801,8 @@ static void join_frame(void) {
             log_pending_state("join test");
         } else if (state == 0 || state == 2 || state == 5) join_over("join failed");
         else if (waited > JOIN_TIMEOUT_MS) join_over("join timed out");
-    } else if (state != 6) join_over("no longer a client");
+    } else if (state == 3) join_over("the host left and the session passed to us (host migration): invasion over");
+    else if (state != 6) join_over("no longer a client");
     else if (g_join == 4) {
         enter_watch(sm);
         if (!g_enter_world && GetTickCount() - g_enter_tick > ENTER_WATCHDOG_MS) join_over("enter test watchdog: no way into the world");
@@ -1871,6 +1947,7 @@ static const char *const SYNC_STEP_NAMES[26] = {
     "NonActiveBlockInfo", "EndIngame", "Finish"};
 static const char *sync_step_name(int i) { return i >= 0 && i < 26 ? SYNC_STEP_NAMES[i] : "?"; }
 #define INIT_SYNC_PHASE 0xd8
+static int g_invasion_ended;  // the invasion itself ended (not just a search): no "cancelled" notice
 #define MOVE_LOAD_WAIT_MS  60000
 #define MOVE_SCENE_WAIT_MS 90000
 static void enter_watch(char *sm) {
@@ -1894,6 +1971,22 @@ static void enter_watch(char *sm) {
              "next map %08x pending block %08x map exit %d context mode %d players %d | ctrl +40 %d +44 %d | block %08x",
              t, now[0], now[1], now[2], sync_step_name(now[2]), now[7], now[3], now[4], now[5], now[8], now[9], now[10],
              now[11], now[12], now[13], now[6]);
+    }
+    // Full world state: the sync steps ProgressInfo, EventState, MapOwnerInitSync (7-9), MapInitState
+    // (14), NonActiveBlockInfo (23) and others ask the host only when sync +0xe5 is set (0xdcd260 sets it
+    // only for a role-8 rejoin, from gm+0xc96); the host answers every subtype for a member it flags
+    // as rejoining (+0xea), which our joiner is. Set before the sync passes step 6.
+    if (g_move_test && sync && now[0] == 6 && now[2] >= 0 && now[2] <= 6 && !sync[0xe5]) {
+        sync[0xe5] = 1;
+        logf("move test: sync +0xe5 set (sync step %d): the client asks the host for the full world state", now[2]);
+    }
+    // Step 20 PreEndRejoinMapEnter (0xdcf210) with +0xe5 waits for sync phase 4, which only a rejoin's
+    // map load sets (HorseWait 0xc347d0 -> 0xdf28d0), then for an answer to subtype 11; run 98a15ff1
+    // stalled there for its 30 s and left. Cleared on reaching step 20, so 20 and 23 run as before
+    // while 7-9, 14, 18 and 19 have asked for the host's state.
+    if (g_move_test && sync && now[2] >= 20 && sync[0xe5]) {
+        sync[0xe5] = 0;
+        logf("move test: sync +0xe5 cleared at sync step %d %s", now[2], sync_step_name(now[2]));
     }
     if (g_move_test && !g_move && now[0] == 6 && now[2] == 10 && now[3] == QM_STEP_NONE) {
         g_move = 1;
@@ -1948,14 +2041,32 @@ static void enter_watch(char *sm) {
     if (now[2] >= 22 && !g_enter_world) {
         g_enter_world = t;
         logf("enter test: world sync at step %d: in the host's world?", now[2]);
+        expedition_log("enter test");
         log_position("enter test");
         log_members(sm, "enter test");
     }
-    if (g_enter_world && !g_enter_effect && t - g_enter_world > 10000 && chr) {
-        g_enter_effect = 1;
+    // The invader's team for the whole invasion: the effect (no time limit: effectEndurance -1 in our
+    // regulation row) is put on 10 s after the world sync reached StartIngame; its team is logged a
+    // second later (the same frame still reads the old team). Death removes it (dontDeleteOnDead 0),
+    // so once it is gone the invader died: decision 3, the invader leaves and returns to its hub.
+    static DWORD applied, check_at;
+    DWORD nowt = GetTickCount();
+    if (g_enter_world && chr && t - g_enter_world > 10000 && !g_enter_effect) {
         team_log("enter test, before the team effect");
         ((void (*)(void *, int, unsigned char))(g_base + RVA_ADD_SPEFFECT))(chr, TEAM_TEST_SPEFFECT, 0);
-        team_log("enter test, after the team effect");
+        g_enter_effect = 1;
+        applied = nowt;
+        check_at = nowt + 1000;
+    }
+    if (check_at && (int)(nowt - check_at) >= 0 && chr) {
+        check_at = 0;
+        team_log("enter test, 1 s after the team effect");
+    }
+    if (g_enter_effect && chr && nowt - applied > 2000 && our_speffect_active(chr) == 0) {
+        team_log("enter test, team effect gone");
+        g_invasion_ended = 1;
+        join_over("invader died (team effect removed)");
+        return;
     }
 }
 // Death while on our team (decision 3: a dead invader leaves the session). The effect goes by rule:
@@ -2224,7 +2335,8 @@ static void toggle_search(const char *where) {
         g_stop_pending = GetTickCount();  // a joined session: the network goes down once the leave is through
     } else set_network(0);  // the search only looks: no session of ours to leave
     clear_notices();
-    notice(g_searching ? 0 : 1);
+    if (g_searching || !g_invasion_ended) notice(g_searching ? 0 : 1);  // after an invasion: no "search cancelled"
+    if (!g_searching) g_invasion_ended = 0;
     logf("invasion: search %s (%s)", g_searching ? "started" : "called off", where);
 }
 
@@ -2289,6 +2401,20 @@ static int move_force(char *ctrl) {
     }
     ctx_log("move test");
     play_state_log("move test, before");
+    {
+        const char *hg = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_GEN_KEY);
+        logf("move test: generator results: ours %x,%x,%x, host's %s", *(unsigned *)(gm + 0xb48), *(unsigned *)(gm + 0xb54),
+             *(unsigned *)(gm + 0xb5c), hg && *hg ? hg : "(none)");
+        // The generator (0x6aec40) leaves its result in gm +0xb48 / +0xb54 / +0xb5c; the next map request
+        // (0xc27870 -> 0x6b06f0) turns them into the current expedition (+0xb4c.. +0xb64) and the map to
+        // load. They have no readable setter (written only by protected code), so the host's values are
+        // written straight into the same fields.
+        unsigned g1, g2, g3;
+        if (hg && sscanf(hg, "%x,%x,%x", &g1, &g2, &g3) == 3) {
+            *(unsigned *)(gm + 0xb48) = g1, *(unsigned *)(gm + 0xb54) = g2, *(unsigned *)(gm + 0xb5c) = g3;
+            logf("move test: generator results set to the host's: %x,%x,%x", g1, g2, g3);
+        }
+    }
     // Play state as a group guest's start sets it (SingleStart 0xb5c010 / GuestReadyWait 0xb545a0:
     // 0x200a20(2) requested mode expedition; 0x200a30 requested +0xdd = 2 so that after the switch
     // +0xdc is 2 and the equipment packet 0xc is sent; gm+0xaf0 cleared with 0x6abae0, or the move
@@ -2313,6 +2439,14 @@ static int move_force(char *ctrl) {
     }
     char *begin = *(char **)(sm + SM_PLAYERS_BEGIN), *stop = *(char **)(sm + SM_PLAYERS_BEGIN + 8);
     int members = begin && stop >= begin ? (int)((stop - begin) / SM_PLAYER_SIZE) : 0;
+    // Decision 11: the player count in the menu does not apply to invasions. The invader's context is
+    // put in mode 1 (what "1 player" gives; the run of 5c775057 entered the host's world that way): no
+    // count check and no online-flag wait in MoveMapStart, MoveMap lets go at once (+0x10a).
+    if ((unsigned char)ctx[0x9d] != 1) {
+        unsigned char was = (unsigned char)ctx[0x9d];
+        ((void (*)(void *, unsigned char))(*(void ***)ctx)[0x48 / 8])(ctx, 1);
+        logf("move test: context mode %u -> %u (context setter vt+0x48)", was, (unsigned char)ctx[0x9d]);
+    }
     unsigned char mode = (unsigned char)ctx[0x9d];
     int expected = *(int *)(ctx + 0x98);
     logf("move test: context mode %u, expected players %d, session members %d, gm+0xb40 %u", mode, expected, members,

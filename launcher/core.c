@@ -38,7 +38,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 9
+#define BUILD_FORMAT 10
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
                               "porbr", "rusru", "spaar", "spaes", "thath", "zhocn", "zhotw"};
@@ -935,7 +935,7 @@ static int build_regulation(const char *game_dir) {
     } else if (no_rain_wanted() && ((area_index = bnd4_find(bundle, PLAY_AREA_PARAM)) < 0 || !no_rain(bnd4_file(bundle, area_index)))) {
         logf_("The game's PlayAreaCreateCommonParam looks different than expected; no-rain cannot be applied.");
     } else {
-        wr32(team_row + 0x08, 0x43340000);   // effectEndurance 180.0 s
+        // effectEndurance stays -1 (the template's): until removed; death removes it
         team_row[0x16D] = 16;                // changeTeamType 16
         wr32(team_row + 0x18C, 300050);      // vfxId1: red phantom look
         if (no_rain_wanted()) logf_("Test option: no rain damage");

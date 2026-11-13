@@ -33,7 +33,10 @@ CHANGES = {131150: 131160,   # expeditionNameId
 
 FIRST_LARGE_ICON, LARGE_ICON = 41820, 41814   # row 0's largeBossIconId; ours (build_icon.py)
 
-# Team test (DLL, "team-test" file): a SpEffect of ours that puts its target on team 16 for 180 s.
+# The invader's team (and the DLL's "team-test"): a SpEffect of ours that puts its target on team 16
+# until it is removed (effectEndurance -1, as the template row and the game's lasting effects have it;
+# death removes it: dontDeleteOnDead stays 0). It was 180 s; re-adding a running SpEffect does not
+# restart its time (run 0a6833c2), so a timed row cannot last an invasion.
 # Copied from row 10101, which equals the most common value in every field (no icon, no vfx, no
 # category, no stat change, never saved: saveCategory -1). Row size 0x400 as in the game's file;
 # field offsets from Smithbox's NR paramdef, checked on the binary rows of the PVP mod (its 300 s
@@ -44,7 +47,7 @@ SPEFFECT_TEMPLATE, SPEFFECT_TEAM_ROW = 10101, 90071610
 SPEFFECT_SIZE = 0x400
 SPEFFECT_ENDURANCE, SPEFFECT_TEAM = 0x08, 0x16D   # effectEndurance f32 (s), changeTeamType u8
 SPEFFECT_VFX1 = 0x18C   # vfxId1 s32: the slot the PVP mod's team-16 row uses (150053 found at +0x18c)
-TEAM_INVADER, TEAM_TEST_SECONDS = 16, 180.0
+TEAM_INVADER, TEAM_TEST_SECONDS = 16, -1.0
 # Red look: SpEffectVfxParam 300050, a vanilla row that only sets phantomParamOverwriteType 2 and
 # phantomParamOverwriteId 60 (PhantomParam 60, "Red Phantom" in Smithbox's row names); vanilla
 # SpEffects 14559, 18698 and 99860 use it.
@@ -217,7 +220,7 @@ def main(src, dst, no_row=False, rain=True):
         assert struct.unpack_from("<f", p, off + SPEFFECT_ENDURANCE)[0] == TEAM_TEST_SECONDS
         assert p[off + SPEFFECT_TEAM] == TEAM_INVADER
         assert struct.unpack_from("<i", p, off + SPEFFECT_VFX1)[0] == RED_PHANTOM_VFX
-        print(f"regulation.bin: SpEffectParam row {SPEFFECT_TEAM_ROW} (team {TEAM_INVADER}, {TEAM_TEST_SECONDS:g} s), {count} rows")
+        print(f"regulation.bin: SpEffectParam row {SPEFFECT_TEAM_ROW} (team {TEAM_INVADER}, until removed), {count} rows")
         p = next(b for n, b in bnd4_read(check) if n.endswith(NPC_PARAM))
         count, = struct.unpack_from("<H", p, 0x0A)
         teams = [p[struct.unpack_from("<q", p, 0x40 + i * 24 + 8)[0] + NPC_TEAM] for i in range(count)
