@@ -81,9 +81,11 @@ static void settings_load(void) {
     if (f) fclose(f);
     if (settings_parse(text, n, g_settings, bad, sizeof bad)) logf("settings: lines not used: %s", bad);
     for (int i = 0; i < SETTINGS_COUNT; i++) {
-        logf("settings: %s = %s (%s)", SETTING_NAMES[i], g_settings[i] > 0 ? "true" : "false",
+        if (g_settings[i] < 0 || !f) g_settings[i] = g_settings[i] < 0 || !f ? (signed char)(-1 - setting_default(i)) : g_settings[i];
+        int v = g_settings[i] < 0 ? -1 - g_settings[i] : g_settings[i];
+        logf("settings: %s = %s (%s)", SETTING_NAMES[i], v ? "true" : "false",
              !f ? "no test-settings.toml next to the DLL, default" : g_settings[i] < 0 ? "not in the file, default" : path);
-        if (g_settings[i] < 0) g_settings[i] = 0;
+        g_settings[i] = (signed char)v;
     }
     for (int i = 0; i < SETTINGS_COUNT; i++)  // the empty marker files of earlier test builds
         for (int txt = 0; txt < 2; txt++) {
@@ -714,6 +716,16 @@ static void play_state_log(const char *who) {
          (unsigned char)pd[0xdc], (unsigned char)pd[0xdd], (unsigned char)pd[0xde], (unsigned char)pd[0xdf],
          (unsigned char)pd[0xe0], gm ? (unsigned char)gm[0xaf0] : 0);
 }
+static void list_state_log(const char *who) {
+    char *ctx = g_qm_ctrl && !IsBadReadPtr(g_qm_ctrl + 0xa8, 8) ? *(char **)(g_qm_ctrl + 0xa8) : NULL;
+    char *gm = *(char **)(g_base + 0x3c13258), *sm = *(char **)(g_base + 0x3c21ec8);
+    char *sy = sm ? *(char **)(sm + 0x1b8) : NULL;
+    logf("%s: state: context mode %d expected %d | gm+0xb40 %d | controller +0x10d %d | sync +0xe5 %d",
+         who, ctx && !IsBadReadPtr(ctx, 0xa0) ? (unsigned char)ctx[0x9d] : -1, ctx && !IsBadReadPtr(ctx, 0xa0) ? *(int *)(ctx + 0x98) : -1,
+         gm ? (unsigned char)gm[0xb40] : -1, g_qm_ctrl ? (unsigned char)g_qm_ctrl[0x10d] : -1,
+         sy && !IsBadReadPtr(sy, 0xe8) ? (unsigned char)sy[0xe5] : -1);
+    play_state_log(who);
+}
 static void diff_log(const char *what, const unsigned *before, const unsigned *after, unsigned words, unsigned base) {
     char text[600] = "";
     int n = 0;
@@ -770,7 +782,95 @@ static void answer_send_hook(void *sm, unsigned long long *to, int packet, int *
     logf("host: join answer 0x%x = %d sent to a member (0 ready, 1 blocked, 2 not expected)", packet, data ? *data : -1);
     ((void (*)(void *, void *, int, void *, unsigned long long))(g_base + RVA_SESSION_SEND_TO))(sm, to, packet, data, size);
 }
+// Party HUD (health bars of the other players). 0x7da8b0 fills the HUD's seven member slots
+// (CSFeMan +0xcf28, 0x98 each, 0x7c4a80) from the party member list at game manager +0xdc8
+// (PartyMemberInfo: count +0x14, ids at +0x28 + i*0x30, 0xaed2a0); each id is turned into a ChrIns
+// with 0x518f30 (call at 0x7daaa4); no character, the local player, or a -27 join reason leaves the
+// slot hidden. The list holds every session player whatever its team, so team 16 alone does not
+// hide anything. Here: the invader (our effect on the local player) gets no character for any slot,
+// and a host or squad member gets none for a character carrying our effect.
+static int our_speffect_active(char *chr);
+// Run 09f36c57: hidden both ways until the invader was downed, then shown for good. Two more party
+// list readers fill other member displays (0x7d9f80 lookup 0x7da1f9, 0x7dba10 lookup 0x7dbb1f), and
+// the effect's state may read inactive while downed; so the invader hides all members for the whole
+// invasion (in the host's world), and the host hides every character that has once carried our effect
+// in this session.
+static int g_join_in_world(void);
+static char *g_hud_invaders[4];
+// Who ends a session: every readable call of the session leave (0xdf1180, 44 call sites) and of the
+// client's role-1 timeout leave (0xdf5840) is logged with its call site (the return address) and
+// arguments, before the game's function runs.
+static const unsigned LEAVE_SITES[] = {
+    0xaece55, 0xb1a8d5, 0xb1a932, 0xb1aad5, 0xb4c972, 0xb50169, 0xb54f69, 0xb59332, 0xb5944f, 0xb59991, 0xc37d13,
+    0xc42c03, 0xdcd3da, 0xdcd54a, 0xdcdb2a, 0xdce6ca, 0xddd06c, 0xdce892, 0xdcebaa, 0xdced7a, 0xdcef2a, 0xdcf0ea,
+    0xdcf2ba, 0xdcf46a, 0xdcf62a, 0xdcfc0a, 0xdcfeda, 0xdf17ae, 0xdf2db8, 0xdf339a, 0xdf343c, 0xdf3461, 0xdf5404,
+    0xdf695d, 0xdf5898, 0xdf58c0, 0xdf58d5, 0xdfb75b, 0xdfba0b, 0xdfdd1a, 0xdf3855, 0xdf389c, 0xdf3bbb, 0x58f9c1};
+static unsigned long long leave_hook(char *sm, unsigned long long arg) {
+    unsigned site = (unsigned)((char *)__builtin_return_address(0) - g_base) - 5;
+    logf("session leave (0xdf1180) called from %x, argument %llu, lobby_state %u role %u", site, arg & 0xff,
+         sm ? *(unsigned *)(sm + 0xc) : 0, sm ? *(unsigned *)(sm + 0x10) : 0);
+    return ((unsigned long long (*)(char *, unsigned long long))(g_base + 0xdf1180))(sm, arg);
+}
+static unsigned long long leave_timeout_hook(char *sm, unsigned long long arg) {
+    logf("session leave (0xdf5840, the client's 30 s answer timeout) called, argument %llu, lobby_state %u role %u", arg & 0xff,
+         sm ? *(unsigned *)(sm + 0xc) : 0, sm ? *(unsigned *)(sm + 0x10) : 0);
+    return ((unsigned long long (*)(char *, unsigned long long))(g_base + 0xdf5840))(sm, arg);
+}
+// Every front-end lookup of a character by id (0x518f30 from the HUD code at 0x7c..-0x7d..). Only the
+// party bar panel's lookup hides anything on the host (0x7daaa4: a character that carries our effect);
+// on the invader the three party-list displays hide every other player. All other sites are passed
+// through and only counted, logged on the invader every 10 s, to name the display that still shows
+// the host's bar.
+static const unsigned HUD_SITES[] = {0x7c6fe1, 0x7c817b, 0x7c84cb, 0x7c8c74, 0x7ced59, 0x7cf1d2, 0x7d81ac, 0x7d8dc7,
+                                     0x7d9242, 0x7d93fb, 0x7d9484, 0x7da1f9, 0x7daaa4, 0x7dae8d, 0x7db44b, 0x7db636, 0x7dbb1f};
+#define HUD_SITE_COUNT (sizeof HUD_SITES / sizeof *HUD_SITES)
+static unsigned g_hud_calls[HUD_SITE_COUNT], g_hud_hidden[HUD_SITE_COUNT];
+static char *hud_lookup_hook(void *wcm, unsigned long long *id) {
+    unsigned site = (unsigned)((char *)__builtin_return_address(0) - g_base) - 5;
+    char *c = ((char *(*)(void *, unsigned long long *))(g_base + 0x518f30))(wcm, id);
+    unsigned k = 0;
+    while (k < HUD_SITE_COUNT && HUD_SITES[k] != site) k++;
+    if (k < HUD_SITE_COUNT) g_hud_calls[k]++;
+    char *me = wcm ? *(char **)((char *)wcm + 0x174e8) : NULL;
+    int party = site == 0x7daaa4 || site == 0x7da1f9 || site == 0x7dbb1f;
+    char *out = c;
+    if (c && c != me && party) {
+        int invading = g_join_in_world() || (me && !IsBadReadPtr(me, 0x200) && our_speffect_active(me) == 1);
+        if (invading) out = NULL;
+        else if (site == 0x7daaa4) {
+            for (int i = 0; i < 4; i++)
+                if (g_hud_invaders[i] == c) out = NULL;
+            if (out && !IsBadReadPtr(c, 0x200) && our_speffect_active(c) == 1) {
+                for (int i = 0; i < 4; i++)
+                    if (!g_hud_invaders[i]) {
+                        g_hud_invaders[i] = c;
+                        logf("party HUD: character %p carries our team effect: no bar for it in this session", (void *)c);
+                        break;
+                    }
+                out = NULL;
+            }
+        }
+    }
+    if (!out && c && k < HUD_SITE_COUNT) g_hud_hidden[k]++;
+    if (g_join_in_world()) {
+        static DWORD next;
+        if ((int)(GetTickCount() - next) >= 0) {
+            next = GetTickCount() + 10000;
+            char text[600] = "";
+            for (unsigned i = 0; i < HUD_SITE_COUNT; i++)
+                if (g_hud_calls[i])
+                    snprintf(text + strlen(text), sizeof text - strlen(text), " %x:%u/%u", HUD_SITES[i], g_hud_calls[i], g_hud_hidden[i]);
+            logf("party HUD (invader): lookups per site calls/hidden:%s", text);
+            memset(g_hud_calls, 0, sizeof g_hud_calls), memset(g_hud_hidden, 0, sizeof g_hud_hidden);
+        }
+    }
+    return out;
+}
 static void hook_acceptance(void) {
+    for (unsigned i = 0; i < sizeof LEAVE_SITES / sizeof *LEAVE_SITES; i++)
+        hook_call(LEAVE_SITES[i], 0xdf1180, (void *)leave_hook, "session leave log");
+    hook_call(0xdf3ebd, 0xdf5840, (void *)leave_timeout_hook, "session leave log (timeout)");
+    for (unsigned i = 0; i < HUD_SITE_COUNT; i++) hook_call(HUD_SITES[i], 0x518f30, (void *)hud_lookup_hook, "party HUD lookup");
     hook_call(0xdde88b, RVA_SESSION_SEND_TO, (void *)answer_send_hook, "host join answer send");
     hook_call(0xb4bce6, RVA_GENERATE, (void *)generate_hook_setup, "expedition generation (SingleSetup)");
     hook_call(0xb4d937, RVA_GENERATE, (void *)generate_hook_other, "expedition generation (0xb4cc40)");
@@ -945,8 +1045,39 @@ static void preselect_invasion(char *grid) {
     ((void *(*)(void *, void *))(g_base + RVA_VECTOR_ASSIGN))(request + 0x50, source);
 }
 
+// Diagnostics for the Target list (an entry missing after an invasion): which builder the dialog's
+// selector (0x9e7ee5, a fragment) calls, at 0x9e7fd3 (_CreateBossList 0x9e9330) or 0x9e7fcc (the
+// second builder 0x9e9b60), and the state an invasion changes, logged with every list shown.
+static const char *g_list_builder = "?";
+static void list_state_log(const char *who);
+static void builder_main_hook(void *dialog) {
+    g_list_builder = "_CreateBossList";
+    ((void (*)(void *))(g_base + 0x9e9330))(dialog);
+}
+static void builder_second_hook(void *dialog) {
+    g_list_builder = "second builder";
+    ((void (*)(void *))(g_base + 0x9e9b60))(dialog);
+}
 static void show_boss_list_hook(void *grid, char *list, void *a3, void *a4) {
+    {
+        char *b1 = *(char **)(list + 0x10), *e1 = *(char **)(list + 0x18);
+        int has = 0;
+        for (char *it = b1; b1 && it + 0x28 <= e1; it += 0x28) has |= *(int *)(it + 0x10) == INVASION_ROW;
+        logf("target list: built by %s, %u items, row %d %s", g_list_builder, b1 && e1 >= b1 ? (unsigned)((e1 - b1) / 0x28) : 0,
+             INVASION_ROW, has ? "present" : "not present");
+        list_state_log("target list");
+        g_list_builder = "?";
+    }
     preselect_invasion(grid);
+    {  // the second builder (_CreateBossList_Debug, 0x9e9b60) may already list our row
+        char *b0 = *(char **)(list + 0x10), *e0 = *(char **)(list + 0x18);
+        for (char *it = b0; b0 && it + 0x28 <= e0; it += 0x28)
+            if (*(int *)(it + 0x10) == INVASION_ROW) {
+                logf("target list: Invasion already in the list (%u items)", (unsigned)((e0 - b0) / 0x28));
+                ((void (*)(void *, void *, void *, void *))(g_base + RVA_SHOW_BOSS_LIST))(grid, list, a3, a4);
+                return;
+            }
+    }
     _Alignas(16) char item[0x40];  // a MatchingNightBossViewItem is 0x28 bytes
     ((void *(*)(void *, int, unsigned char, unsigned char))(g_base + RVA_BOSS_ITEM_CTOR))(item, INVASION_ROW, 0, 0);
     ((void (*)(void *, void *))(g_base + RVA_BOSS_ITEM_PUSH))(list, item);
@@ -1010,6 +1141,16 @@ static void hook_target_list(void) {
     stub[10] = 0xFF; stub[11] = 0xE0;
     if (patch_rel32(site + 1, site + 5, stub)) logf("target list: hooked (stub at %p)", (void *)stub);
     else logf("target list: cannot patch the jump site");
+    // The other builder the dialog uses (0x9e9b60, chosen by a flag in 0x9e7ee5) ends with the same
+    // jump to the list view at 0x9e9d82: after an invasion the list came without our entry and without
+    // any line from the hook above, so that path is covered too.
+    unsigned char *site2 = (unsigned char *)g_base + 0x9e9d82;
+    int expected2 = (int)(RVA_SHOW_BOSS_LIST - (0x9e9d82 + 5));
+    if (site2[0] == 0xE9 && !memcmp(site2 + 1, &expected2, 4) && patch_rel32(site2 + 1, site2 + 5, stub))
+        logf("target list: second builder hooked (0x9e9d82)");
+    else logf("target list: second builder jump not as expected, not hooked");
+    hook_call(0x9e7fd3, 0x9e9330, (void *)builder_main_hook, "target list builder (_CreateBossList)");
+    hook_call(0x9e7fcc, 0x9e9b60, (void *)builder_second_hook, "target list builder (second)");
 }
 
 // --- "Number of Players": a fourth option --------------------------------------------------------
@@ -1363,27 +1504,35 @@ static void member_flags_log(const char *who, char *sm) {
 #define RVA_SM_SET_INGAME     0xdf28e0  // sm+0x10 = 7, sm+0x74c = 0
 #define RVA_SM_REQUEST_STATE  0xdf20c0  // packet 10 to every member with +0xe2
 static int g_host_switched, g_host_old_dc;
-// Host: the invader's character, once it exists. Read only: the world character manager keeps the
-// local player at +0x174e8; the slots after it are tried as other players' ChrIns, accepted only with
-// the same vtable as the local player's. Team byte +0x74 and whether our team SpEffect is on it.
+static char *g_hud_invaders[4];
 static int our_speffect_active(char *chr);
+// Host: the invader's character, once it exists. Network players are in the player set at the world
+// character manager +0x9a40: vt[0] the count, vt[1](set, i) the i-th ChrIns, as the play-area update
+// walks it (0x696170); the network character is created into it by 0x518280 (0xc445a0). Logged on
+// change: base team +0x74, effective team (0x3d1b30) and whether our team SpEffect is on it.
 static void remote_chr_log(void) {
     static DWORD next;
-    static char last[200];
+    static char last[300] = "?";
     if ((int)(GetTickCount() - next) < 0) return;
     next = GetTickCount() + 5000;
     char *wcm = *(char **)(g_base + 0x3c0f0a8), *me = wcm ? *(char **)(wcm + 0x174e8) : NULL;
-    if (!me || IsBadReadPtr(me, 8)) return;
-    char text[200] = "";
-    for (int k = 1; k < 6; k++) {
-        char *c = *(char **)(wcm + 0x174e8 + 8 * k);
-        if (!c || IsBadReadPtr(c, 0x200) || *(void **)c != *(void **)me) continue;
-        snprintf(text + strlen(text), sizeof text - strlen(text), " [slot %d team %u effect %d]", k,
-                 (unsigned char)c[0x74], our_speffect_active(c));
+    if (!wcm) return;
+    void **set = (void **)(wcm + 0x9a40);
+    if (IsBadReadPtr(set, 8) || IsBadReadPtr(*(void ***)set, 16)) return;
+    void **vt = *(void ***)set;
+    int count = ((int (*)(void *))vt[0])(set);
+    char text[300] = "";
+    for (int i = 0; i < count && i < 8; i++) {
+        char *c = ((char *(*)(void *, unsigned long long))vt[1])(set, (unsigned long long)i);
+        if (!c || c == me || IsBadReadPtr(c, 0x200)) continue;
+        unsigned char team = 0;
+        ((unsigned char *(*)(void *, unsigned char *))(g_base + 0x3d1b30))(c, &team);
+        snprintf(text + strlen(text), sizeof text - strlen(text), " [%d: base team %u effective %u our effect %d]", i,
+                 (unsigned char)c[0x74], team, our_speffect_active(c));
     }
     if (strcmp(text, last)) {
         snprintf(last, sizeof last, "%s", text);
-        logf("host: other player characters:%s", text[0] ? text : " none found");
+        logf("host: other player characters (%d in the player set):%s", count, text[0] ? text : " none");
     }
 }
 static void host_member_sync(char *sm) {
@@ -1423,6 +1572,7 @@ static void host_member_sync(char *sm) {
             play_state_log("host, no member left");
         }
         logf("host: no member left; session role back to 5 for the next arrival");
+        memset(g_hud_invaders, 0, sizeof g_hud_invaders);
     }
     if (*(int *)(sm + 0x10) == 7) g_host_switched = 1;
     if (g_host_switched) remote_chr_log();
@@ -1640,13 +1790,16 @@ static void join_test_start(void) {
 }
 // Every frame while joining: one line per change of the session's state, with ms since the call.
 static void join_watch(char *sm) {
-    static unsigned last[6];
+    static unsigned last[12];
     static unsigned long long last_end;
     static DWORD logged_for;  // g_join_tick of the join last logged: a new join always gets a first line
     char *begin = *(char **)(sm + SM_PLAYERS_BEGIN), *end = *(char **)(sm + SM_PLAYERS_BEGIN + 8);
-    unsigned now[6] = {*(unsigned *)(sm + SM_LOBBY_STATE), *(unsigned *)(sm + SM_HANDLE), *(unsigned *)(sm + SM_JOIN_HANDLE),
-                       *(unsigned *)(sm + 0x10), begin && end >= begin ? (unsigned)((end - begin) / SM_PLAYER_SIZE) : 0,
-                       (unsigned char)sm[SM_LEAVING]};
+    char *sy = *(char **)(sm + 0x1b8);
+    if (sy && IsBadReadPtr(sy, 0xe8)) sy = NULL;
+    unsigned now[12] = {*(unsigned *)(sm + SM_LOBBY_STATE), *(unsigned *)(sm + SM_HANDLE), *(unsigned *)(sm + SM_JOIN_HANDLE),
+                        *(unsigned *)(sm + 0x10), begin && end >= begin ? (unsigned)((end - begin) / SM_PLAYER_SIZE) : 0,
+                        (unsigned char)sm[SM_LEAVING], (unsigned char)sm[0x1a], (unsigned char)sm[0x1b], (unsigned char)sm[0x1d],
+                        (unsigned char)sm[0x1f], sy ? (unsigned char)sy[0xd8] : 0xff, sy ? *(unsigned *)(sy + 0x40) : 0xff};
     unsigned long long end_code = *(unsigned long long *)(sm + SM_END_CODE);
     if (!memcmp(now, last, sizeof now) && end_code == last_end && logged_for == g_join_tick) return;
     logged_for = g_join_tick;
@@ -1654,9 +1807,11 @@ static void join_watch(char *sm) {
     memcpy(last, now, sizeof now);
     last_end = end_code;
     char *eac = *(char **)(g_base + RVA_EAC_MAN_PTR);
-    logf("join test: +%lums lobby_state %u handle %u join %u role %u players %u leaving %u end_code %llx | eac error %u (0x%x)",
+    logf("join test: +%lums lobby_state %u handle %u join %u role %u players %u leaving %u end_code %llx | eac error %u (0x%x) | "
+         "sm +1a %u +1b %u +1d %u +1f %u | sync phase %u step %u",
          GetTickCount() - g_join_tick, now[0], now[1], now[2], now[3], now[4], now[5], end_code,
-         eac ? *(unsigned *)(eac + EAC_ERROR) : 0, eac ? *(unsigned *)(eac + EAC_ERROR) : 0);
+         eac ? *(unsigned *)(eac + EAC_ERROR) : 0, eac ? *(unsigned *)(eac + EAC_ERROR) : 0, now[6], now[7], now[8], now[9],
+         now[10], now[11]);
     if (members_changed) log_members(sm, "join test");
 }
 // The game manager's pending multiplayer state: where a joining player is put on the next map
@@ -1692,11 +1847,31 @@ static void log_pending_state(const char *who) {
 // join set-up (0xb51070) clears +0x10d first. Inferred: +0x10d left at 1 is why the next
 // "Invasion" sent no start request; so it is logged, and cleared when the join test ends.
 static void toggle_search(const char *where);
-static int g_move, g_move_online;
+static int g_move, g_move_online, g_ctx_old_mode;
+static unsigned g_saved_pending[4];  // pending block, +0xaac, type +0xdc0, reason +0xdbc before the forced step
+static int g_saved_pending_valid;
 #define RVA_QM_UNREGISTER 0xb52ef0  // void (ctrl*): if step != 0, cancel the job chain, set step 25
 static int g_invasion_ended;
 static void join_over(const char *why) {
     g_join = 3;
+    if (g_saved_pending_valid) {  // the pending map state we set at the forced step goes back
+        unsigned blk = g_saved_pending[0];
+        ((void (*)(unsigned *))(g_base + 0x6b0610))(&blk);
+        ((void (*)(unsigned char))(g_base + 0x6b05f0))((unsigned char)g_saved_pending[1]);
+        ((void (*)(unsigned char))(g_base + 0x6b0410))((unsigned char)g_saved_pending[2]);
+        ((void (*)(int))(g_base + 0x6b0520))((int)g_saved_pending[3]);
+        g_saved_pending_valid = 0;
+        logf("join test: pending map state back to block %08x +aac %u type %u reason %d", g_saved_pending[0],
+             g_saved_pending[1], g_saved_pending[2], (int)g_saved_pending[3]);
+    }
+    if (g_ctx_old_mode && g_qm_ctrl) {  // the context mode we forced to 1 at the forced step goes back
+        char *cx = *(char **)(g_qm_ctrl + 0xa8);
+        if (cx && !IsBadReadPtr(cx, 0xa0) && *(char **)cx == g_base + 0x2c75d20) {
+            ((void (*)(void *, unsigned char))(*(void ***)cx)[0x48 / 8])(cx, (unsigned char)g_ctx_old_mode);
+            logf("join test: context mode back to %u", (unsigned char)cx[0x9d]);
+        }
+        g_ctx_old_mode = 0;
+    }
     {  // a clean start for the next invasion: our +0xe5 on the world sync object goes
         char *sm0 = *(char **)(g_base + RVA_SESSION_MAN_PTR), *sy = sm0 ? *(char **)(sm0 + 0x1b8) : NULL;
         if (sy && !IsBadReadPtr(sy, 0xe8) && sy[0xe5]) sy[0xe5] = 0, logf("join test: sync +0xe5 cleared");
@@ -1762,6 +1937,16 @@ static void join_frame(void) {
             logf("join test: lobby_state %u leaving %u, the manager would refuse a join", state, (unsigned char)sm[SM_LEAVING]);
             join_over("session manager busy");
             return;
+        }
+        {   // Run 09f36c57: every repeated join in one game session failed at once, and its sync object
+            // still held the last invasion's phase (5 or 6; a first join starts at 0). The phase is
+            // written by the sync start only for the role-8 path and by the steps; put it back to 0.
+            char *sy = *(char **)(sm + 0x1b8);
+            if (sy && !IsBadReadPtr(sy, 0xe8) && sy[0xd8]) {
+                logf("join test: sync phase %u left from the last session, set back to 0", (unsigned char)sy[0xd8]);
+                sy[0xd8] = 0;
+            }
+            if (sm[0x1d]) logf("join test: session manager +0x1d (a deferred leave) is %u before the join", (unsigned char)sm[0x1d]);
         }
         g_join_data[0] = g_candidate;
         void *vector[2] = {g_join_data, g_join_data + 1};  // {begin, end}, as 0xdf0f70 reads it
@@ -1950,6 +2135,7 @@ static const char *sync_step_name(int i) { return i >= 0 && i < 26 ? SYNC_STEP_N
 static int g_invasion_ended;  // the invasion itself ended (not just a search): no "cancelled" notice
 #define MOVE_LOAD_WAIT_MS  60000
 #define MOVE_SCENE_WAIT_MS 90000
+static int g_join_in_world(void) { return g_join == 4 && g_enter_world; }
 static void enter_watch(char *sm) {
     static int last[14] = {-9, -9, -9, -9, -9, -9, -9, -9, -9, -9, -9, -9, -9, -9};
     char *sync = *(char **)(sm + SM_INIT_SYNC), *gm = *(char **)(g_base + RVA_GAME_MAN_PTR), *chr = local_player();
@@ -1976,7 +2162,7 @@ static void enter_watch(char *sm) {
     // (14), NonActiveBlockInfo (23) and others ask the host only when sync +0xe5 is set (0xdcd260 sets it
     // only for a role-8 rejoin, from gm+0xc96); the host answers every subtype for a member it flags
     // as rejoining (+0xea), which our joiner is. Set before the sync passes step 6.
-    if (g_move_test && sync && now[0] == 6 && now[2] >= 0 && now[2] <= 6 && !sync[0xe5]) {
+    if (g_move_test && setting(S_FULL_SYNC) && sync && now[0] == 6 && now[2] >= 0 && now[2] <= 6 && !sync[0xe5]) {
         sync[0xe5] = 1;
         logf("move test: sync +0xe5 set (sync step %d): the client asks the host for the full world state", now[2]);
     }
@@ -2424,6 +2610,12 @@ static int move_force(char *ctrl) {
     if (gm[0xaf0]) ((void (*)(void))(g_base + 0x6abae0))();
     play_state_log("move test, after");
     pending_log("before");
+    {
+        char *g0 = *(char **)(g_base + 0x3c13258);
+        g_saved_pending[0] = *(unsigned *)(g0 + 0xa74), g_saved_pending[1] = (unsigned char)g0[0xaac];
+        g_saved_pending[2] = (unsigned char)g0[0xdc0], g_saved_pending[3] = *(unsigned *)(g0 + 0xdbc);
+        g_saved_pending_valid = 1;
+    }
     ((void (*)(unsigned *))(g_base + RVA_SET_PENDING_BLOCK))(&block);
     ((void (*)(unsigned char))(g_base + RVA_SET_PENDING_AAC))(1);
     ((void (*)(unsigned char))(g_base + RVA_SET_PENDING_TYPE))(14);
@@ -2442,6 +2634,7 @@ static int move_force(char *ctrl) {
     // Decision 11: the player count in the menu does not apply to invasions. The invader's context is
     // put in mode 1 (what "1 player" gives; the run of 5c775057 entered the host's world that way): no
     // count check and no online-flag wait in MoveMapStart, MoveMap lets go at once (+0x10a).
+    g_ctx_old_mode = (unsigned char)ctx[0x9d] | 0x100;
     if ((unsigned char)ctx[0x9d] != 1) {
         unsigned char was = (unsigned char)ctx[0x9d];
         ((void (*)(void *, unsigned char))(*(void ***)ctx)[0x48 / 8])(ctx, 1);
@@ -2475,7 +2668,12 @@ static int move_force(char *ctrl) {
     return 1;
 }
 
+static int cursor_on_invasion(char *dialog);
+static char *g_dialog;
+static DWORD g_request_tick;
 static void step_hook(void *ctrl, void *time, int step) {
+    static int last_seen_start = -1;
+    if (step == QM_STEP_NONE) last_seen_start = -1;
     static int last = -1;
     g_qm_ctrl = ctrl;
     g_qm_step = step;
@@ -2498,6 +2696,15 @@ static void step_hook(void *ctrl, void *time, int step) {
         join_frame();  // enter test: the game may be taking the client into the host's world; network stays up
         if (g_join == 3) return;  // just stopped (and a forced step may have been set back): skip this frame's step
     } else if (step != QM_STEP_NONE) {
+        // Safety net (run 6e9bdd30: after an invasion the menu's start reached SingleStart without the
+        // fill-context call our choice is read in): a start with the cursor on Invasion is an invasion,
+        // whatever path led to it.
+        if (step == 12 && !g_invasion_pending && !g_searching && step != last_seen_start && cursor_on_invasion(g_dialog) == 1) {
+            logf("invasion: SingleStart reached with the cursor on Invasion without a start request we saw; treated as an invasion");
+            g_invasion_pending = 1;
+            g_request_tick = GetTickCount();
+        }
+        last_seen_start = step;
         if (g_invasion_pending) {
             void **vt = *(void ***)ctrl;
             ((void (*)(void *, int))vt[QM_CTRL_VT_SET_STEP])(ctrl, QM_STEP_NONE);

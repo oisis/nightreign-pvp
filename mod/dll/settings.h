@@ -6,9 +6,11 @@
 #include <stddef.h>
 #include <string.h>
 
-enum { S_HOST_TEST, S_JOIN_TEST, S_ENTER_TEST, S_MOVE_TEST, S_TEAM_TEST, S_NO_RAIN, S_SLOW_TIME, SETTINGS_COUNT };
+enum { S_HOST_TEST, S_JOIN_TEST, S_ENTER_TEST, S_MOVE_TEST, S_TEAM_TEST, S_NO_RAIN, S_SLOW_TIME, S_FULL_SYNC, SETTINGS_COUNT };
 static const char *const SETTING_NAMES[SETTINGS_COUNT] = {"host-test", "join-test", "enter-test", "move-test",
-                                                          "team-test", "no-rain",   "slow-time"};
+                                                          "team-test", "no-rain",   "slow-time", "full-sync"};
+// Settings that are on when the file does not mention them.
+static int setting_default(int i) { return i == S_FULL_SYNC; }
 
 static int settings_word(const char *s, size_t n, const char *w) {  // case-insensitive, whole word
     size_t i = 0;

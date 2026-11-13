@@ -873,11 +873,11 @@ static int load_settings(const char *path, signed char v[SETTINGS_COUNT]) {  // 
     buf t = read_file(path);
     char bad[300];
     if (!t.p) {
-        for (int i = 0; i < SETTINGS_COUNT; i++) v[i] = 0;
+        for (int i = 0; i < SETTINGS_COUNT; i++) v[i] = setting_default(i);
         return 0;
     }
     if (settings_parse((const char *)t.p, t.n, v, bad, sizeof bad)) logf_("test-settings.toml: ignored: %s", bad);
-    for (int i = 0; i < SETTINGS_COUNT; i++) if (v[i] < 0) v[i] = 0;
+    for (int i = 0; i < SETTINGS_COUNT; i++) if (v[i] < 0) v[i] = setting_default(i);
     free(t.p);
     return 1;
 }
@@ -1496,11 +1496,11 @@ int core_selftest(void) {
                                 "nope = true\r\nteam-test = yes\r\n\r\nno-rain = false";
         signed char v[SETTINGS_COUNT];
         char bad[64];
-        static const signed char want[SETTINGS_COUNT] = {1, 0, -1, -1, -1, 0, 1};
+        static const signed char want[SETTINGS_COUNT] = {1, 0, -1, -1, -1, 0, 1, -1};
         int good = settings_parse(t, sizeof t - 1, v, bad, sizeof bad) == 2 && !memcmp(v, want, sizeof v) &&
                    !strcmp(bad, "nope = true, team-test = yes");
         good = good && !load_settings("/nonexistent/test-settings.toml", v);
-        for (int i = 0; i < SETTINGS_COUNT; i++) good = good && v[i] == 0;
+        for (int i = 0; i < SETTINGS_COUNT; i++) good = good && v[i] == setting_default(i);
         if (!good) { ok = 0; logf_("selftest: test settings parser failed"); }
     }
     if (ok) logf_("selftest ok");
