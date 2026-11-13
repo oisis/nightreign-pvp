@@ -86,3 +86,8 @@ launcher's folder. Attach that file to your report.
 or Bandai Namco. It contains no game files: everything it needs is built from your own copy of
 the game. It includes the [me3](https://github.com/garyttierney/me3) mod loader (MIT /
 Apache-2.0).*
+
+## Links
+
+- [Nexus Mods](https://www.nexusmods.com/eldenringnightreign/mods/967)
+- [Discord](https://discord.gg/nGDhbA2aNV)
