@@ -62,7 +62,7 @@ static const char *const KEY_LINES[] = {
     "host: session up", "host: expedition reached", "host: expedition over", "host: member admitted", "role: ",
     "host: no member left", "leave done", "join: search started", "joining lobby", "join -> ", "stopping (",
     "in the host's world", "world sync at step", "invasion won", "invasion lost", "invasion neither", "level: ", "map test", "two-regions", "expedition: result", "reward test: won", "reward test: lost",
-    "expedition end requested", "still down", "watchdog", "no map load", "went back", "code patch", "crash"};
+    "expedition end requested", "flags: ", "map test",  "still down", "watchdog", "no map load", "went back", "code patch", "crash"};
 static void logf(const char *fmt, ...) {
     char line[1024];
     va_list ap;
@@ -103,7 +103,9 @@ static void settings_load(void) {
     for (int i = 0; i < SETTINGS_COUNT; i++) {
         if (g_settings[i] < 0 || !f) g_settings[i] = g_settings[i] < 0 || !f ? (signed char)(-1 - setting_default(i)) : g_settings[i];
         int v = g_settings[i] < 0 ? -1 - g_settings[i] : g_settings[i];
-        logf("settings: %s = %s (%s)", SETTING_NAMES[i], v ? "true" : "false",
+        char num[8];
+        snprintf(num, sizeof num, "%d", v);
+        logf("settings: %s = %s (%s)", SETTING_NAMES[i], setting_is_number(i) ? num : v ? "true" : "false",
              !f ? "no test-settings.toml next to the DLL, default" : g_settings[i] < 0 ? "not in the file, default" : path);
         g_settings[i] = (signed char)v;
     }
@@ -786,14 +788,18 @@ static void generate_hook(unsigned long long a1, unsigned long long a2, unsigned
     // unpickable, runs 30..36). Its region argument v3 (rare map layer, u8: the region the player chose)
     // becomes the Mountaintop (1); the launcher left a weight only on the Mountaintop sets, so one of the
     // Mountaintop patterns is drawn (two-regions: with the Rotted Woods added by the launcher).
-    if ((setting(S_MAP_CONTROL) || setting(S_TWO_REGIONS)) && g_join != 4 && v3 && !IsBadReadPtr(v3, 32)) {
+    // map-region (test): the region digit asked for (1..5); 9 (plain sets) leaves the argument alone, plain
+    // sets are always candidates. The launcher left weights only on that region's sets.
+    // one-region (measurement only): that region's digit; the launcher left weights only on its sets.
+    int want = g_settings[S_ONE_REGION] >= 1 && g_settings[S_ONE_REGION] <= 5 ? g_settings[S_ONE_REGION] : 1;  // decision 35: Mountaintop / plain sets
+    if (want && g_join != 4 && v3 && !IsBadReadPtr(v3, 32)) {
         unsigned char *b = v3[1], *e = v3[2], *cap = v3[3];
         if (b && e > b) {
-            for (unsigned char *q = b; q < e; q++) *q = 1;
-            logf("map test: generator region argument set to the Mountaintop (1)");
+            for (unsigned char *q = b; q < e; q++) *q = (unsigned char)want;
+            logf("map test: generator region argument set to %d", want);
         } else if (b && e == b && cap > e) {
-            *e = 1, v3[2] = e + 1;
-            logf("map test: generator region argument was empty; the Mountaintop (1) added");
+            *e = (unsigned char)want, v3[2] = e + 1;
+            logf("map test: generator region argument was empty; %d added", want);
         } else
             logf("map test: generator region argument not usable; the draw stays the game's own");
     }
@@ -1347,13 +1353,16 @@ static char *map_model_hook(char *model, unsigned long long a2) {
 // model's +0xa0 list, the same other-player pins the compass reads (self: "PlayerList" over +0x78).
 // Logged: which model the map screen gets; the pin dump below follows that model.
 static char *volatile g_map_dialog_model;
+static void md_pins(const char *when);
 static void *map_dialog_hook(void *a, void *b, void *c, unsigned long long d, char *model) {
     g_map_dialog_model = model;
     int kind = -1;
     for (int k = 0; k < 3; k++)
         if (g_view_models[k] == model) kind = k;
     logf("marker test: map screen built with view model %p (kind %d of the models seen)", (void *)model, kind);
-    return ((void *(*)(void *, void *, void *, unsigned long long, char *))(g_base + 0xac53a0))(a, b, c, d, model);
+    void *r = ((void *(*)(void *, void *, void *, unsigned long long, char *))(g_base + 0xac53a0))(a, b, c, d, model);
+    md_pins("map screen built");
+    return r;
 }
 // Map-only hide (decision 19). The map screen's list controls (CS::WorldMapItemControl, built by 0xacd1f0
 // over a pin list) draw through 0xace8e0(control+0x38, list, selected, ...), called at 0xacedf2; the item
@@ -1575,11 +1584,11 @@ static void reward_hook(unsigned long long a1, unsigned a2) {
 // tile scripts (run 35: the Rotted Woods' rot works with the Mountaintop as the map type). The patterns
 // are the game's Mountaintop ones (40g+20..24) with the Rotted Woods added by the launcher; the map type
 // stays the Mountaintop's (what its cold and ice dragon need, runs 33..35). Here, once per map request:
-// 7603 (the Rotted Woods, tile variant 3) into the list, the real event flags 7601 / 7603 on and the other
-// region flags off. Host and invader alike. Event flag calls: 0x5e7260 get (man, &id, tag), 0x5e79f0 set
+// 7603 (the Rotted Woods, tile variant 3) appended to the list (the game puts only the record's last region
+// flag, 7601, there: 0x6b06f0). The event flags come from the record (the launcher puts a 7603 row before
+// 7601; OnMapEnter sets both). Host and invader alike. Event flag calls: 0x5e7260 get (man, &id, tag), 0x5e79f0 set
 // (man, &id, on, tag, notify 0, 0), the manager at 0x3c115a8.
-static int two_pattern(unsigned pat) { return pat < 320 && pat % 40 >= 20 && pat % 40 < 25; }
-static const int TWO_ON[1] = {7601}, TWO_OFF[4] = {7600, 7602, 7604, 7605};  // 7603 later, after the start flight
+static int two_pattern(unsigned pat) { return pat < 320 && pat % 40 < 25; }  // the plain and Mountaintop slots (decision 35)
 static int two_flag(int id, int set, int on) {  // set: 0 read, 1 write
     char *man = *(char **)(g_base + 0x3c115a8);
     if (!man) return -1;
@@ -1588,21 +1597,597 @@ static int two_flag(int id, int set, int on) {  // set: 0 read, 1 write
     ((void (*)(char *, int *, char, void *, char, char))(g_base + 0x5e79f0))(man, &id, (char)on, &tag, 0, 0);
     return on;
 }
-static void two_regions_flags(void) {
-    char line[160] = "";
-    for (int i = 0; i < 1; i++)
-        if (two_flag(TWO_ON[i], 0, 0) == 0) two_flag(TWO_ON[i], 1, 1), snprintf(line + strlen(line), sizeof line - strlen(line), " +%d", TWO_ON[i]);
-    for (int i = 0; i < 4; i++)
-        if (two_flag(TWO_OFF[i], 0, 0) == 1) two_flag(TWO_OFF[i], 1, 0), snprintf(line + strlen(line), sizeof line - strlen(line), " -%d", TWO_OFF[i]);
-    logf("two-regions: event flags at the map request:%s", line[0] ? line : " nothing to change");
+// Event flags (CS::CSFD4VirtualMemoryFlag; manager 0x3c115a8, built by 0x5e3ed0 -> 0x60c500(heap, 7, 3)):
+// +0x1c flags per block (1000), +0x20 bytes per block (125), +0x28 one buffer of block slots, +0x38 a
+// std::map block number (id / 1000) -> node {+0x20 key, +0x28 kind, +0x30 slot or pointer}: kind 1 = slot
+// in the +0x28 buffer (slot * 125), kind 2 = a buffer of its own (blocks kept from the save, map +0x160).
+// Bit = 7 - (rest & 7) of byte rest >> 3. Read 0x60ce40 (from get 0x5e7260), write 0x60d330 (from the
+// two setters 0x5e79f0 and 0x5e7740, which every script and code write ends in). No block: the read gives
+// 0 and the write is dropped without a word. The blocks are laid out again at every map load (MoveMapStep
+// 0xc2fc30 -> 0x5e7d40 tile list, 0x5e6b90 layout; mode 1 = the expedition (0x5e4f60 keeps blocks and rebuilds the tile list), mode 0 = the hub and leaving (fresh)): 0..9 (ids 0..9999),
+// 60..99 (60000..99999), and for each field tile of the 4x4 grid m60_42..45_36..39 (0x7623c0), taken
+// through its Shifting Earth variant (0x6ab690 -> CalcGetReplaceMapIdByDisaster 0x6ab7a0, from gm +0xbb8),
+// blocks 1000000 + ((X%10*10 + Y%10)*10 + variant)*100 + d, d in {0,2,4,5,7,8,9}: a ten-digit id reads
+// 10 X Y V dd nnn (1056300800: tile x5_x6, variant 3, d 0, flag 800). A tile flag of a variant that is
+// not the one laid out for that tile has no block. flag_state: 1 / 0, -1 no block, -2 no manager.
+static char *flag_man(void) {
+    char *man = *(char **)(g_base + 0x3c115a8);
+    return man && !IsBadReadPtr(man, 0x40) && *(unsigned *)(man + 0x1c) ? man : NULL;
+}
+static char *flag_block(char *man, unsigned key) {  // the block's bytes, NULL when there is none
+    char *head = *(char **)(man + 0x38), *node = head ? *(char **)(head + 8) : NULL, *best = head;
+    while (node && !node[0x19]) {
+        if (*(unsigned *)(node + 0x20) < key) node = *(char **)(node + 0x10);
+        else best = node, node = *(char **)node;
+    }
+    if (!best || best == head || best[0x19] || *(unsigned *)(best + 0x20) > key) return NULL;
+    int kind = *(int *)(best + 0x28);
+    if (kind == 1) return *(char **)(man + 0x28) ? *(char **)(man + 0x28) + (unsigned)(*(int *)(best + 0x30) * *(int *)(man + 0x20)) : NULL;
+    return kind == 2 ? *(char **)(best + 0x30) : NULL;
+}
+static int flag_state_in(char *man, unsigned id) {
+    unsigned div = *(unsigned *)(man + 0x1c), key = id / div, bit = id - key * div;
+    char *data = flag_block(man, key);
+    return data ? (data[bit >> 3] >> (7 - (bit & 7))) & 1 : -1;
+}
+// Every block key in order (std::map: node +0 left, +8 parent, +0x10 right, +0x19 nil). Returns the count.
+static int flag_blocks(char *man, unsigned *keys, int cap) {
+    char *head = *(char **)(man + 0x38), *n = head ? *(char **)head : NULL;
+    int k = 0;
+    while (n && n != head && !n[0x19] && k < 20000) {
+        if (k < cap) keys[k] = *(unsigned *)(n + 0x20);
+        k++;
+        char *r = *(char **)(n + 0x10);
+        if (!r[0x19]) {
+            n = r;
+            while (!(*(char **)n)[0x19]) n = *(char **)n;
+        } else {
+            char *p = *(char **)(n + 8);
+            while (!p[0x19] && n == *(char **)(p + 0x10)) n = p, p = *(char **)(p + 8);
+            n = p;
+        }
+    }
+    return k;
+}
+// flag-log: one line per change (id, new value, seconds since the map load). Writes that change nothing
+// are skipped; a flag changing more than 4 times in 2 s is counted instead and reported once it is quiet.
+// A write whose block is missing is logged once per flag and map load ("dropped").
+#define FLOG_SLOTS 4096
+static struct { unsigned id; DWORD t0, last; int n, hidden, dropped; signed char value; } g_flog[FLOG_SLOTS];
+static CRITICAL_SECTION g_flog_lock;
+static DWORD g_flog_layout_tick;
+static int g_flog_last_mode = -1;  // mode of the last layout (run 32: 1 = the expedition, 0 = hub / leaving), -1 none seen
+static struct { unsigned id; DWORD t; } g_flog_back[8];  // ten-digit flags turned on, read back 5 s later
+static int g_flog_back_n, g_flog_back_logged;
+static double flog_t(void) { return (GetTickCount() - g_flog_layout_tick) / 1000.0; }
+static void flag_note(char *man, unsigned id, int on, int before) {
+    (void)man;
+    if (!setting(S_FLAG_LOG) || before == (on != 0)) return;
+    EnterCriticalSection(&g_flog_lock);
+    unsigned h = (id * 2654435761u) % FLOG_SLOTS;
+    for (int k = 0; k < 64 && g_flog[h].id && g_flog[h].id != id; k++) h = (h + 1) % FLOG_SLOTS;
+    DWORD now = GetTickCount();
+    if (!g_flog[h].id || g_flog[h].id == id) {
+        if (!g_flog[h].id) g_flog[h].id = id, g_flog[h].t0 = now, g_flog[h].n = 0;
+        if (before < 0) {
+            if (!g_flog[h].dropped++) logf("flags: %u -> %d dropped, no block (t %.1f)", id, on != 0, flog_t());
+        } else {
+            if (now - g_flog[h].t0 > 2000) g_flog[h].t0 = now, g_flog[h].n = 0;
+            g_flog[h].last = now, g_flog[h].value = (signed char)(on != 0);
+            if (++g_flog[h].n <= 4) logf("flags: %u -> %d (t %.1f)", id, on != 0, flog_t());
+            else g_flog[h].hidden++;
+        }
+    } else if (before >= 0)
+        logf("flags: %u -> %d (t %.1f; table full)", id, on != 0, flog_t());
+    if (on && before == 0 && id >= 1000000000u && g_flog_back_n < 8) g_flog_back[g_flog_back_n].id = id, g_flog_back[g_flog_back_n++].t = now;
+    LeaveCriticalSection(&g_flog_lock);
+}
+// map-dump (test, read only): one file per own expedition, work/native/map-dump-p<pattern>-<hhmmss>.txt
+// (mapdump.h: opened at the first InGame frame, appended and flushed, closed when the expedition ends; what
+// comes before the opening, i.e. the expedition's flag layout and the flag writes of the map load, is kept in
+// memory and written at the top; layouts and writes outside an expedition never touch a file). Run 32: the
+// expedition's own layout is mode 1; mode 0 is the hub's and the one when leaving. At the layout: the 16 tiles. At the first InGame frame: pattern, seed, map type, region list,
+// start point, the pattern record (0x6ad3e0(0x6ad850()): +0 / +4 play-area rows, +0x18 flag count, +0x24 + 8i
+// flags, +0x19 small-base count, entries 0x3c bytes from +0xc0: +0xc0 i32, +0xc6 AA, +0xc7 BB, +0xcc instance),
+// the flag blocks and every flag that is on; again every flag on at +30 s and +180 s. All the time: every
+// flag write that changes a value or is dropped (no block), with the two callers above the setter (return
+// addresses as offsets in the game), more than 4 changes of one flag in 2 s counted instead. Nothing written.
+#include "mapdump.h"
+static md_state g_mds;
+static int g_md;  // an expedition file is open
+static DWORD g_md_t0;
+static struct { unsigned id; DWORD t0, last; int n, hidden; signed char value; } g_md_seen[4096];
+static void mdf(const char *fmt, ...) {
+    if (!setting(S_MAP_DUMP)) return;
+    char line[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    md_print(&g_mds, "%s", line);
+}
+static void md_flags_on(char *man, const char *when) {
+    static unsigned keys[4096];
+    int n = flag_blocks(man, keys, 4096), total = 0;
+    mdf("== flags on (%s), %d blocks\n", when, n);
+    for (int i = 0; i < n && i < 4096; i++) {
+        char *data = flag_block(man, keys[i]);
+        int first = 1;
+        for (unsigned b = 0; data && b < 1000; b++)
+            if (data[b >> 3] >> (7 - (b & 7)) & 1) {
+                if (first) mdf("block %u:", keys[i]), first = 0;
+                mdf(" %u", keys[i] * 1000 + b), total++;
+            }
+        if (!first) mdf("\n");
+    }
+    mdf("== %d flags on\n", total);
+    md_flush(&g_mds);
+}
+static void md_layout(char *man, int mode) {  // under g_flog_lock
+    if (!setting(S_MAP_DUMP)) return;
+    if (!g_mds.dir[0]) {
+        next_to_dll(g_mds.dir, sizeof g_mds.dir, "x");
+        char *slash = strrchr(g_mds.dir, '\\');
+        if (slash) *slash = 0;
+    }
+    if (g_md) {  // the expedition's file stays as it is; only a note
+        mdf("== layout %d at %.1f s during the expedition (not kept)\n", mode, (GetTickCount() - g_md_t0) / 1000.0);
+        return;
+    }
+    md_layout_begin(&g_mds);
+    g_md_t0 = GetTickCount();
+    memset(g_md_seen, 0, sizeof g_md_seen);
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    md_layout_print(&g_mds, "== layout %d at %02d:%02d:%02d (times below: seconds since this layout)\n", mode, t.wHour, t.wMinute, t.wSecond);
+    for (char *e = *(char **)(man + 0x118); e && e < *(char **)(man + 0x120); e += 8) {
+        unsigned m = *(unsigned *)e;
+        md_layout_print(&g_mds, "tile m%02u_%02u_%02u_%u%u own-variant-flags %d\n", m >> 24, m >> 16 & 0xff, m >> 8 & 0xff, m >> 4 & 0xf, m & 0xf, e[4]);
+    }
+    static unsigned keys[4096];
+    int n = flag_blocks(man, keys, 4096);
+    md_layout_print(&g_mds, "blocks %d:", n);
+    for (int i = 0; i < n && i < 4096; i++) md_layout_print(&g_mds, " %u", keys[i]);
+    md_layout_print(&g_mds, "\n");
+}
+static void md_end(const char *why) {  // the expedition is over
+    if (!g_md) return;
+    EnterCriticalSection(&g_flog_lock);
+    md_close(&g_mds, why);
+    g_md = 0;
+    LeaveCriticalSection(&g_flog_lock);
+}
+static void md_hex(const unsigned char *p, int n) {
+    for (int i = 0; i < n; i++) mdf("%02x", p[i]);
+}
+static void md_entry(void) {  // first InGame frame of an expedition
+    char *man = flag_man(), *gm = *(char **)(g_base + 0x3c13258);
+    if (!g_md || !man || !gm) return;
+    mdf("== map entry (first InGame frame) at %.1f s\n", (GetTickCount() - g_md_t0) / 1000.0);
+    mdf("pattern +b4c %u +b48 %u seed +b54 %u +b5c %u map type +b46 %u +b50 %d\n", *(unsigned *)(gm + 0xb4c),
+        *(unsigned *)(gm + 0xb48), *(unsigned *)(gm + 0xb54), *(unsigned *)(gm + 0xb5c), (unsigned char)gm[0xb46], *(int *)(gm + 0xb50));
+    long long cnt = *(long long *)(gm + 0xbd0);
+    mdf("region list (%lld):", cnt);
+    for (long long i = 0; i < cnt && i < 4; i++) mdf(" %d", ((int *)(gm + 0xbb8))[i]);
+    mdf("\nstart block +a74 %08x pos %.2f %.2f %.2f\n", *(unsigned *)(gm + 0xa74), *(float *)(gm + 0xa78), *(float *)(gm + 0xa7c), *(float *)(gm + 0xa80));
+    int pat = ((int (*)(void))(g_base + 0x6ad850))();
+    unsigned char *rec = pat >= 0 ? ((unsigned char *(*)(int))(g_base + 0x6ad3e0))(pat) : NULL;
+    mdf("record of pattern %d: %p\n", pat, (void *)rec);
+    if (rec && !IsBadReadPtr(rec, 0xc0)) {
+        mdf("record head "), md_hex(rec, 0xc0), mdf("\n");
+        mdf("play area rows %d %d, values %d %d, flags %u, small bases %u\n", ((int *)rec)[0], ((int *)rec)[1], ((int *)rec)[2],
+            ((int *)rec)[3], rec[0x18], rec[0x19]);
+        for (int i = 0; i < rec[0x18]; i++) mdf("record flag %d %d\n", i, *(int *)(rec + 0x24 + 8 * i));
+        for (int i = 0; i < rec[0x19] && !IsBadReadPtr(rec + 0xc0 + 0x3c * i, 0x3c); i++) {
+            unsigned char *e = rec + 0xc0 + 0x3c * i;
+            mdf("small base %d: m%02u_%02u #%u value %d raw ", i, e[6], e[7], e[0xc], *(int *)e);
+            md_hex(e, 0x3c);
+            mdf("\n");
+        }
+    }
+    md_flags_on(man, "map entry");
+}
+__attribute__((noinline)) static void md_note(unsigned id, int on, int before) {
+    if (before == (on != 0)) return;
+    void *fr[4] = {0};
+    USHORT got = RtlCaptureStackBackTrace(2, 3, fr, NULL);  // skip us and flag_store_hook: setter, its caller, one up
+    DWORD now = GetTickCount();
+    unsigned h = (id * 2654435761u) % 4096;
+    for (int k = 0; k < 64 && g_md_seen[h].id && g_md_seen[h].id != id; k++) h = (h + 1) % 4096;
+    if (!g_md_seen[h].id) g_md_seen[h].id = id, g_md_seen[h].t0 = now;
+    if (now - g_md_seen[h].t0 > 2000) g_md_seen[h].t0 = now, g_md_seen[h].n = 0;
+    g_md_seen[h].last = now, g_md_seen[h].value = (signed char)(on != 0);
+    if (++g_md_seen[h].n > 4) { g_md_seen[h].hidden++; return; }
+    char call[3][24];
+    for (int i = 0; i < 3; i++) {
+        unsigned long long a = (unsigned long long)fr[i];
+        if (i < got && a >= (unsigned long long)g_base && a < (unsigned long long)g_base + 0x8000000)
+            snprintf(call[i], sizeof call[i], "%llx", a - (unsigned long long)g_base);
+        else snprintf(call[i], sizeof call[i], "-");
+    }
+    mdf("%.3f flag %u -> %d%s by %s < %s < %s\n", (now - g_md_t0) / 1000.0, id, on != 0, before < 0 ? " DROPPED (no block)" : "", call[0], call[1], call[2]);
+}
+// Pin listing (map-dump, read only): the map view model (CS::WorldMapViewModel, vtable 0x2c4a548; the one the
+// map screen got, else kind 0, else 1) holds a WorldMapPinDataList<WorldMapPointPinData*> (vtable 0x2c4a510),
+// begin/end at list +0x10/+0x18 (as the other-player list at +0xa0 -> +0xb0/+0xb8). A WorldMapPointPinData
+// (vtable 0x2c4a148): +0x78 row id, +0x80 the WorldMapPointParam row, +0x390 IsOpen last frame, +0x391 visible
+// (UpdateVisible 0x909450). Row flag fields, IsOpen 0xeaaa70: +0xc (eventFlagId5) on hides, +4 / +8 must be on.
+static void md_pins(const char *when) {
+    static const unsigned short OFF[] = {4, 8, 0xc, 0x44, 0x48, 0x4c, 0x60, 0x64, 0x6c, 0x70};
+    static const char *const NAME[] = {"id0", "id1", "id5", "id2", "id3", "id4", "id6", "id7", "id8", "fh0"};
+    static const unsigned TREE[] = {64443630, 64443730, 64453730};
+    if (!setting(S_MAP_DUMP) || !g_md) return;
+    char *man = flag_man();
+    char *m = g_map_dialog_model ? g_map_dialog_model : g_view_models[0] ? g_view_models[0] : g_view_models[1];
+    if (!man || !m) return;
+    EnterCriticalSection(&g_flog_lock);
+    int size = !IsBadReadPtr(m, 0x800) ? 0x800 : !IsBadReadPtr(m, 0x300) ? 0x300 : 0;
+    if (!size || *(char **)m != g_base + 0x2c4a548) {
+        mdf("== pins (%s): no map view model\n", when);
+        LeaveCriticalSection(&g_flog_lock);
+        return;
+    }
+    int lists = 0, tree_seen[3] = {0};
+    for (int off = 8; off + 0x20 <= size; off += 8) {
+        char *list = m + off;
+        if (*(char **)list != g_base + 0x2c4a510) continue;
+        char **b = *(char ***)(list + 0x10), **e = *(char ***)(list + 0x18);
+        long long n = b && e >= b ? e - b : -1;
+        mdf("== pins (%s, %.1f s): point pin list at view model %p +0x%x, %lld pins\n", when,
+            (GetTickCount() - g_md_t0) / 1000.0, (void *)m, off, n);
+        lists++;
+        for (long long i = 0; i < n && i < 4096 && !IsBadReadPtr(b + i, 8); i++) {
+            char *pin = b[i];
+            if (!pin || IsBadReadPtr(pin, 0x398)) { mdf("pin %lld: unreadable %p\n", i, (void *)pin); continue; }
+            unsigned id = *(unsigned *)(pin + 0x78);
+            char *row = *(char **)(pin + 0x80);
+            for (int t = 0; t < 3; t++) tree_seen[t] |= id == TREE[t];
+            mdf("pin %lld row %u open %u visible %u", i, id, (unsigned char)pin[0x390], (unsigned char)pin[0x391]);
+            if (*(char **)pin != g_base + 0x2c4a148) mdf(" vtable +%llx", (unsigned long long)(*(char **)pin - g_base));
+            if (row && !IsBadReadPtr(row, 0x80)) {
+                mdf(" attach %d 3c %u:", *(int *)(row + 0x10), (unsigned char)row[0x3c]);
+                for (int k = 0; k < 10; k++) {
+                    unsigned f = *(unsigned *)(row + OFF[k]);
+                    if (f && f != 0xffffffffu) mdf(" %s %u=%d", NAME[k], f, flag_state_in(man, f));
+                }
+            } else mdf(" row %p unreadable", (void *)row);
+            mdf("\n");
+        }
+    }
+    if (!lists) mdf("== pins (%s): no point pin list in view model %p (first 0x%x bytes)\n", when, (void *)m, size);
+    else for (int t = 0; t < 3; t++) mdf("tree row %u: %s\n", TREE[t], tree_seen[t] ? "pin present" : "NO pin");
+    md_flush(&g_mds);
+    LeaveCriticalSection(&g_flog_lock);
+}
+// Circle effects log (map-dump, read only), once a second while the circle exists (+0x159) and on any change:
+// StageRend +0xc553 before the circle update; play-area manager (0x3c13158): phase +0x154, mode +0x160, player
+// beyond radius + margin +0x430, outside-blend state +0x473, around-player effect id +0x424 (807400/2/4) and its
+// handle +0x428 (0x695f80), edge effects (0x692350): tree head +0x410 walked as std::map (node +0 left, +8 parent,
+// +0x10 right, +0x19 nil), radius +0x260.
+static volatile int g_c553_pre;  // defined with the no-rain hooks below
+static int md_map_count(char *head) {
+    if (!head || IsBadReadPtr(head, 0x20)) return -1;
+    char *n = *(char **)head;
+    int k = 0;
+    while (n && n != head && !IsBadReadPtr(n, 0x20) && !n[0x19] && k < 1000) {
+        k++;
+        char *r = *(char **)(n + 0x10);
+        if (r && !IsBadReadPtr(r, 0x20) && !r[0x19]) {
+            n = r;
+            while (*(char **)n && !IsBadReadPtr(*(char **)n, 0x20) && !(*(char **)n)[0x19]) n = *(char **)n;
+        } else {
+            char *p = *(char **)(n + 8);
+            while (p && !IsBadReadPtr(p, 0x20) && !p[0x19] && n == *(char **)(p + 0x10)) n = p, p = *(char **)(n + 8);
+            n = p;
+        }
+    }
+    return k;
+}
+// Player special effects (map-dump, measurement): on every change of +0x430 (beyond radius + margin) the local
+// player's active effect entries (ChrIns +0x190 module, list from +8, next at entry +0x38): each row pointer as
+// (row - row of 90071610) / 0x400, i.e. its index offset in SpEffectParam (rows 0x400 apart, in id order); the
+// ids follow offline from the regulation's row order.
+static void md_player_effects(const char *when) {
+    char *chr = local_player();
+    struct { char *row; unsigned id; unsigned char flag; } ref = {0};
+    ((void (*)(void *, unsigned))(g_base + 0xea17e0))(&ref, 90071610);
+    char *module = chr && !IsBadReadPtr(chr, 0x200) ? *(char **)(chr + 0x190) : NULL;
+    if (!module || !ref.row || IsBadReadPtr(module, 0x10)) { mdf("player effects (%s): none readable\n", when); return; }
+    char line[1800];
+    int at = snprintf(line, sizeof line, "player effects (%s), offsets from row 90071610:", when), n = 0;
+    for (char **e = *(char ***)(module + 8); e && n < 64 && !IsBadReadPtr(e, 0x70); e = (char **)e[7], n++)
+        at += snprintf(line + at, sizeof line - (size_t)at, " %lld%s", (long long)(e[0] - ref.row) / 0x400,
+                       (*(unsigned *)((char *)e + 0x68) & 0x800c0003) ? "(off)" : "");
+    mdf("%s\n", line);
+}
+// Circle asset log (map-dump, measurement): the play-area code's asset state calls, first time per (site, instance,
+// value) and every change: giant assets (0x653be0: 0x7019e0 at 0x653ef4 / 0x654194, level 1 or 4 by the phase
+// rule at 0x653e0c), the cloud asset AEG596_500 and the +0x30c assets (0x693930 / 0x694050: 0x704cd0 at 0x693ae8,
+// 0x693dc3, 0x6942db, 0x69451e). The game's call is made unchanged.
+static void md_asset_note(unsigned site, void *inst, unsigned value) {
+    if (!g_md) return;
+    static struct { unsigned site; void *inst; unsigned value; } last[256];
+    static int n;
+    static DWORD seen_for;
+    EnterCriticalSection(&g_flog_lock);
+    if (seen_for != g_md_t0) seen_for = g_md_t0, n = 0;
+    int k = 0;
+    while (k < n && !(last[k].site == site && last[k].inst == inst)) k++;
+    if (k == n && n < 256) last[n].site = site, last[n].inst = inst, last[n].value = ~value, n++;
+    if (k < n && last[k].value != value) {
+        last[k].value = value;
+        char *pa = *(char **)(g_base + 0x3c13158);
+        mdf("%.3f circle asset %x inst %p value %u (phase %d out430 %d)\n", (GetTickCount() - g_md_t0) / 1000.0, site, inst,
+            value, pa ? (signed char)pa[0x154] : -9, pa ? pa[0x430] : -1);
+    }
+    LeaveCriticalSection(&g_flog_lock);
+}
+static void asset_level_hook(void *inst, unsigned long long level) {
+    md_asset_note((unsigned)((char *)__builtin_return_address(0) - g_base) - 5, inst, (unsigned)(level & 0xff));
+    ((void (*)(void *, unsigned long long))(g_base + 0x7019e0))(inst, level);
+}
+static void asset_enable_hook(void *inst, unsigned long long on) {
+    md_asset_note((unsigned)((char *)__builtin_return_address(0) - g_base) - 5, inst, (unsigned)(on & 0xff));
+    ((void (*)(void *, unsigned long long))(g_base + 0x704cd0))(inst, on);
+}
+static void md_circle_tick(void) {
+    static DWORD next;
+    static char last[96];
+    char *pa = *(char **)(g_base + 0x3c13158);
+    if (!pa || IsBadReadPtr(pa, 0x480)) return;
+    char line[96];
+    snprintf(line, sizeof line, "c553 %d phase %d mode %u out430 %u out473 %u id %d handle %llx edge %d",
+             g_c553_pre, (signed char)pa[0x154], (unsigned char)pa[0x160], (unsigned char)pa[0x430], (unsigned char)pa[0x473],
+             *(int *)(pa + 0x424), *(unsigned long long *)(pa + 0x428), md_map_count(*(char **)(pa + 0x410)));
+    DWORD now = GetTickCount();
+    int changed = strcmp(line, last) != 0;
+    static int last430 = -1;
+    if (pa[0x430] != last430) {
+        last430 = pa[0x430];
+        md_player_effects(last430 ? "player beyond the circle" : "player inside the circle");
+    }
+    if (!pa[0x159] && !changed) return;
+    if (!changed && (int)(now - next) < 0) return;
+    next = now + 1000;
+    memcpy(last, line, sizeof last);
+    mdf("%.3f circle %s %s radius %.1f\n", (now - g_md_t0) / 1000.0, changed ? "change" : "tick", line, *(float *)(pa + 0x260));
+}
+// Effect creation log (map-dump, measurement): every call of the effect manager's create (0xedce20, 30 call sites)
+// passes through; while an expedition file is open, the first time each (call site, effect id) pair is seen it is
+// written with the circle state. Read only: the game's call is made unchanged.
+static const unsigned SFX_SITES[] = {0x25826e, 0x353812, 0x41eb8c, 0x447c24, 0x447cb3, 0x53e99e, 0x53eab9, 0x57b65e,
+    0x57b924, 0x65ffec, 0x6600f8, 0x6601fe, 0x66067c, 0x664262, 0x664355, 0x66449b, 0x664596, 0x69345e, 0x6937a7,
+    0x69517a, 0x6952b1, 0x6960cd, 0x6963d2, 0x72ae96, 0x74178c, 0xb93da8, 0xb93f89, 0xba6673, 0xbf4ba6, 0xbf533c};
+static void *sfx_create_hook(void *mgr, void *out, int *id, void *extra) {
+    void *r = ((void *(*)(void *, void *, int *, void *))(g_base + 0xedce20))(mgr, out, id, extra);
+    if (!g_md || !id || IsBadReadPtr(id, 4)) return r;
+    unsigned site = (unsigned)((char *)__builtin_return_address(0) - g_base) - 5;
+    static unsigned long long seen[512];
+    static int nseen;
+    static DWORD seen_for;
+    unsigned long long key = (unsigned long long)site << 32 | (unsigned)*id;
+    EnterCriticalSection(&g_flog_lock);
+    if (seen_for != g_md_t0) seen_for = g_md_t0, nseen = 0;
+    int k = 0;
+    while (k < nseen && seen[k] != key) k++;
+    if (k == nseen && nseen < 512) {
+        seen[nseen++] = key;
+        char *pa = *(char **)(g_base + 0x3c13158);
+        int circle = pa && !IsBadReadPtr(pa, 0x480) ? pa[0x159] : -1;
+        mdf("%.3f effect created %d at %x (circle %d)\n", (GetTickCount() - g_md_t0) / 1000.0, *id, site, circle);
+    }
+    LeaveCriticalSection(&g_flog_lock);
+    return r;
+}
+static void md_frame(DWORD expedition) {  // own expedition, InGame, every frame; expedition = its start tick
+    if (!setting(S_MAP_DUMP)) return;
+    static DWORD opened_for, open_tick, at30, at180, next;
+    DWORD now = GetTickCount();
+    char *man = flag_man(), *gm = *(char **)(g_base + 0x3c13258);
+    if (!man || !gm) return;
+    EnterCriticalSection(&g_flog_lock);
+    if (opened_for != expedition) {
+        opened_for = expedition, open_tick = now;
+        SYSTEMTIME t;
+        GetLocalTime(&t);
+        g_md = md_open(&g_mds, (int)*(unsigned *)(gm + 0xb4c), t.wHour, t.wMinute, t.wSecond);
+        logf("map test: map-dump %s %s", g_md ? "writing" : "cannot open", g_mds.name);
+        if (g_md) md_entry();
+    }
+    if (g_md) {
+        if (at30 != expedition && now - open_tick > 30000) at30 = expedition, md_flags_on(man, "+30 s after InGame"), md_pins("+30 s after InGame");
+        if (at180 != expedition && now - open_tick > 180000) at180 = expedition, md_flags_on(man, "+180 s after InGame"), md_pins("+180 s after InGame");
+        md_circle_tick();
+        if ((int)(now - next) >= 0) {
+            next = now + 1000;
+            for (int i = 0; i < 4096; i++)
+                if (g_md_seen[i].hidden && now - g_md_seen[i].last > 2000)
+                    mdf("%.3f flag %u changed %d more times (now %d)\n", (now - g_md_t0) / 1000.0, g_md_seen[i].id, g_md_seen[i].hidden, g_md_seen[i].value), g_md_seen[i].hidden = 0;
+            md_flush(&g_mds);
+        }
+    }
+    LeaveCriticalSection(&g_flog_lock);
+}
+static void flag_store_hook(char *man, unsigned id, int on) {  // replaces the two calls of 0x60d330
+    int before = flag_state_in(man, id);
+    ((void (*)(char *, unsigned, int))(g_base + 0x60d330))(man, id, on);
+    flag_note(man, id, on, before);
+    if (setting(S_MAP_DUMP)) {
+        EnterCriticalSection(&g_flog_lock);
+        md_note(id, on, before);
+        LeaveCriticalSection(&g_flog_lock);
+    }
+}
+// After a layout: the 16 field tiles as laid out (map id, variant), the tile blocks, and 20 s later every
+// ten-digit flag that is on (proves the read of tile flags without a boss kill).
+static void flag_layout_log(char *man, int mode) {
+    char line[900] = "";
+    for (char *e = *(char **)(man + 0x118); e && e < *(char **)(man + 0x120) && strlen(line) < sizeof line - 40; e += 8) {
+        unsigned m = *(unsigned *)e;
+        snprintf(line + strlen(line), sizeof line - strlen(line), " m%02u_%02u_%02u_%u%u%s", m >> 24, m >> 16 & 0xff, m >> 8 & 0xff, m >> 4 & 0xf, m & 0xf, e[4] ? "" : "(d)");
+    }
+    logf("flags: layout %d (map load): tiles%s", mode, line);
+    static unsigned keys[4096];
+    int n = flag_blocks(man, keys, 4096), tiles = 0;
+    line[0] = 0;
+    for (int i = 0; i < n && i < 4096; i++)
+        if (keys[i] >= 1000000 && (i == 0 || keys[i] / 100 != keys[i - 1] / 100) && strlen(line) < sizeof line - 12)
+            tiles++, snprintf(line + strlen(line), sizeof line - strlen(line), " %u", keys[i] / 100);
+    logf("flags: %d blocks, %d tile block groups (10XYV: ids 10XYVddnnn):%s", n, tiles, line);
+}
+static void flag_layout_hook(char *man, int mode) {  // replaces the calls of 0x5e6b90 in MoveMapStep
+    ((void (*)(char *, int))(g_base + 0x5e6b90))(man, mode);
+    EnterCriticalSection(&g_flog_lock);
+    for (int i = 0; i < FLOG_SLOTS; i++) g_flog[i].dropped = 0;
+    g_flog_back_n = g_flog_back_logged = 0;
+    g_flog_layout_tick = GetTickCount();
+    g_flog_last_mode = mode;
+    md_layout(man, mode);
+    LeaveCriticalSection(&g_flog_lock);
+    flag_layout_log(man, mode);
+}
+static void flag_log_frame(void) {  // InGame, every frame
+    if (!setting(S_FLAG_LOG)) return;
+    static DWORD next;
+    DWORD now = GetTickCount();
+    if ((int)(now - next) < 0) return;
+    next = now + 1000;
+    char *man = flag_man();
+    if (!man) return;
+    EnterCriticalSection(&g_flog_lock);
+    for (int i = 0; i < FLOG_SLOTS; i++)
+        if (g_flog[i].hidden && now - g_flog[i].last > 2000)
+            logf("flags: %u changed %d more times (now %d)", g_flog[i].id, g_flog[i].hidden, g_flog[i].value), g_flog[i].hidden = 0;
+    for (int i = 0; i < g_flog_back_n; i++)
+        if (g_flog_back[i].t && now - g_flog_back[i].t > 5000) {
+            if (g_flog_back_logged++ < 8)
+                logf("flags: read back %u (on 5 s ago): game get %d, storage %d", g_flog_back[i].id, two_flag((int)g_flog_back[i].id, 0, 0), flag_state_in(man, g_flog_back[i].id));
+            g_flog_back[i].t = 0;
+        }
+    LeaveCriticalSection(&g_flog_lock);
+    static DWORD scanned_for;
+    if (scanned_for != g_flog_layout_tick && now - g_flog_layout_tick > 20000) {
+        scanned_for = g_flog_layout_tick;
+        static unsigned keys[4096];
+        int n = flag_blocks(man, keys, 4096), on = 0;
+        char line[900] = "";
+        for (int i = 0; i < n && i < 4096; i++) {
+            if (keys[i] < 1000000) continue;
+            char *data = flag_block(man, keys[i]);
+            for (unsigned b = 0; data && b < 1000; b++)
+                if (data[b >> 3] >> (7 - (b & 7)) & 1) {
+                    if (strlen(line) < sizeof line - 14) snprintf(line + strlen(line), sizeof line - strlen(line), " %u", keys[i] * 1000 + b);
+                    on++;
+                }
+        }
+        logf("flags: 20 s after the map load, %d tile flags on (read from storage):%s", on, line);
+    }
 }
 static int g_two_active, g_two_requests;  // the current map is a two-regions one (not the hub); map requests
+// The tile list (0x5e7d40) asks 0x6ab300(&tile map id, -1) at 0x5e7ff6 whether a tile has flags of its own
+// variant (ids 10 X%10 Y%10 V dd nnn) or the base ones (10 XX YY d nnn). 0x6ab3c0 says yes only for the
+// tiles of the region of the FIRST flag in gm +0xbb8 (7601: 42..43 x 38..39; 7603 would give 44..45 x
+// 36..37). Two-regions: the Rotted Woods tiles (variant 3) say yes too, as on a Rotted Woods map, or every
+// flag of their scripts (Captain's death 1056300800, the tree 1046300590, the treasure map 1056304580)
+// has no block (run 50).
+static unsigned char tile_flag_space_hook(unsigned *id, int a) {
+    unsigned char r = ((unsigned char (*)(unsigned *, int))(g_base + 0x6ab300))(id, a);
+    unsigned m = id ? *id : 0, x = m >> 16 & 0xff, y = m >> 8 & 0xff;
+    if (!r && g_two_active && m >> 24 == 60 && x >= 44 && x <= 45 && y >= 36 && y <= 37 && (m >> 4 & 0xf) == 3) r = 1;
+    return r;
+}
+// No rain (fixed, every player): the raindrops outside the circle and the circle's wall are one effect, the
+// play-area effect (GPARAM group "PlayAreaEffect": RainDrop and Border fields, values in mapbase.gparam). The
+// render object CS::StageRend (0x3c22750 +0x10 -> 0xe15f20) draws it while its byte +0xc553 is 1; the circle
+// code sets that byte every frame while the circle exists: 0x696170 (called only at 0x68e1d2) and 0x698c90
+// (only at 0x68e1ea), both under the game's guard StageRend +0x48 bit 19. Only drawing reads it (0x1bbff5a,
+// 0x1c1609, 0x1ce655c), never the circle, clock or phase code. So after each of the two calls it goes back to 0.
+// The circle's edge sound "CircleBorderSe" (sounds 600010000/10/20 at the edge point nearest the player) is
+// started only by 0x6953b0 (called only at 0x68e229): that call is skipped.
+static DWORD g_expedition_start_tick;  // defined with g_expedition_tick below
+static DWORD g_norain_seen[9];
+static void norain_first(int k, const char *what) {
+    if (g_debug_log && g_norain_seen[k] != g_expedition_start_tick) {
+        g_norain_seen[k] = g_expedition_start_tick;
+        logf("no rain: %s (first time this expedition)", what);
+    }
+}
+static char *stage_rend(void) {
+    char *g = *(char **)(g_base + 0x3c22750);
+    void *a = g ? *(void **)(g + 0x10) : NULL;
+    char *sr = a ? ((char *(*)(void *))(g_base + 0xe15f20))(a) : NULL;
+    return sr && (*(unsigned *)(sr + 0x48) >> 19 & 1) ? sr : NULL;
+}
+static void norain_effect_off(void) {
+    char *sr = stage_rend();
+    if (sr) sr[0xc553] = 0;
+}
+static volatile int g_c553_pre = -1;  // measurement: StageRend +0xc553 just before the circle update (after last frame's clear)
+static void norain_circle_hook(char *mgr, float dt, unsigned long long c) {
+    char *sr = stage_rend();
+    g_c553_pre = sr ? (unsigned char)sr[0xc553] : -1;
+    ((void (*)(char *, float, unsigned long long))(g_base + 0x696170))(mgr, dt, c);
+    norain_effect_off();
+    norain_first(0, "circle update 0x696170, effect switched off");
+}
+static void norain_circle2_hook(char *mgr, float dt) {
+    ((void (*)(char *, float))(g_base + 0x698c90))(mgr, dt);
+    norain_effect_off();
+    norain_first(1, "circle update 0x698c90, effect switched off");
+}
+static void norain_sound_hook(char *mgr, float dt) {
+    (void)mgr, (void)dt;
+    norain_first(2, "edge sound 0x6953b0 skipped");
+}
+// The rain itself (run 38, one-region 3: rain only outside the circle = effect 807400/2/4 active, handle +0x428):
+// both circle effects use only s51300_a.tif, the texture of the rain weather effect 806100. 0x695f80 (called
+// only at 0x68e208) creates the effect around the player while beyond radius + margin (+0x430); its fields
+// +0x424/+0x428 are read by nothing else. 0x692350 (called only at 0x68e213) keeps the rain instances along the
+// edge near the player (807421/3/5, list +0x408/+0x410/+0x418, else only a clean-up walk); its callees are
+// math (0x68f1d0) and ground queries (0xdac580, 0xdad400). Both calls are skipped: never created.
+static void norain_player_rain_hook(char *mgr) {
+    (void)mgr;
+    norain_first(3, "rain around the player 0x695f80 skipped");
+}
+static void norain_edge_rain_hook(char *mgr, float dt) {
+    (void)mgr, (void)dt;
+    norain_first(4, "rain along the edge 0x692350 skipped");
+}
+// The border (run 39: still drawn, "like fire", with no edge rain): 0x694580 (called only at 0x68e21e) splits the
+// whole circumference into +0x340 = radius * k / +0x32c segments and creates effect 807011 (textures s31021 /
+// s34030 / s31031, not the rain texture) at each segment point (0x695123 -> 0xedce20), kept in the container
+// +0x358/+0x360 (else only a clean-up walk); its callees are container helpers and math. Skipped: never created.
+static void norain_border_hook(char *mgr, float dt) {
+    (void)mgr, (void)dt;
+    norain_first(5, "circle border effects 0x694580 skipped");
+}
+// Health bar colour outside the circle: the HUD (0x7cbdf0 at 0x7cbf86, 0x7ceca0 at 0x7cee41) asks 0x68c5f0(play
+// area, character) whether the character is in the play area's per-character map (+0x460) while the circle exists,
+// and styles the bar with the answer (+0xa4 = 2 / 1). Without a circle the function answers 0; these are its only
+// callers. The hooks always answer 0: the bar looks as before the circle.
+// Circle-start notice: when the circle phase (+0x154) changes, 0x696170 calls the HUD (0x3c14a70) at 0x69722c:
+// 0x7c52f0(hud, phase) shows text effect 4200 (phase 1, "The Night's tide grows stronger") or 4201 (phase 2, "Rains
+// gather, portending the tide of Night") through 0x8b4c30 and does nothing else; its only caller. Skipped.
+static void hud_circle_notice_hook(void *hud, unsigned long long phase) {
+    (void)hud, (void)phase;
+    norain_first(7, "circle notice 0x7c52f0 skipped");
+}
+static unsigned long long hud_circle_state_hook(char *mgr, unsigned long long chr) {
+    (void)mgr, (void)chr;
+    norain_first(6, "health bar circle state answered 0");
+    return 0;
+}
 static unsigned *map_request_hook(unsigned *out, unsigned *request) {
     unsigned req = request ? *request : 0;
     unsigned *r = ((unsigned *(*)(unsigned *, unsigned *))(g_base + 0x6b06f0))(out, request);
     char *gm = *(char **)(g_base + 0x3c13258);
     // 0xa000000: the hub (the pattern stays in +0xb4c there; nothing of ours belongs in the hub)
-    g_two_active = gm && req != 0xa000000 && two_pattern(*(unsigned *)(gm + 0xb4c));
+    int one = g_settings[S_ONE_REGION] >= 1 && g_settings[S_ONE_REGION] <= 5;
+    g_two_active = !one && gm && req != 0xa000000 && two_pattern(*(unsigned *)(gm + 0xb4c));
+    if (one && gm && req != 0xa000000) {
+        logf("one-region (test): map request: pattern %u, map type +b46 %d, region list left as the game's", *(unsigned *)(gm + 0xb4c), (int)(unsigned char)gm[0xb46]);
+        return r;
+    }
     if (!g_two_active) {
         if (gm && req != 0xa000000) logf("two-regions: map request: pattern %u is not a Mountaintop pattern; nothing added", *(unsigned *)(gm + 0xb4c));
         return r;
@@ -1619,7 +2204,7 @@ static unsigned *map_request_hook(unsigned *out, unsigned *request) {
     logf("two-regions: map request: pattern %u, map type +b46 %d, +b50 %d, region flags (%lld) %d %d %d %d",
          *(unsigned *)(gm + 0xb4c), (int)(unsigned char)gm[0xb46], *(int *)(gm + 0xb50), *count,
          *count > 0 ? flags[0] : -1, *count > 1 ? flags[1] : -1, *count > 2 ? flags[2] : -1, *count > 3 ? flags[3] : -1);
-    two_regions_flags();
+    logf("two-regions: event flags come from the pattern record (7603 row before 7601, OnMapEnter); none set here");
     return r;
 }
 // Decision 26: on a two-regions map the player starts with more HP flask charges, so that with every
@@ -1648,7 +2233,13 @@ static void two_regions_flasks(void) {
 #define TWO_FLASK_DELAY_MS 30000
     static int done_for = -1, seen_for = -1;
     static DWORD since;
-    if (seen_for != g_two_requests) seen_for = g_two_requests, since = GetTickCount();
+    static int last_hp = -1;
+    if (seen_for != g_two_requests) seen_for = g_two_requests, since = GetTickCount(), last_hp = -1;
+    if (done_for != g_two_requests) {  // when does the game's start value become final? logged until we adjust
+        char *gdm0 = *(char **)(g_base + 0x3c078d0), *pgd0 = gdm0 ? *(char **)(gdm0 + 8) : NULL;
+        if (pgd0 && (unsigned char)pgd0[0xff] != last_hp)
+            last_hp = (unsigned char)pgd0[0xff], logf("two-regions: flasks: HP charges now %d (%lu ms into the expedition)", last_hp, GetTickCount() - since);
+    }
     if (done_for == g_two_requests || GetTickCount() - since < TWO_FLASK_DELAY_MS) return;
     char *gm = *(char **)(g_base + 0x3c13258), *gdm = *(char **)(g_base + 0x3c078d0), *pgd = gdm ? *(char **)(gdm + 8) : NULL;
     if (!gm || !pgd) return;
@@ -1656,14 +2247,21 @@ static void two_regions_flasks(void) {
     unsigned pat = *(unsigned *)(gm + 0xb4c);
     int churches = two_churches(pat), extra;
     unsigned char hp = (unsigned char)pgd[0xff], fp = (unsigned char)pgd[0x100];
+    // Churches already taken are in the charges (run 48: one taken before this ran was counted twice). The
+    // church script raises +0x1a8 by one for each (0x5fdad0), so: charges now + churches not yet taken >= 7.
+    int taken = *(int *)(pgd + 0x1a8), left;
     if (churches < 0) { logf("two-regions: flasks: no church count for pattern %u; left alone", pat); return; }
-    extra = 7 - hp - churches;
-    if (extra <= 0) { logf("two-regions: flasks: %u HP charges, pattern %u has %d churches; left as it is", hp, pat, churches); return; }
+    left = churches - taken > 0 ? churches - taken : 0;
+    extra = 7 - hp - left;
+    if (extra <= 0) {
+        logf("two-regions: flasks: %u HP charges, %d churches on pattern %u, %d taken; left as it is", hp, churches, pat, taken);
+        return;
+    }
     if (hp + extra > 14) extra = 14 - hp;
     ((void (*)(char *, unsigned char, unsigned char))(g_base + 0x20d9d0))(pgd, (unsigned char)(hp + extra), fp);
     ((void (*)(void))(g_base + 0x60ad60))();  // fill to the new maximum, as a church does
-    logf("two-regions: flasks: HP charges %u -> %u (pattern %u, %d churches counted, at least 7 with all of them)", hp,
-         (unsigned char)pgd[0xff], pat, churches);
+    logf("two-regions: flasks: HP charges %u -> %u (pattern %u: %d churches counted, %d already taken; at least 7 with the rest)", hp,
+         (unsigned char)pgd[0xff], pat, churches, taken);
 }
 // Item pickup while hosting (runs 38..41: with our host session open, part of the items and all weapons
 // showed the prompt but pressing did nothing; with no-host everything could be picked up). The game's
@@ -1714,8 +2312,47 @@ static void hook_acceptance(void) {
         hook_call(0x674f37, 0x66f3b0, (void *)finish_down_hook, "finish test: going down");
         hook_call(0x43dac3, 0x66dec0, (void *)finish_hit_hook, "finish test: gauge hit");
     }
-    if (setting(S_TWO_REGIONS)) hook_call(0xc27a41, 0x6b06f0, (void *)map_request_hook, "two-regions: map request");
+    hook_call(0xc27a41, 0x6b06f0, (void *)map_request_hook, "two-regions: map request");
+    hook_call(0x5e7ff6, 0x6ab300, (void *)tile_flag_space_hook, "two-regions: tile flag space");
+    hook_call(0x68e1d2, 0x696170, (void *)norain_circle_hook, "no rain: play-area effect off after the circle update");
+    hook_call(0x68e1ea, 0x698c90, (void *)norain_circle2_hook, "no rain: play-area effect off after the second circle update");
+    hook_call(0x68e229, 0x6953b0, (void *)norain_sound_hook, "no rain: circle edge sound skipped");
+    hook_call(0x68e208, 0x695f80, (void *)norain_player_rain_hook, "no rain: rain around the player skipped");
+    hook_call(0x68e213, 0x692350, (void *)norain_edge_rain_hook, "no rain: rain along the circle edge skipped");
+    hook_call(0x68e21e, 0x694580, (void *)norain_border_hook, "no rain: circle border effects skipped");
+    hook_call(0x7cbf86, 0x68c5f0, (void *)hud_circle_state_hook, "no rain: health bar circle state (1)");
+    hook_call(0x7cee41, 0x68c5f0, (void *)hud_circle_state_hook, "no rain: health bar circle state (2)");
+    hook_call(0x69722c, 0x7c52f0, (void *)hud_circle_notice_hook, "no rain: circle notice skipped");
+    {
+        static const unsigned site[9] = {0x68e1d2, 0x68e1ea, 0x68e229, 0x68e208, 0x68e213, 0x68e21e, 0x7cbf86, 0x7cee41, 0x69722c},
+                              orig[9] = {0x696170, 0x698c90, 0x6953b0, 0x695f80, 0x692350, 0x694580, 0x68c5f0, 0x68c5f0, 0x7c52f0};
+        int n = 0;
+        for (int i = 0; i < 9; i++) {
+            unsigned char *c = (unsigned char *)g_base + site[i];
+            int rel = (int)(orig[i] - (site[i] + 5));
+            n += c[0] == 0xE8 && memcmp(c + 1, &rel, 4) != 0;
+        }
+        logf("no rain: %s (%d of 9 hooks: play-area effect off after both circle updates; edge sound, rain around the player, rain along the edge, border effects and circle notice skipped; health bar circle state 0)",
+             n == 9 ? "in place" : "NOT complete", n);
+    }
     hook_call(0x5c92f0, 0xb8fc70, (void *)pickup_action_hook, "pickup: map item action (session byte)");
+    InitializeCriticalSection(&g_flog_lock);
+    if (setting(S_MAP_DUMP)) {
+        for (unsigned i = 0; i < sizeof SFX_SITES / sizeof *SFX_SITES; i++) hook_call(SFX_SITES[i], 0xedce20, (void *)sfx_create_hook, "map-dump: effect creation log");
+        hook_call(0x653ef4, 0x7019e0, (void *)asset_level_hook, "map-dump: circle giant asset log (1)");
+        hook_call(0x654194, 0x7019e0, (void *)asset_level_hook, "map-dump: circle giant asset log (2)");
+        static const unsigned EN[] = {0x693ae8, 0x693dc3, 0x6942db, 0x69451e};
+        for (unsigned i = 0; i < 4; i++) hook_call(EN[i], 0x704cd0, (void *)asset_enable_hook, "map-dump: circle asset enable log");
+    }
+    if (setting(S_FLAG_LOG) || setting(S_MAP_DUMP)) {
+        hook_call(0x5e789d, 0x60d330, (void *)flag_store_hook, "flags: storage write (0x5e7740)");
+        hook_call(0x5e7ac0, 0x60d330, (void *)flag_store_hook, "flags: storage write (0x5e79f0)");
+    }
+    if (setting(S_FLAG_LOG) || setting(S_MAP_DUMP)) {
+        hook_call(0xc303b4, 0x5e6b90, (void *)flag_layout_hook, "flags: layout at map load (keep)");
+        hook_call(0xc304f2, 0x5e6b90, (void *)flag_layout_hook, "flags: layout at map load (fresh)");
+        hook_call(0xc4a48d, 0x5e6b90, (void *)flag_layout_hook, "flags: layout (other)");
+    }
     if (setting(S_LOOT_TEST)) {
         hook_call(0x6fd220, 0x724420, (void *)loot_update_hook, "loot test: pickup objects");
         hook_call(0x72464c, 0x7247d0, (void *)loot_pickup_hook, "loot test: pickup");
@@ -2912,7 +3549,7 @@ static int level_apply(int level, const char *why) {
             ((void (*)(char *, int))(g_base + 0x428bf0))(*mod, 0);
         }
     }
-    logf("level: %s: invader level %d -> %d (max HP %d, FP %d, stamina %d)", why, before, *(int *)(pd + 0x68), *(int *)(pd + 0x18),
+    logf("level: %s: level %d -> %d (max HP %d, FP %d, stamina %d)", why, before, *(int *)(pd + 0x68), *(int *)(pd + 0x18),
          *(int *)(pd + 0x24), *(int *)(pd + 0x30));
     return before;
 }
@@ -3592,7 +4229,7 @@ static void lobby_position(void) {
 #define QM_STEP_INGAME 23
 #define NET_READY_WAIT_MS 15000  // only for the log: say once if the network is slow to come up
 static int g_in_expedition;
-static DWORD g_expedition_tick;
+static DWORD g_expedition_tick, g_expedition_start_tick;
 static void host_test_create(void);
 static int host_test_leave(void);
 static void host_expedition(int step) {
@@ -3602,6 +4239,7 @@ static void host_expedition(int step) {
             slow_time_frame(1);
             g_in_expedition = 1;
             g_expedition_tick = GetTickCount();
+            g_expedition_start_tick = GetTickCount() | 1;
             g_self_check = 0;
             lobby_search_reset();
             host_test_start();
@@ -3617,6 +4255,13 @@ static void host_expedition(int step) {
         }
         team_test_frame(0);
         slow_time_frame(0);
+        flag_log_frame();
+        md_frame(g_expedition_start_tick);
+        // test-level (test setting, own expedition only): the level set once, 5 s into the expedition,
+        // through the same game path as the invader's level (level_apply).
+        static DWORD test_level_done;
+        if (g_settings[S_TEST_LEVEL] > 0 && test_level_done != g_expedition_start_tick && GetTickCount() - g_expedition_start_tick > 5000)
+            test_level_done = g_expedition_start_tick, level_apply(g_settings[S_TEST_LEVEL], "test-level (own expedition)");
         if (g_host_test == 1) {
             host_test_create();
             if (g_host_test == 1 && g_expedition_tick && GetTickCount() - g_expedition_tick > NET_READY_WAIT_MS) {
@@ -3633,6 +4278,7 @@ static void host_expedition(int step) {
         g_in_expedition = 0;
         lobby_search_reset();
         logf("host: expedition over (step %s)%s", STEP_NAMES[step], g_host_test == 2 ? ", leaving the session" : "");
+        md_end("expedition over");
         if (host_test_leave()) g_stop_pending = GetTickCount();  // network down once the leave is through
         else if (g_network_on && !g_searching) set_network(0);
         g_lobby = 0;
@@ -3828,29 +4474,19 @@ static void step_hook(void *ctrl, void *time, int step) {
     // Both roles live in every player (no switches since 14c271a): its own expeditions host; while it is
     // an invader in another player's world (g_join 4) it opens and advertises nothing of its own.
     // map-test-control / two-regions: the generator draws the pattern (generate_hook); here only a check.
-    if ((setting(S_MAP_CONTROL) || setting(S_TWO_REGIONS)) && g_join != 4 && step == 21) {
+    if (g_join != 4 && step == 21) {
         char *gm = *(char **)(g_base + 0x3c13258);
         static unsigned told = 0xffffffff;
         unsigned pat = gm ? *(unsigned *)(gm + 0xb48) : 0xffffffff;
         if (gm && pat != told)
             told = pat, logf("map test: generator pattern %u (%s)", pat,
-                             pat < 320 && pat % 40 >= 20 && pat % 40 < 25 ? "a Mountaintop pattern, as wanted" : "NOT a Mountaintop pattern");
+                             two_pattern(pat) ? "a two-region slot, as wanted" : "NOT a two-region slot");
     }
-    if (setting(S_TWO_REGIONS) && step == QM_STEP_INGAME && g_two_active) {
+    if (step == QM_STEP_INGAME && g_two_active) {
         two_regions_flasks();
-        // The game clears 7603 between the map request and InGame (run 37: off in game, no rot; runs 35/43
-        // set it again at the first InGame frame: rot yes, but the start flight showed neither the hawk nor
-        // the character; run 37 without it: hawk visible). So 7603 is turned on only once the start flight
-        // is over: TWO_ROT_DELAY_MS after InGame began, when it is seen off, at most 3 times per expedition.
-        // ponytail: a fixed delay, not the end of the flight itself; the rot scripts wait for the flag, so
-        // a later start only delays the rot.
-#define TWO_ROT_DELAY_MS 30000
-        static int rot_for = -1, rot_sets;
-        static DWORD rot_since;
-        if (rot_for != g_two_requests) rot_for = g_two_requests, rot_sets = 0, rot_since = GetTickCount();
-        if (rot_sets < 3 && GetTickCount() - rot_since >= TWO_ROT_DELAY_MS && two_flag(7603, 0, 0) == 0)
-            rot_sets++, two_flag(7603, 1, 1),
-                logf("two-regions: event flag 7603 off %lus into the expedition; set (%d of at most 3)", (GetTickCount() - rot_since) / 1000, rot_sets);
+        // 7603 comes from the merged pattern record (launcher: a 7603 row before 7601), set by the game's
+        // OnMapEnter at map entry like on a Rotted Woods map; nothing is written here (measurement 3: our
+        // delayed write was the only DLL flag write; the hawk problem of runs 33..35 was start group 708).
         // Watched, never written here (logged when they change): 7601, the powers 9193 / 9192, and the
         // Rotted Woods' pattern flag 1046300590 (cleared by the game every frame in run 35).
         static const int WATCH[5] = {7601, 7603, 9193, 9192, 1046300590};

@@ -24,12 +24,10 @@ DLL="-target x86_64-windows-gnu -shared -O2 -Wall -Wextra"
 "$ZIG" cc -target x86_64-windows-gnu -O2 -o "$B/unkrak.exe" "$R/mod/tools/unkrak.c"
 
 # Test settings: $W/test-settings.toml (same format as launcher/test-settings.toml) goes next to the
-# DLL, which reads it; without it every setting is false. no-rain acts here, on the regulation.
+# DLL, which reads it; without it every setting is false. The rain never does damage (decision 27).
 SETTINGS="$W/test-settings.toml"
 if [ -e "$SETTINGS" ]; then cp "$SETTINGS" "$B/native/test-settings.toml"; else rm -f "$B/native/test-settings.toml"; fi
-NO_RAIN=""
-[ -e "$SETTINGS" ] && tr -d '\r' < "$SETTINGS" | grep -qiE '^[[:space:]]*no-rain[[:space:]]*=[[:space:]]*true[[:space:]]*(#.*)?$' && NO_RAIN="--no-rain"
-uv run -q "$R/mod/build_regulation.py" "$GAME/regulation.bin" "$B/regulation.bin" $NO_RAIN
+uv run -q "$R/mod/build_regulation.py" "$GAME/regulation.bin" "$B/regulation.bin" --no-rain
 
 # Menu texts for the development package (the launcher does this itself for all languages).
 for src in "$W"/analysis/gamefiles/msg/*/menu_dlc01.msgbnd.dcx; do

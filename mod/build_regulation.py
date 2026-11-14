@@ -80,7 +80,7 @@ def scarab_rows(param):
     return bytes(out)
 
 
-# No rain (test sessions only, --no-rain): PlayAreaCreateCommonParam row 0 names the SpEffects the
+# No rain (--no-rain; decision 27: always, the launcher does the same): PlayAreaCreateCommonParam row 0 names the SpEffects the
 # rain puts on a character outside the circle, day 1 at +0x28 (99810) and day 2 at +0x2c (99811):
 # 2 % of HP plus 15 / 30 per tick, 110 s, chaining to 99871 / 99876. Both become -1, the value rows
 # 1 and 2 of the same param carry. The circle still shrinks on its own schedule; standing outside it
@@ -231,7 +231,7 @@ def main(src, dst, no_row=False, rain=True):
         off = struct.unpack_from("<q", p, 0x48)[0]
         values = [struct.unpack_from("<i", p, off + f)[0] for f in RAIN_FIELDS]
         assert values == ([99810, 99811] if rain else [-1, -1])
-        print(f"regulation.bin: rain {'as in the game' if rain else 'OFF (test build)'}")
+        print(f"regulation.bin: rain {'as in the game' if rain else 'does no damage (decision 27)'}")
     Path(dst).parent.mkdir(parents=True, exist_ok=True)
     Path(dst).write_bytes(out)
     print(f"regulation.bin: Target list rows {ids}")
