@@ -38,7 +38,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 10
+#define BUILD_FORMAT 11
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
                               "porbr", "rusru", "spaar", "spaes", "thath", "zhocn", "zhotw"};
@@ -911,8 +911,294 @@ static int read_settings(void) {
 }
 static int slow_time_wanted(void) { return setting(S_SLOW_TIME); }
 static int no_rain_wanted(void) { return setting(S_NO_RAIN); }
+// two-regions (Shifting Earth experiment, only with the setting on): the Mountaintop and the Rotted Woods
+// in one expedition. Each region is a set of whole map tiles of its own (m60_XX_YY_V0, V = 1 Mountaintop,
+// 3 Rotted Woods, all detail levels), and the two sets share no tile. The game picks a tile's variant per
+// tile: CS::GameMan::CalcGetReplaceMapIdByDisaster (0x1406ab7a0) goes through the region flags in gm
+// +0xbb8 (up to 4, count +0xbd0) and takes the first variant this tile has. The map request puts one flag
+// there; the DLL adds the other (map request call 0x140c27a41). The launcher builds the rest:
+static int two_regions_wanted(void) { return setting(S_TWO_REGIONS); }
+static int map_control_wanted(void) { return setting(S_MAP_CONTROL) && !setting(S_TWO_REGIONS); }
 
 // game's regulation.bin -> work/build/regulation.bin with our Target list row.
+// Map patterns: MapPatternSet rows below 1000 hold, in id order, how many patterns each set has (+4):
+// patterns 0..319, 40 per night boss group (set ids g0..g5: tens digit the group, last digit the region:
+// 0 plain, 1 Mountaintop, 2 Crater, 3 Rotted Woods, 5 Noklateo). Per group: 0..19 plain, 20..24
+// Mountaintop, 25..29 Crater, 30..34 Rotted Woods, 35..39 Noklateo. Every table keyed by the pattern
+// number (patternId +4: LotResultMapPatternFlag, LotResultPlayAreaParam, LotResultSmallBaseAndSpot) is
+// read in row order, pattern by pattern (one cursor through the small bases, 0x1406ac1d6), so a
+// pattern's rows stay together.
+// The generator (0x1406b2aa0, at SingleSetup) draws the expedition's set: candidates are the sets with a
+// weight (+0, or the u16 at +0xe in one mode) whose region digit is plain or the region the player
+// chose (the generator's rare-map-layer argument); one is drawn by weight; then one of its patterns.
+// Everything it derives from the pattern then belongs to that pattern (map test runs 30..36: forcing
+// gm +0xb48 afterwards, even to the game's own pattern 20, left items unpickable all expedition).
+// So the map tests let the generator draw natively: the DLL passes the Mountaintop (1) as the region
+// argument, and the launcher leaves a weight only on the Mountaintop sets (x1; all others 0):
+//   map-test-control: that alone (the game's own Mountaintop patterns 20..24, 60..64, ...);
+//   two-regions: the same, and each Mountaintop pattern 40g+20+k gets, in place, the Rotted Woods of
+//     pattern 40g+30+k (same group, same position):
+//     LotResultMapPatternFlag: its rows of modifier sets the Mountaintop pattern lacks (500: the Rotted
+//       Woods' event flag). Not its map-type row (13 / 7603; with two the map type was the Rotted Woods'
+//       next to the Mountaintop's play area, runs 33/34); the DLL adds 7603 for the tiles and scripts;
+//     LotResultPlayAreaParam: the Mountaintop's (room for one region's play area; the Rotted Woods'
+//       1021 / 1022 is left out);
+//     LotResultSmallBaseAndSpot: the Mountaintop's rows except at points in the Rotted Woods' area
+//       (removed), plus the Rotted Woods pattern's rows at points the Mountaintop pattern leaves empty
+//       and not in the Mountaintop's area (see attach_points).
+// Ids of rows after an insertion move up just enough (copy_pattern_rows); contents stay.
+#define TWO_PATTERNS 320
+#define ATTACH_MAX 4096
+static u64 param_row_size(buf p) { return p.n > 0x40 + 48 ? rd64(p.p + 0x40 + 24 + 8) - rd64(p.p + 0x48) : 0; }
+// Rows of pattern src (filter: keep row?) copied as pattern dst; 0 if a step fails. The game reads these
+// tables in row order, pattern by pattern (0..319, 1000..; one cursor through LotResultSmallBaseAndSpot,
+// 0x1406ac1d6 ff.), so a pattern's rows must stay together and in pattern order: the copies go right
+// after the last row of a pattern <= dst, and if the ids there are taken, the following rows' ids move
+// up just enough (in the tables seen, only patterns 21..319 for an in-place pattern 20; their ids are
+// not referenced anywhere we know of).
+static int copy_pattern_rows(buf *p, int src, int dst, int (*keep)(const u8 *row, void *ctx), void *ctx) {
+    u64 size = param_row_size(*p);
+    u32 count = rd16(p->p + 0x0A), after = 0;
+    int n = 0, have_after = 0;
+    for (u32 i = 0; i < count; i++) {
+        const u8 *row = p->p + rd64(p->p + 0x40 + i * 24 + 8);
+        if ((int)rd32(row + 4) == src && (!keep || keep(row, ctx))) n++;
+        if ((int)rd32(row + 4) <= dst) after = i, have_after = 1;
+    }
+    if (!n || n > 512 || !have_after) return 0;
+    int first = (int)rd32(p->p + 0x40 + after * 24) + 1, need = first + n;
+    for (u32 i = after + 1; i < count; i++) {  // make room: ids first .. first + n - 1
+        int id = (int)rd32(p->p + 0x40 + i * 24);
+        if (id >= need) break;
+        wr32(p->p + 0x40 + i * 24, (u32)need);
+        need++;
+    }
+    int ids[512], k = 0;
+    for (u32 i = 0; i < count && k < n; i++) {
+        const u8 *d = p->p + 0x40 + i * 24, *row = p->p + rd64(d + 8);
+        if ((int)rd32(row + 4) == src && (!keep || keep(row, ctx))) ids[k++] = (int)rd32(d);
+    }
+    for (int i = 0; i < n; i++) {
+        u8 *row = NULL;
+        buf next = param_insert_sorted(*p, ids[i], first + i, size, &row);
+        if (!next.p) return 0;
+        wr32(row + 4, (u32)dst);
+        free(p->p);
+        *p = next;
+    }
+    return n;
+}
+static int keep_map_type_row(const u8 *row, void *ctx) { (void)ctx; return rd32(row + 8) == 0 && rd32(row + 0x10) >= 7600 && rd32(row + 0x10) <= 7605; }
+typedef struct { u32 sets[64]; int n; } set_list;
+static int keep_b_flag(const u8 *row, void *ctx) {  // pattern 30's rows of modifier sets pattern 20 lacks
+    set_list *a = ctx;
+    for (int i = 0; i < a->n; i++) if (a->sets[i] == rd32(row + 8)) return 0;
+    return 1;
+}
+// p without the rows for which drop(row) is true; 0 if p is not a plain fixed-size param.
+static buf param_remove_rows(buf p, int (*drop)(const u8 *row, void *ctx), void *ctx, int *removed) {
+    buf out = {0};
+    u32 strings_off = rd32(p.p), count = rd16(p.p + 0x0A);
+    u64 size = param_row_size(p), data_start = rd64(p.p + 0x48);
+    if (!size || data_start != 0x40 + (u64)count * 24 || strings_off != data_start + count * size) return out;
+    u32 keep = 0;
+    for (u32 i = 0; i < count; i++) keep += !drop(p.p + data_start + i * size, ctx);
+    u64 shift = (u64)(count - keep) * (24 + size), new_start = 0x40 + (u64)keep * 24;
+    out.n = p.n - shift;
+    out.p = xalloc(out.n);
+    memcpy(out.p, p.p, 0x40);
+    wr32(out.p, (u32)(strings_off - shift));
+    wr16(out.p + 0x0A, (uint16_t)keep);
+    wr64(out.p + 0x10, rd64(p.p + 0x10) - shift);
+    wr64(out.p + 0x30, new_start);
+    for (u32 i = 0, j = 0; i < count; i++) {
+        const u8 *d = p.p + 0x40 + i * 24, *row = p.p + data_start + i * size;
+        if (drop(row, ctx)) continue;
+        u8 *nd = out.p + 0x40 + j * 24;
+        wr32(nd, rd32(d));
+        wr32(nd + 4, 0);
+        wr64(nd + 8, new_start + j * size);
+        wr64(nd + 16, rd64(d + 16) - shift);
+        memcpy(out.p + new_start + j * size, row, size);
+        j++;
+    }
+    memcpy(out.p + strings_off - shift, p.p + strings_off, p.n - strings_off);
+    *removed = (int)(count - keep);
+    return out;
+}
+// Map type of each pattern 0..319 (0 plain, 1..5 the region) from its modifier set 0 row.
+static void pattern_kinds(buf flags, signed char kind[TWO_PATTERNS]) {
+    memset(kind, -1, TWO_PATTERNS);
+    for (u32 i = 0; i < rd16(flags.p + 0x0A); i++) {
+        const u8 *row = flags.p + rd64(flags.p + 0x40 + i * 24 + 8);
+        int pat = (int)rd32(row + 4);
+        if (pat >= 0 && pat < TWO_PATTERNS && keep_map_type_row(row, NULL)) kind[pat] = (signed char)(rd32(row + 0x10) - 7600);
+    }
+}
+static int two_pairs_ok(const signed char kind[TWO_PATTERNS]) {  // 40g+20..24 Mountaintop, 40g+30..34 Rotted Woods
+    for (int g = 0; g < 8; g++)
+        for (int k = 0; k < 5; k++)
+            if (kind[40 * g + 20 + k] != 1 || kind[40 * g + 30 + k] != 3) return 0;
+    return 1;
+}
+typedef struct { u8 gone_a[ATTACH_MAX], gone_b[ATTACH_MAX], a_has[ATTACH_MAX]; int mountaintop; } attach_sets;
+static int drop_gone_b(const u8 *row, void *ctx) {  // a Mountaintop pattern's small base where the woods are
+    attach_sets *s = ctx;
+    int pat = (int)rd32(row + 4);
+    u32 at = rd32(row + 8);
+    return pat >= 0 && pat < TWO_PATTERNS && pat % 40 >= 20 && pat % 40 < 25 && at < ATTACH_MAX && s->gone_b[at];
+}
+static int keep_b_base(const u8 *row, void *ctx) {
+    attach_sets *s = ctx;
+    u32 at = rd32(row + 8);
+    return at < ATTACH_MAX && !s->a_has[at] && !s->gone_a[at];
+}
+// Which attach points lie in a region's area: SmallBaseAndSpotAttachPoint +0xc holds the map type
+// (11 Mountaintop, 12 Crater, 13 Rotted Woods, 15 Noklateo, 0 none) whose area holds the point; a
+// region's own patterns never use the points in its area (checked on the tables: 0 of 80 / 66 / 104 /
+// 112), the other patterns do. (Run 37 used a usage statistic instead and kept 32 Mountaintop small
+// bases inside the Rotted Woods.)
+static int attach_points(buf points, attach_sets *s) {
+    memset(s, 0, sizeof *s);
+    int in_a = 0, in_b = 0;
+    if (param_row_size(points) < 0x10) return 0;
+    for (u32 i = 0; i < rd16(points.p + 0x0A); i++) {
+        u32 id = rd32(points.p + 0x40 + i * 24);
+        const u8 *row = points.p + rd64(points.p + 0x40 + i * 24 + 8);
+        if (id >= ATTACH_MAX) continue;
+        if (rd32(row + 0xc) == 11) s->gone_a[id] = 1, in_a++;
+        if (rd32(row + 0xc) == 13) s->gone_b[id] = 1, in_b++;
+    }
+    logf_("two-regions: attach points in the Mountaintop's area %d, in the Rotted Woods' %d", in_a, in_b);
+    return in_a > 0 && in_b > 0;
+}
+// Churches (SmallBaseAndSpotDefine rows with map icon 3, "Church": +0x2c; their small-base ids as
+// int16s at +4..+0x2b) per two-regions pattern -> work/native/two-regions.txt ("pattern churches"),
+// which the DLL reads for decision 26 (more HP flask charges at the start).
+static int write_churches(buf define, buf bases) {
+    short church[64];
+    int nc = 0;
+    u64 dsize = param_row_size(define);
+    if (dsize < 0x30) return 0;
+    for (u32 i = 0; i < rd16(define.p + 0x0A); i++) {
+        const u8 *row = define.p + rd64(define.p + 0x40 + i * 24 + 8);
+        if (rd32(row + 0x2c) != 3) continue;
+        for (int k = 0; k < 20 && nc < 64; k++) {
+            short v = (short)rd16(row + 4 + 2 * k);
+            if (v != -1) church[nc++] = v;
+        }
+    }
+    int count[TWO_PATTERNS] = {0};
+    for (u32 i = 0; i < rd16(bases.p + 0x0A); i++) {
+        const u8 *row = bases.p + rd64(bases.p + 0x40 + i * 24 + 8);
+        int pat = (int)rd32(row + 4), m = (int)rd32(row + 0xc);
+        if (pat < 0 || pat >= TWO_PATTERNS) continue;
+        for (int k = 0; k < nc; k++) if (church[k] == m) { count[pat]++; break; }
+    }
+    char path[1300], line[64];
+    snprintf(path, sizeof path, "%s" SEP "work" SEP "native" SEP "two-regions.txt", g_app);
+    make_parents(path);
+    FILE *f = fopen(path, "w");
+    if (!f) return 0;
+    fprintf(f, "# Written by the launcher: two-regions pattern, churches on it.\n");
+    int lo = 99, hi = 0;
+    for (int g = 0; g < 8; g++)
+        for (int k = 0; k < 5; k++) {
+            int pat = 40 * g + 20 + k;
+            snprintf(line, sizeof line, "%d %d\n", pat, count[pat]);
+            fputs(line, f);
+            if (count[pat] < lo) lo = count[pat];
+            if (count[pat] > hi) hi = count[pat];
+        }
+    fclose(f);
+    logf_("two-regions: churches on the merged Mountaintop patterns: %d..%d (%d church small-base ids)", lo, hi, nc);
+    return nc > 0;
+}
+// table: 0 map flags, 1 play area (unchanged), 2 small bases, 3 MapPatternSet. flags: the game's map flag table.
+static buf map_test_table(buf src, int table, buf flags, buf points, int two) {
+    buf p = {xalloc(src.n), src.n}, none = {0};
+    memcpy(p.p, src.p, src.n);
+    u32 count = rd16(p.p + 0x0A);
+    int ok = 1;
+    static signed char kind[TWO_PATTERNS];
+    pattern_kinds(flags, kind);
+    if (table == 3) {  // weights: only the Mountaintop sets (last digit 1) below 1000
+        int kept = 0, zeroed = 0;
+        for (u32 i = 0; i < count; i++) {
+            int id = (int)rd32(p.p + 0x40 + i * 24);
+            u8 *row = p.p + rd64(p.p + 0x40 + i * 24 + 8);
+            if (id >= 1000) continue;
+            if (id % 10 == 1 && rd32(row + 4)) kept++;
+            else wr32(row, 0), wr16(row + 0xe, 0), zeroed++;
+        }
+        ok = kept == 8;
+        logf_("map test: MapPatternSet: %d Mountaintop sets keep their weight, %d others weighted 0", kept, zeroed);
+    } else if (table == 0 && two) {
+        ok = two_pairs_ok(kind);
+        int got = 0;
+        for (int g = 0; ok && g < 8; g++)
+            for (int k = 0; ok && k < 5; k++) {
+                int a_pat = 40 * g + 20 + k, b_pat = 40 * g + 30 + k;
+                static set_list a;
+                a.n = 0;
+                for (u32 i = 0; i < rd16(p.p + 0x0A) && a.n < 64; i++) {
+                    const u8 *row = p.p + rd64(p.p + 0x40 + i * 24 + 8);
+                    if ((int)rd32(row + 4) == a_pat) a.sets[a.n++] = rd32(row + 8);
+                }
+                int n = copy_pattern_rows(&p, b_pat, a_pat, keep_b_flag, &a);
+                ok = n > 0;
+                got += n;
+            }
+        logf_("two-regions: %d map flag rows of the Rotted Woods patterns added to the 40 Mountaintop patterns", got);
+    } else if (table == 2 && two) {
+        static attach_sets sets;
+        ok = two_pairs_ok(kind) && attach_points(points, &sets);
+        int removed = 0, added = 0, most = 0;
+        if (ok) {
+            buf less = param_remove_rows(p, drop_gone_b, &sets, &removed);
+            ok = less.p != NULL;
+            if (ok) free(p.p), p = less;
+        }
+        for (int g = 0; ok && g < 8; g++)
+            for (int k = 0; ok && k < 5; k++) {
+                int a_pat = 40 * g + 20 + k, b_pat = 40 * g + 30 + k, total = 0;
+                memset(sets.a_has, 0, sizeof sets.a_has);
+                for (u32 i = 0; i < rd16(p.p + 0x0A); i++) {
+                    const u8 *row = p.p + rd64(p.p + 0x40 + i * 24 + 8);
+                    if ((int)rd32(row + 4) == a_pat && rd32(row + 8) < ATTACH_MAX) sets.a_has[rd32(row + 8)] = 1, total++;
+                }
+                int n = copy_pattern_rows(&p, b_pat, a_pat, keep_b_base, &sets);
+                added += n;
+                total += n;
+                if (total > most) most = total;
+                ok = total < 128;  // the game reads at most 127 per pattern
+            }
+        logf_("two-regions: small bases: %d removed where the woods are, %d added from the Rotted Woods patterns (most on one pattern %d)",
+              removed, added, most);
+    }
+    if (!ok) { free(p.p); return none; }
+    return p;
+}
+// The map-test tables, changed (maps[t].p stays empty for a table left alone); 0 if one fails.
+static int map_tables(buf bundle, int index[4], buf maps[4]) {
+    static const char *const NAMES[4] = {"\\LotResultMapPatternFlag.param", "\\LotResultPlayAreaParam.param",
+                                         "\\LotResultSmallBaseAndSpot.param", "\\MapPatternSet.param"};
+    int two = two_regions_wanted();
+    for (int t = 0; t < 4; t++)
+        if ((index[t] = bnd4_find(bundle, NAMES[t])) < 0) return 0;
+    int ap = bnd4_find(bundle, "\\SmallBaseAndSpotAttachPoint.param");
+    if (ap < 0) return 0;
+    for (int t = 0; t < 4; t++) {
+        if (t == 1 || (!two && t != 3)) continue;
+        if (!(maps[t] = map_test_table(bnd4_file(bundle, index[t]), t, bnd4_file(bundle, index[0]), bnd4_file(bundle, ap), two)).p) return 0;
+    }
+    if (two) {
+        int d = bnd4_find(bundle, "\\SmallBaseAndSpotDefine.param");
+        if (d < 0 || !write_churches(bnd4_file(bundle, d), maps[2])) return 0;
+    }
+    return 1;
+}
+
 static int build_regulation(const char *game_dir) {
     char path[1300];
     snprintf(path, sizeof path, "%s" SEP "regulation.bin", game_dir);
@@ -930,8 +1216,8 @@ static int build_regulation(const char *game_dir) {
     if (memcmp(dcx, "DCX", 3) || memcmp(dcx + 0x28, "ZSTD", 4) || csize > enc.n - 16 - 0x4C)
         return free(enc.p), logf_("regulation.bin is not in the expected format"), 0;
     buf bundle = {xalloc((size_t)usize + (1 << 17)), usize};
-    buf patched = {0}, body = {0}, param = {0}, speffect = {0}, step = {0};
-    int ok = 0, index, sp_index, npc_index, area_index;
+    buf patched = {0}, body = {0}, param = {0}, speffect = {0}, step = {0}, maps[4] = {{0}}, cur = {0};
+    int ok = 0, index, sp_index, npc_index, area_index, map_index[4] = {-1, -1, -1, -1};
     u8 *team_row = NULL;
     if (nr_zstd_decompress(dcx + 0x4C, csize, bundle.p, (size_t)usize + (1 << 17)) != usize) {
         logf_("regulation.bin could not be unpacked");
@@ -946,6 +1232,9 @@ static int build_regulation(const char *game_dir) {
         logf_("The game's NpcParam looks different than expected. The game may have been updated; the mod needs an update too.");
     } else if (no_rain_wanted() && ((area_index = bnd4_find(bundle, PLAY_AREA_PARAM)) < 0 || !no_rain(bnd4_file(bundle, area_index)))) {
         logf_("The game's PlayAreaCreateCommonParam looks different than expected; no-rain cannot be applied.");
+    } else if ((two_regions_wanted() || map_control_wanted()) && !map_tables(bundle, map_index, maps)) {
+        logf_("The game's map pattern tables look different than expected; %s cannot be applied.",
+              two_regions_wanted() ? "two-regions" : "map-test-control");
     } else {
         // effectEndurance stays -1 (the template's): until removed; death removes it
         team_row[0x16D] = 16;                // changeTeamType 16
@@ -955,8 +1244,12 @@ static int build_regulation(const char *game_dir) {
         // to be compressed: the game crashes at start-up on a 55 MB regulation.bin of stored zstd
         // blocks. ponytail: unlike the game's own file this is not zstd; if the game ever stops
         // taking zlib here, a zstd compressor is the upgrade path.
+        if (two_regions_wanted()) logf_("Test option: two-regions (the Mountaintop patterns with the Rotted Woods added)");
+        if (map_control_wanted()) logf_("Test option: map-test-control (the generator draws a Mountaintop pattern)");
         step = bnd4_replace(bundle, index, param);
         patched = bnd4_replace(step, sp_index, speffect);
+        for (int t = 0; t < 4; t++)
+            if (maps[t].p) cur = bnd4_replace(patched, map_index[t], maps[t]), free(patched.p), patched = cur;
         body = dcx_write(patched);
         size_t padded = (body.n + 15) / 16 * 16;
         buf out = {xalloc(16 + padded), 16 + padded};
@@ -971,6 +1264,7 @@ static int build_regulation(const char *game_dir) {
         free(out.p);
     }
     free(enc.p); free(bundle.p); free(param.p); free(speffect.p); free(step.p); free(patched.p); free(body.p);
+    for (int t = 0; t < 4; t++) free(maps[t].p);
     return ok;
 }
 
@@ -1008,6 +1302,74 @@ static int free_spot(const rect *used, size_t n, int side, int width, int height
 }
 
 // quality: 'h' or 'l', the game's two texture sets. Returns 1 on success.
+// two-regions, the map screen: it shows one texture pack per map type, menu:/71_MapTile_M%02d.tpf
+// (0x140ec2cc0), 256 x 256 BC7 tiles named MENU_MapTile_L<level>_<x>_<y>. The Mountaintop's (01) and the
+// Rotted Woods' (03) each redraw their own part over the plain map's (00). Both packs are replaced by one
+// with the Mountaintop's tiles and, in every 4 x 4 block where the Rotted Woods' tile differs from the
+// plain one, the Rotted Woods' block (BC7 blocks stand alone, so no re-encoding). Written only with the
+// setting on; removed otherwise. ponytail: textures only the Rotted Woods' pack has (3 "_B1" tiles) are
+// not added; adding them means rebuilding the TPF's tables.
+typedef struct { const u8 *dds; u32 size; } tpf_tex;
+static tpf_tex tpf_find(buf tpf, const u8 *name_utf16, size_t name_bytes) {
+    tpf_tex none = {0};
+    for (u32 i = 0; tpf.n >= 0x10 && i < rd32(tpf.p + 8) && 0x10 + (size_t)(i + 1) * 0x14 <= tpf.n; i++) {
+        const u8 *e = tpf.p + 0x10 + i * 0x14;
+        u32 off = rd32(e), size = rd32(e + 4), name = rd32(e + 0x0C);
+        if ((u64)off + size <= tpf.n && (u64)name + name_bytes + 2 <= tpf.n && !memcmp(tpf.p + name, name_utf16, name_bytes) &&
+            !tpf.p[name + name_bytes] && !tpf.p[name + name_bytes + 1]) {
+            tpf_tex t = {tpf.p + off, size};
+            return t;
+        }
+    }
+    return none;
+}
+static int build_two_region_map(const char *game_dir, buf bhd, const char *bdt) {
+    char path[1300];
+    buf pack[3] = {{0}};  // 00 plain, 01 the Mountaintop, 03 the Rotted Woods
+    static const int IDS[3] = {0, 1, 3};
+    int ok = 1, merged = 0;
+    for (int k = 0; k < 3; k++) {
+        snprintf(path, sizeof path, "/menu/71_maptile_m%02d.tpf.dcx", IDS[k]);
+        buf dcx = archive_read(bhd, bdt, path);
+        pack[k] = dcx.p ? dcx_read(game_dir, dcx) : dcx;
+        free(dcx.p);
+        ok = ok && pack[k].p && pack[k].n >= 0x10 && !memcmp(pack[k].p, "TPF", 3);
+    }
+    for (u32 i = 0; ok && i < rd32(pack[1].p + 8) && 0x10 + (size_t)(i + 1) * 0x14 <= pack[1].n; i++) {
+        const u8 *e = pack[1].p + 0x10 + i * 0x14;
+        u32 off = rd32(e), size = rd32(e + 4), name = rd32(e + 0x0C);
+        size_t len = 0;
+        while ((u64)name + len + 1 < pack[1].n && (pack[1].p[name + len] || pack[1].p[name + len + 1])) len += 2;
+        tpf_tex plain = tpf_find(pack[0], pack[1].p + name, len), rot = tpf_find(pack[2], pack[1].p + name, len);
+        u8 *mine = pack[1].p + off;
+        if ((u64)off + size > pack[1].n || size <= DDS_HEADER || !plain.dds || !rot.dds || plain.size != size || rot.size != size ||
+            memcmp(mine, plain.dds, DDS_HEADER) || memcmp(mine, rot.dds, DDS_HEADER) || memcmp(mine + 84, "DX10", 4) ||
+            rd32(mine + 128) != 98 || (size - DDS_HEADER) % 16)
+            continue;
+        for (u32 at = DDS_HEADER; at < size; at += 16)
+            if (memcmp(rot.dds + at, plain.dds + at, 16)) memcpy(mine + at, rot.dds + at, 16), merged++;
+    }
+    if (ok) {
+        buf out = dcx_write(pack[1]);
+        for (int k = 1; k < 3; k++) {
+            snprintf(path, sizeof path, "%s" SEP "work" SEP "build" SEP "menu" SEP "71_maptile_m%02d.tpf.dcx", g_app, IDS[k]);
+            ok = ok && write_file(path, out.p, out.n);
+        }
+        free(out.p);
+        logf_("two-regions: map screen built (%d blocks of the Rotted Woods over the Mountaintop's tiles)", merged);
+    } else
+        logf_("The game's map screen textures look different than expected; two-regions cannot be applied.");
+    for (int k = 0; k < 3; k++) free(pack[k].p);
+    return ok;
+}
+static void remove_two_region_map(void) {
+    char path[1300];
+    for (int k = 1; k <= 3; k += 2) {
+        snprintf(path, sizeof path, "%s" SEP "work" SEP "build" SEP "menu" SEP "71_maptile_m%02d.tpf.dcx", g_app, k);
+        remove(path);
+    }
+}
+
 static int build_icons(const char *game_dir, buf bhd, const char *bdt, char quality) {
     char path[1300];
     snprintf(path, sizeof path, "/menu/21_common_dlc01_%c.sblytbnd.dcx", quality);
@@ -1349,7 +1711,7 @@ int core_build(const char *game_dir) {
     // BUILD_FORMAT: bump when the set of files the launcher builds changes.
     snprintf(stamp, sizeof stamp, "%016llx%016llx", (unsigned long long)fnv1a64(enc.p, enc.n),
              (unsigned long long)(fnv1a64(dll.p, dll.n) + BUILD_FORMAT + ((u64)no_rain_wanted() << 40) +
-                                     ((u64)slow_time_wanted() << 41)));
+                                     ((u64)slow_time_wanted() << 41) + ((u64)two_regions_wanted() << 42) + ((u64)map_control_wanted() << 43)));
     free(dll.p);
     buf old_stamp = read_file(stamp_path);
     int same = old_stamp.n == 32 && !memcmp(old_stamp.p, stamp, 32);
@@ -1374,6 +1736,8 @@ int core_build(const char *game_dir) {
     }
     if (ok) logf_("Menu texts built for %d languages", langs);
     ok = ok && build_icons(game_dir, bhd, bdt_path, 'h') && build_icons(game_dir, bhd, bdt_path, 'l');
+    if (ok && two_regions_wanted()) ok = build_two_region_map(game_dir, bhd, bdt_path);
+    if (!two_regions_wanted()) remove_two_region_map();
     free(bhd.p);
     if (!ok) return 0;
     logf_("Menu icons added");
@@ -1559,7 +1923,7 @@ int core_selftest(void) {
                                 "nope = true\r\nloot-test = yes\r\n\r\ndebug-log = false";
         signed char v[SETTINGS_COUNT];
         char bad[64];
-        static const signed char want[SETTINGS_COUNT] = {1, 0, 1, -1, -1, 0};
+        static const signed char want[SETTINGS_COUNT] = {1, 0, 1, -1, -1, 0, -1, -1, -1};
         int good = settings_parse(t, sizeof t - 1, v, bad, sizeof bad) == 2 && !memcmp(v, want, sizeof v) &&
                    !strcmp(bad, "nope = true, loot-test = yes");
         good = good && !load_settings("/nonexistent/test-settings.toml", v);

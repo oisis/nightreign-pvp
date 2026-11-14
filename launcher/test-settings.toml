@@ -7,3 +7,6 @@ no-rain = false     # both players the same: the rain outside the circle does no
 slow-time = false   # both players the same: day and circle clocks run about ten times slower (the host's counts)
 full-sync = true    # invader: ask the host for its full world state (enemies, events); false only for tests
 loot-test = false   # logging only: what lies on the ground, every pickup and equipment dialog
+map-test-control = false  # experiment, own expedition: the game draws one of its own Mountaintop patterns (a control)
+two-regions = false       # experiment, own expedition: the Mountaintop and the Rotted Woods in one map, more flasks
+no-host = false           # test: your own expedition opens no host session (nobody can invade you)

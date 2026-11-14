@@ -61,7 +61,7 @@ static const char *const KEY_LINES[] = {
     "not hooked", "not as expected", "not expected", "cannot", "failed", "NOT ", "not started", "not written",
     "host: session up", "host: expedition reached", "host: expedition over", "host: member admitted", "role: ",
     "host: no member left", "leave done", "join: search started", "joining lobby", "join -> ", "stopping (",
-    "in the host's world", "world sync at step", "invasion won", "invasion lost", "invasion neither", "level: ", "reward test: won", "reward test: lost",
+    "in the host's world", "world sync at step", "invasion won", "invasion lost", "invasion neither", "level: ", "map test", "two-regions", "expedition: result", "reward test: won", "reward test: lost",
     "expedition end requested", "still down", "watchdog", "no map load", "went back", "code patch", "crash"};
 static void logf(const char *fmt, ...) {
     char line[1024];
@@ -509,7 +509,9 @@ static void host_test_start(void) {
     g_lobby = 0;
     g_someone_joining = 0;
     g_marked_squad = ~0u;
-    g_host_test = 1;  // every player hosts its own expeditions (no switch since 14c271a)
+    // every player hosts its own expeditions (no switch since 14c271a); no-host (test setting): the own
+    // expedition opens no host session (to test whether item pickup breaks inside our host session)
+    g_host_test = setting(S_NO_HOST) ? 0 : 1;
     g_host_test_tick = 0;
 }
 // InGame step, every frame until called: create once the network is ready.
@@ -780,6 +782,21 @@ static void generate_hook(unsigned long long a1, unsigned long long a2, unsigned
     char *pa = *(char **)(g_base + 0x3c13158);
     if (gm) memcpy(gm_before, gm + 0xa00, sizeof gm_before);
     if (pa) memcpy(pa_before, pa, sizeof pa_before);
+    // map-test-control / two-regions: the generator draws the pattern itself (a forced gm +0xb48 left items
+    // unpickable, runs 30..36). Its region argument v3 (rare map layer, u8: the region the player chose)
+    // becomes the Mountaintop (1); the launcher left a weight only on the Mountaintop sets, so one of the
+    // Mountaintop patterns is drawn (two-regions: with the Rotted Woods added by the launcher).
+    if ((setting(S_MAP_CONTROL) || setting(S_TWO_REGIONS)) && g_join != 4 && v3 && !IsBadReadPtr(v3, 32)) {
+        unsigned char *b = v3[1], *e = v3[2], *cap = v3[3];
+        if (b && e > b) {
+            for (unsigned char *q = b; q < e; q++) *q = 1;
+            logf("map test: generator region argument set to the Mountaintop (1)");
+        } else if (b && e == b && cap > e) {
+            *e = 1, v3[2] = e + 1;
+            logf("map test: generator region argument was empty; the Mountaintop (1) added");
+        } else
+            logf("map test: generator region argument not usable; the draw stays the game's own");
+    }
     ((void (*)(unsigned long long, unsigned long long, unsigned long long, unsigned long long, void *, void *, void *,
                void *, unsigned long long))(g_base + RVA_GENERATE))(a1, a2, a3, a4, v1, v2, v3, v4, a9);
     logf("generate (%s): done; start block after %08x", g_generate_where, gm ? *(unsigned *)(gm + 0xa74) : 0);
@@ -1551,6 +1568,123 @@ static void reward_hook(unsigned long long a1, unsigned a2) {
     } else
         logf("reward test: %s: no player data, nothing granted", won ? "won" : "lost");
 }
+// two-regions: the map request (0x6b06f0, called once, from RequestMoveMap at 0xc27a41) turns the pattern
+// into the current expedition and puts one region flag (7601..7606, the pattern's map type) into gm +0xbb8
+// (int[4], count int64 at +0xbd0). Map tiles take their variant from those flags, per tile
+// (CalcGetReplaceMapIdByDisaster, 0x6ab7a0: the first flag whose variant the tile has), and so do the
+// tile scripts (run 35: the Rotted Woods' rot works with the Mountaintop as the map type). The patterns
+// are the game's Mountaintop ones (40g+20..24) with the Rotted Woods added by the launcher; the map type
+// stays the Mountaintop's (what its cold and ice dragon need, runs 33..35). Here, once per map request:
+// 7603 (the Rotted Woods, tile variant 3) into the list, the real event flags 7601 / 7603 on and the other
+// region flags off. Host and invader alike. Event flag calls: 0x5e7260 get (man, &id, tag), 0x5e79f0 set
+// (man, &id, on, tag, notify 0, 0), the manager at 0x3c115a8.
+static int two_pattern(unsigned pat) { return pat < 320 && pat % 40 >= 20 && pat % 40 < 25; }
+static const int TWO_ON[2] = {7601, 7603}, TWO_OFF[4] = {7600, 7602, 7604, 7605};
+static int two_flag(int id, int set, int on) {  // set: 0 read, 1 write
+    char *man = *(char **)(g_base + 0x3c115a8);
+    if (!man) return -1;
+    struct { unsigned char kind; const char *name; } tag = {1, "nrpvp two-regions"};
+    if (!set) return ((char (*)(char *, int *, void *))(g_base + 0x5e7260))(man, &id, &tag) != 0;
+    ((void (*)(char *, int *, char, void *, char, char))(g_base + 0x5e79f0))(man, &id, (char)on, &tag, 0, 0);
+    return on;
+}
+static void two_regions_flags(void) {
+    char line[160] = "";
+    for (int i = 0; i < 2; i++)
+        if (two_flag(TWO_ON[i], 0, 0) == 0) two_flag(TWO_ON[i], 1, 1), snprintf(line + strlen(line), sizeof line - strlen(line), " +%d", TWO_ON[i]);
+    for (int i = 0; i < 4; i++)
+        if (two_flag(TWO_OFF[i], 0, 0) == 1) two_flag(TWO_OFF[i], 1, 0), snprintf(line + strlen(line), sizeof line - strlen(line), " -%d", TWO_OFF[i]);
+    logf("two-regions: event flags at the map request:%s", line[0] ? line : " nothing to change");
+}
+static int g_two_active, g_two_requests;  // the current map is a two-regions one (not the hub); map requests
+static unsigned *map_request_hook(unsigned *out, unsigned *request) {
+    unsigned req = request ? *request : 0;
+    unsigned *r = ((unsigned *(*)(unsigned *, unsigned *))(g_base + 0x6b06f0))(out, request);
+    char *gm = *(char **)(g_base + 0x3c13258);
+    // 0xa000000: the hub (the pattern stays in +0xb4c there; nothing of ours belongs in the hub)
+    g_two_active = gm && req != 0xa000000 && two_pattern(*(unsigned *)(gm + 0xb4c));
+    if (!g_two_active) {
+        if (gm && req != 0xa000000) logf("two-regions: map request: pattern %u is not a Mountaintop pattern; nothing added", *(unsigned *)(gm + 0xb4c));
+        return r;
+    }
+    g_two_requests++;
+    int *flags = (int *)(gm + 0xbb8);
+    long long *count = (long long *)(gm + 0xbd0);
+    static const int WANT[2] = {7601, 7603};
+    for (int w = 0; w < 2; w++) {
+        int have = 0;
+        for (long long i = 0; i < *count && i < 4; i++) have |= flags[i] == WANT[w];
+        if (!have && *count >= 0 && *count < 4) flags[(*count)++] = WANT[w];
+    }
+    logf("two-regions: map request: pattern %u, map type +b46 %d, +b50 %d, region flags (%lld) %d %d %d %d",
+         *(unsigned *)(gm + 0xb4c), (int)(unsigned char)gm[0xb46], *(int *)(gm + 0xb50), *count,
+         *count > 0 ? flags[0] : -1, *count > 1 ? flags[1] : -1, *count > 2 ? flags[2] : -1, *count > 3 ? flags[3] : -1);
+    two_regions_flags();
+    return r;
+}
+// Decision 26: on a two-regions map the player starts with more HP flask charges, so that with every
+// church taken the total is at least 7: start = 3 + max(0, 7 - 3 - churches on the pattern). The game:
+// player game data = *(GameDataMan 0x3c078d0 + 8); +0xff HP flask charges (maximum), +0x100 FP; set at
+// load from CharaInitParam +0xfe (3 for the heroes) through 0x20d9d0 (0x200ed7). A church is script
+// 2004[86] -> 0x5fdad0 (0x20d9d0(pgd, +0xff + 1, +0x100), +0x1a8 += 1) and 2004[87] -> 0x60ad60 (fill
+// to the new maximum). Churches per pattern: work/native/two-regions.txt from the launcher.
+static int two_churches(unsigned pat) {
+    char path[MAX_PATH], line[64];
+    next_to_dll(path, sizeof path, "two-regions.txt");
+    FILE *f = fopen(path, "r");
+    int found = -1;
+    while (f && fgets(line, sizeof line, f)) {
+        unsigned p;
+        int c;
+        if (line[0] != '#' && sscanf(line, "%u %d", &p, &c) == 2 && p == pat) found = c;
+    }
+    if (f) fclose(f);
+    return found;
+}
+static void two_regions_flasks(void) {
+    static int done_for;
+    if (done_for == g_two_requests) return;
+    char *gm = *(char **)(g_base + 0x3c13258), *gdm = *(char **)(g_base + 0x3c078d0), *pgd = gdm ? *(char **)(gdm + 8) : NULL;
+    if (!gm || !pgd) return;
+    done_for = g_two_requests;
+    unsigned pat = *(unsigned *)(gm + 0xb4c);
+    int churches = two_churches(pat), extra;
+    unsigned char hp = (unsigned char)pgd[0xff], fp = (unsigned char)pgd[0x100];
+    if (churches < 0) { logf("two-regions: flasks: no church count for pattern %u; left alone", pat); return; }
+    if (hp != 3) { logf("two-regions: flasks: start count %u, not the expected 3; left alone", hp); return; }
+    extra = 7 - 3 - churches;
+    if (extra <= 0) { logf("two-regions: flasks: pattern %u has %d churches; start stays 3", pat, churches); return; }
+    ((void (*)(char *, unsigned char, unsigned char))(g_base + 0x20d9d0))(pgd, (unsigned char)(hp + extra), fp);
+    ((void (*)(void))(g_base + 0x60ad60))();  // fill to the new maximum, as a church does
+    logf("two-regions: flasks: HP charges %u -> %u (pattern %u, %d churches, at least 7 with all of them)", hp,
+         (unsigned char)pgd[0xff], pat, churches);
+}
+// Item pickup while hosting (runs 38..41: with our host session open, part of the items and all weapons
+// showed the prompt but pressing did nothing; with no-host everything could be picked up). The game's
+// pickup actions (0x1405c85a0, per frame) build an action entry for each map item near the player and
+// ask the action-button manager (0x140b8fc70 -> 0x140b8d870 on 0x143c177d8) whether it is pressed; if so
+// the pickup runs (0x1405ca0b0 -> 0x140575490). For the items of the second list (0x140578110), entry
+// byte +9 is set when a session exists (CSSessionManager +0x8 handle != 0) and its role (+0x10) is not 7
+// (call at 0x1405c92f0); the first list never sets it. Our solo host session has handle 1, role 5, so
+// those items got the byte; no-host leaves it 0 and they work. The pickup itself handles a session on
+// its own (0x140575490: a client, lobby_state 6, asks the host with packet 0x2c; a host removes the item
+// and tells the members, 0x14057fb50). So on the host (lobby_state 3) the byte is cleared before the
+// manager reads it. The invader (lobby_state 6) is left as the game has it and only logged (debug-log).
+static unsigned char pickup_action_hook(void *mgr, unsigned char *action) {
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
+    unsigned state = sm ? *(unsigned *)(sm + SM_LOBBY_STATE) : 0, role = sm ? *(unsigned *)(sm + 0x10) : 0;
+    unsigned char before = action ? action[9] : 0;
+    static int cleared_told;
+    if (action && before && state == 3) {
+        action[9] = 0;
+        if (cleared_told < 3) cleared_told++, logf("pickup: session byte of a pickup action cleared on the host (lobby_state %u role %u)", state, role);
+    }
+    unsigned char r = ((unsigned char (*)(void *, unsigned char *))(g_base + 0xb8fc70))(mgr, action);
+    if (r && setting(S_DEBUG_LOG))
+        logf("pickup: action pressed: entry %08x byte+9 was %u now %u, +0xb %u, lobby_state %u role %u", action ? *(unsigned *)(action + 0x40) : 0,
+             before, action ? action[9] : 0, action ? action[0xb] : 0, state, role);
+    return r;
+}
 static void hook_acceptance(void) {
     if (1) hook_call(0xc32971, 0x1fd620, (void *)reward_hook, "reward test: expedition reward");
     if (1) {
@@ -1574,6 +1708,8 @@ static void hook_acceptance(void) {
         hook_call(0x674f37, 0x66f3b0, (void *)finish_down_hook, "finish test: going down");
         hook_call(0x43dac3, 0x66dec0, (void *)finish_hit_hook, "finish test: gauge hit");
     }
+    if (setting(S_TWO_REGIONS)) hook_call(0xc27a41, 0x6b06f0, (void *)map_request_hook, "two-regions: map request");
+    hook_call(0x5c92f0, 0xb8fc70, (void *)pickup_action_hook, "pickup: map item action (session byte)");
     if (setting(S_LOOT_TEST)) {
         hook_call(0x6fd220, 0x724420, (void *)loot_update_hook, "loot test: pickup objects");
         hook_call(0x72464c, 0x7247d0, (void *)loot_pickup_hook, "loot test: pickup");
@@ -3463,7 +3599,7 @@ static void host_expedition(int step) {
             g_self_check = 0;
             lobby_search_reset();
             host_test_start();
-            logf("host: expedition reached its world%s", g_host_test ? ", opening a host session" : " (no host session: host-test is off)");
+            logf("host: expedition reached its world%s", g_host_test ? ", opening a host session" : " (no host session: no-host is on)");
             if (g_host_test) {
                 if (g_stop_pending) finish_pending_stop(1);
                 if (!g_network_on) set_network(1);
@@ -3685,6 +3821,32 @@ static void step_hook(void *ctrl, void *time, int step) {
     }
     // Both roles live in every player (no switches since 14c271a): its own expeditions host; while it is
     // an invader in another player's world (g_join 4) it opens and advertises nothing of its own.
+    // map-test-control / two-regions: the generator draws the pattern (generate_hook); here only a check.
+    if ((setting(S_MAP_CONTROL) || setting(S_TWO_REGIONS)) && g_join != 4 && step == 21) {
+        char *gm = *(char **)(g_base + 0x3c13258);
+        static unsigned told = 0xffffffff;
+        unsigned pat = gm ? *(unsigned *)(gm + 0xb48) : 0xffffffff;
+        if (gm && pat != told)
+            told = pat, logf("map test: generator pattern %u (%s)", pat,
+                             pat < 320 && pat % 40 >= 20 && pat % 40 < 25 ? "a Mountaintop pattern, as wanted" : "NOT a Mountaintop pattern");
+    }
+    if (setting(S_TWO_REGIONS) && step == QM_STEP_INGAME && g_two_active) {
+        two_regions_flasks();
+        // The game clears 7603 between the map request and InGame (run 37: off in game, no rot; runs 34/35
+        // set it again in game and the rot worked). So in InGame: turned on when it is seen off, at most
+        // 3 times per expedition (it stayed on once set in runs 34/35; no per-frame setting).
+        static int rot_for = -1, rot_sets;
+        if (rot_for != g_two_requests) rot_for = g_two_requests, rot_sets = 0;
+        if (rot_sets < 3 && two_flag(7603, 0, 0) == 0) rot_sets++, two_flag(7603, 1, 1), logf("two-regions: event flag 7603 was off in game; set (%d of at most 3)", rot_sets);
+        // Watched, never written here (logged when they change): 7601, the powers 9193 / 9192, and the
+        // Rotted Woods' pattern flag 1046300590 (cleared by the game every frame in run 35).
+        static const int WATCH[5] = {7601, 7603, 9193, 9192, 1046300590};
+        static int seen[5] = {-1, -1, -1, -1, -1}, changes;
+        for (int k = 0; k < 5; k++) {
+            int v = two_flag(WATCH[k], 0, 0);
+            if (v != seen[k] && changes < 40) changes++, logf("two-regions: event flag %d is %s", WATCH[k], v ? "on" : "off"), seen[k] = v;
+        }
+    }
     static int told_invader;
     if (g_join != 4) {
         if (told_invader) told_invader = 0, logf("role: no longer an invader; own expeditions host again");
