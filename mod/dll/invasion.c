@@ -1579,7 +1579,7 @@ static void reward_hook(unsigned long long a1, unsigned a2) {
 // region flags off. Host and invader alike. Event flag calls: 0x5e7260 get (man, &id, tag), 0x5e79f0 set
 // (man, &id, on, tag, notify 0, 0), the manager at 0x3c115a8.
 static int two_pattern(unsigned pat) { return pat < 320 && pat % 40 >= 20 && pat % 40 < 25; }
-static const int TWO_ON[2] = {7601, 7603}, TWO_OFF[4] = {7600, 7602, 7604, 7605};
+static const int TWO_ON[1] = {7601}, TWO_OFF[4] = {7600, 7602, 7604, 7605};  // 7603 later, after the start flight
 static int two_flag(int id, int set, int on) {  // set: 0 read, 1 write
     char *man = *(char **)(g_base + 0x3c115a8);
     if (!man) return -1;
@@ -1590,7 +1590,7 @@ static int two_flag(int id, int set, int on) {  // set: 0 read, 1 write
 }
 static void two_regions_flags(void) {
     char line[160] = "";
-    for (int i = 0; i < 2; i++)
+    for (int i = 0; i < 1; i++)
         if (two_flag(TWO_ON[i], 0, 0) == 0) two_flag(TWO_ON[i], 1, 1), snprintf(line + strlen(line), sizeof line - strlen(line), " +%d", TWO_ON[i]);
     for (int i = 0; i < 4; i++)
         if (two_flag(TWO_OFF[i], 0, 0) == 1) two_flag(TWO_OFF[i], 1, 0), snprintf(line + strlen(line), sizeof line - strlen(line), " -%d", TWO_OFF[i]);
@@ -1642,8 +1642,14 @@ static int two_churches(unsigned pat) {
     return found;
 }
 static void two_regions_flasks(void) {
-    static int done_for;
-    if (done_for == g_two_requests) return;
+    // Run 44: the log read 3 at the first InGame frame, the user had 4 at the start (relics or the game
+    // add to it after that frame). So the count is read once the start flight is over (TWO_FLASK_DELAY_MS
+    // into the expedition) and topped up from what it is then: total = charges + churches >= 7.
+#define TWO_FLASK_DELAY_MS 30000
+    static int done_for = -1, seen_for = -1;
+    static DWORD since;
+    if (seen_for != g_two_requests) seen_for = g_two_requests, since = GetTickCount();
+    if (done_for == g_two_requests || GetTickCount() - since < TWO_FLASK_DELAY_MS) return;
     char *gm = *(char **)(g_base + 0x3c13258), *gdm = *(char **)(g_base + 0x3c078d0), *pgd = gdm ? *(char **)(gdm + 8) : NULL;
     if (!gm || !pgd) return;
     done_for = g_two_requests;
@@ -1651,12 +1657,12 @@ static void two_regions_flasks(void) {
     int churches = two_churches(pat), extra;
     unsigned char hp = (unsigned char)pgd[0xff], fp = (unsigned char)pgd[0x100];
     if (churches < 0) { logf("two-regions: flasks: no church count for pattern %u; left alone", pat); return; }
-    if (hp != 3) { logf("two-regions: flasks: start count %u, not the expected 3; left alone", hp); return; }
-    extra = 7 - 3 - churches;
-    if (extra <= 0) { logf("two-regions: flasks: pattern %u has %d churches; start stays 3", pat, churches); return; }
+    extra = 7 - hp - churches;
+    if (extra <= 0) { logf("two-regions: flasks: %u HP charges, pattern %u has %d churches; left as it is", hp, pat, churches); return; }
+    if (hp + extra > 14) extra = 14 - hp;
     ((void (*)(char *, unsigned char, unsigned char))(g_base + 0x20d9d0))(pgd, (unsigned char)(hp + extra), fp);
     ((void (*)(void))(g_base + 0x60ad60))();  // fill to the new maximum, as a church does
-    logf("two-regions: flasks: HP charges %u -> %u (pattern %u, %d churches, at least 7 with all of them)", hp,
+    logf("two-regions: flasks: HP charges %u -> %u (pattern %u, %d churches counted, at least 7 with all of them)", hp,
          (unsigned char)pgd[0xff], pat, churches);
 }
 // Item pickup while hosting (runs 38..41: with our host session open, part of the items and all weapons
@@ -3832,12 +3838,19 @@ static void step_hook(void *ctrl, void *time, int step) {
     }
     if (setting(S_TWO_REGIONS) && step == QM_STEP_INGAME && g_two_active) {
         two_regions_flasks();
-        // The game clears 7603 between the map request and InGame (run 37: off in game, no rot; runs 34/35
-        // set it again in game and the rot worked). So in InGame: turned on when it is seen off, at most
-        // 3 times per expedition (it stayed on once set in runs 34/35; no per-frame setting).
+        // The game clears 7603 between the map request and InGame (run 37: off in game, no rot; runs 35/43
+        // set it again at the first InGame frame: rot yes, but the start flight showed neither the hawk nor
+        // the character; run 37 without it: hawk visible). So 7603 is turned on only once the start flight
+        // is over: TWO_ROT_DELAY_MS after InGame began, when it is seen off, at most 3 times per expedition.
+        // ponytail: a fixed delay, not the end of the flight itself; the rot scripts wait for the flag, so
+        // a later start only delays the rot.
+#define TWO_ROT_DELAY_MS 30000
         static int rot_for = -1, rot_sets;
-        if (rot_for != g_two_requests) rot_for = g_two_requests, rot_sets = 0;
-        if (rot_sets < 3 && two_flag(7603, 0, 0) == 0) rot_sets++, two_flag(7603, 1, 1), logf("two-regions: event flag 7603 was off in game; set (%d of at most 3)", rot_sets);
+        static DWORD rot_since;
+        if (rot_for != g_two_requests) rot_for = g_two_requests, rot_sets = 0, rot_since = GetTickCount();
+        if (rot_sets < 3 && GetTickCount() - rot_since >= TWO_ROT_DELAY_MS && two_flag(7603, 0, 0) == 0)
+            rot_sets++, two_flag(7603, 1, 1),
+                logf("two-regions: event flag 7603 off %lus into the expedition; set (%d of at most 3)", (GetTickCount() - rot_since) / 1000, rot_sets);
         // Watched, never written here (logged when they change): 7601, the powers 9193 / 9192, and the
         // Rotted Woods' pattern flag 1046300590 (cleared by the game every frame in run 35).
         static const int WATCH[5] = {7601, 7603, 9193, 9192, 1046300590};

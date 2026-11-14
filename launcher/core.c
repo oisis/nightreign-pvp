@@ -1072,10 +1072,19 @@ static int attach_points(buf points, attach_sets *s) {
     logf_("two-regions: attach points in the Mountaintop's area %d, in the Rotted Woods' %d", in_a, in_b);
     return in_a > 0 && in_b > 0;
 }
+static int attach_area(buf points, u32 id) {  // SmallBaseAndSpotAttachPoint +0xc of point id, -1 unknown
+    for (u32 i = 0; i < rd16(points.p + 0x0A); i++)
+        if (rd32(points.p + 0x40 + i * 24) == id) return (int)rd32(points.p + rd64(points.p + 0x40 + i * 24 + 8) + 0xc);
+    return -1;
+}
 // Churches (SmallBaseAndSpotDefine rows with map icon 3, "Church": +0x2c; their small-base ids as
 // int16s at +4..+0x2b) per two-regions pattern -> work/native/two-regions.txt ("pattern churches"),
 // which the DLL reads for decision 26 (more HP flask charges at the start).
-static int write_churches(buf define, buf bases) {
+// Churches at attach points in Noklateo's area (SmallBaseAndSpotAttachPoint +0xc == 15; on this map all of
+// them lie on the west tiles 42..43 x 36..37) are not counted: on patterns 20, 22 and 24 exactly those were
+// missing from the map (runs 37, 43, 44: 3 / 3 / 4 counted, 2 / 2 / 2 seen). Why the game leaves them out
+// is not known.
+static int write_churches(buf define, buf bases, buf points) {
     short church[64];
     int nc = 0;
     u64 dsize = param_row_size(define);
@@ -1092,7 +1101,7 @@ static int write_churches(buf define, buf bases) {
     for (u32 i = 0; i < rd16(bases.p + 0x0A); i++) {
         const u8 *row = bases.p + rd64(bases.p + 0x40 + i * 24 + 8);
         int pat = (int)rd32(row + 4), m = (int)rd32(row + 0xc);
-        if (pat < 0 || pat >= TWO_PATTERNS) continue;
+        if (pat < 0 || pat >= TWO_PATTERNS || attach_area(points, rd32(row + 8)) == 15) continue;
         for (int k = 0; k < nc; k++) if (church[k] == m) { count[pat]++; break; }
     }
     char path[1300], line[64];
@@ -1150,6 +1159,20 @@ static buf map_test_table(buf src, int table, buf flags, buf points, int two) {
                 got += n;
             }
         logf_("two-regions: %d map flag rows of the Rotted Woods patterns added to the 40 Mountaintop patterns", got);
+        // Start point group (modifier set 190 -> SortieStartingPoint +0xc): with the Rotted Woods added, the
+        // start flight showed neither the hawk nor the character for group 708 (45_38 / 45_39, tiles that
+        // then load the Rotted Woods' variant: runs 33..35, 43, 44) and was fine for group 701 (west edge,
+        // 41_38 / 42_36: run 37, pattern 22). Groups 704 / 705 / 707 start inside the Rotted Woods (their
+        // conflict column says 13) and 706 on a Rotted Woods variant tile (44_39). So every merged pattern
+        // starts from group 701 (conflicts only with Noklateo, not on this map).
+        int moved = 0;
+        for (u32 i = 0; ok && i < rd16(p.p + 0x0A); i++) {
+            u8 *row = p.p + rd64(p.p + 0x40 + i * 24 + 8);
+            int pat = (int)rd32(row + 4);
+            if (pat >= 0 && pat < TWO_PATTERNS && pat % 40 >= 20 && pat % 40 < 25 && rd32(row + 8) == 190 && rd32(row + 0xc) != 701)
+                wr32(row + 0xc, 701), moved++;
+        }
+        logf_("two-regions: start point group set to 701 (west edge) on %d of the 40 merged patterns", moved);
     } else if (table == 2 && two) {
         static attach_sets sets;
         ok = two_pairs_ok(kind) && attach_points(points, &sets);
@@ -1194,7 +1217,7 @@ static int map_tables(buf bundle, int index[4], buf maps[4]) {
     }
     if (two) {
         int d = bnd4_find(bundle, "\\SmallBaseAndSpotDefine.param");
-        if (d < 0 || !write_churches(bnd4_file(bundle, d), maps[2])) return 0;
+        if (d < 0 || !write_churches(bnd4_file(bundle, d), maps[2], bnd4_file(bundle, ap))) return 0;
     }
     return 1;
 }
