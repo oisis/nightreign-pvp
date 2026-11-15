@@ -1547,6 +1547,56 @@ static void rune_install(void) {
     hook_call(0x3de800, RUNE_KILL_FN, (void *)rune_kill_hook, "runes: kill reward (own kill)");
     hook_call(0x51dc0b, RUNE_KILL_FN, (void *)rune_kill_hook, "runes: kill reward (reported kill)");
 }
+// Packets about another player's character, read every frame by 0x521ff0: 0x2b (16 bytes, loop 0x41c7c0) and
+// 0x72 (48 bytes, loop 0x4472a0). Each packet starts with the sender's own character handle (PlayerIns +0x78/+0x7c;
+// 0x2b is sent only by the machine whose local player that is, from PlayerIns update 0x675d20 via 0x41c9d0, to
+// every member). Both loops look the handle up with 0x519140 and call vt+0x120 on the result without a null
+// check: a packet for a character we do not have crashed the 3-player run at 0x41c8bf. When the lookup finds
+// nothing we hand back a dummy whose vt+0x120 says no, so the loop drops that packet (its je to the loop head),
+// and log the handle, the payload and the ids in our player set (PlayerIns +0x5a0 -> +8, what 0x5197e0 matches
+// the handle's low 11 bits against). Nothing else of the dummy is read: both loops stop at vt+0x120.
+static unsigned char pkt_no(void *self) { (void)self; return 0; }
+static void *pkt_dummy_vt[0x130 / 8];
+static void *pkt_dummy = pkt_dummy_vt;
+static void *pkt_lookup(void *wcm, unsigned long long *id, int kind) {
+    unsigned long long h = id ? *id : 0;  // the lookup releases the handle copy, so read it first
+    char *c = ((char *(*)(void *, unsigned long long *))(g_base + 0x519140))(wcm, id);
+    if (c) return c;
+    static DWORD next;
+    static unsigned skipped;
+    skipped++;
+    if ((int)(GetTickCount() - next) >= 0) {
+        next = GetTickCount() + 2000;
+        unsigned char *p = (unsigned char *)id + 0x10;  // both loops read the packet 0x10 above the handle copy
+        char ids[96] = "";
+        void **set = wcm ? (void **)((char *)wcm + 0x9a40) : NULL;
+        if (set && !IsBadReadPtr(set, 8) && !IsBadReadPtr(*(void ***)set, 0x18)) {
+            void **vt = *(void ***)set;
+            int n = ((int (*)(void *))vt[0])(set);
+            for (int k = 0; k < n && k < 8; k++) {
+                char *pc = ((char *(*)(void *, int))vt[2])(set, k), *gd = pc && !IsBadReadPtr(pc, 0x5a8) ? *(char **)(pc + 0x5a0) : NULL;
+                size_t l = strlen(ids);
+                snprintf(ids + l, sizeof ids - l, " %d", gd && !IsBadReadPtr(gd, 0xc) ? *(int *)(gd + 8) : -1);
+            }
+        }
+        char *me = wcm && !IsBadReadPtr((char *)wcm + 0x174e8, 8) ? *(char **)((char *)wcm + 0x174e8) : NULL;
+        char *cat = wcm && !IsBadReadPtr((char *)wcm + 0x9910, 8) ? *(char **)((char *)wcm + 0x9910) : NULL;
+        logf("crash watch: packet 0x%x for a character we do not have, dropped (%u so far): handle %08x %08x "
+             "(group %u, number %u), payload %08x %02x | our handle %08x %08x, player group %d, player set ids:%s",
+             kind, skipped, (unsigned)h, (unsigned)(h >> 32), (unsigned)(h >> 43) & 0x7f, (unsigned)(h >> 32) & 0x7ff,
+             IsBadReadPtr(p, 0xd) ? 0 : *(unsigned *)(p + 8), IsBadReadPtr(p, 0xd) ? 0 : p[0xc],
+             me && !IsBadReadPtr(me, 0x80) ? *(unsigned *)(me + 0x78) : 0, me && !IsBadReadPtr(me, 0x80) ? *(unsigned *)(me + 0x7c) : 0,
+             cat && !IsBadReadPtr(cat + 0x120, 4) ? *(int *)(cat + 0x120) : -1, ids);
+    }
+    return &pkt_dummy;
+}
+static void *pkt_lookup_2b(void *wcm, unsigned long long *id) { return pkt_lookup(wcm, id, 0x2b); }
+static void *pkt_lookup_72(void *wcm, unsigned long long *id) { return pkt_lookup(wcm, id, 0x72); }
+static void pkt_guard_install(void) {
+    pkt_dummy_vt[0x120 / 8] = (void *)pkt_no;
+    hook_call(0x41c8b7, 0x519140, (void *)pkt_lookup_2b, "crash guard: packet 0x2b character lookup");
+    hook_call(0x4473b7, 0x519140, (void *)pkt_lookup_72, "crash guard: packet 0x72 character lookup");
+}
 static void ult_pvp_install(void) {
     void **slot = (void **)(g_base + RVA_PLAYER_DMG_VTABLE) + 7;
     DWORD old;
@@ -2772,6 +2822,7 @@ static void hook_acceptance(void) {
         hook_call(0x43dac3, 0x66dec0, (void *)finish_hit_hook, "finish test: gauge hit");
         if ((g_settings[S_ULT_PVP] && g_settings[S_ULT_PVP] != 100) || g_debug_log) ult_pvp_install();
         rune_install();
+        pkt_guard_install();
     }
     hook_call(0xc27a41, 0x6b06f0, (void *)map_request_hook, "two-regions: map request");
     hook_call(0x5e7ff6, 0x6ab300, (void *)tile_flag_space_hook, "two-regions: tile flag space");
