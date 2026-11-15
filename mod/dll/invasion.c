@@ -856,6 +856,9 @@ static unsigned long long g_party_lowest;  // the lowest-id lobby with our key i
 static int g_in_expedition;
 static void party_host_over(void);
 #define LOBBY_PARTY_KEY "nrpvp_party"   // a gathering host's party code
+#define LOBBY_HP_KEY    "nrpvp_hp"      // the host's HP flask charges (+0xff), once its start value is final
+#define ALLY_FLASK_CUT  2                // an ally's charges at arrival = max(ALLY_FLASK_MIN, host's - this)
+#define ALLY_FLASK_MIN  1
 #define LOBBY_GO_KEY    "nrpvp_go"      // "1" once the host's expedition is generated (start block, generator results final)
 static int g_invader_in_world(void);        // joined as an invader and in the host's world
 static int side_count(int want_allies);     // remote session members that are allies / invaders (not the host)
@@ -2428,6 +2431,7 @@ static unsigned *map_request_hook(unsigned *out, unsigned *request) {
 // load from CharaInitParam +0xfe (3 for the heroes) through 0x20d9d0 (0x200ed7). A church is script
 // 2004[86] -> 0x5fdad0 (0x20d9d0(pgd, +0xff + 1, +0x100), +0x1a8 += 1) and 2004[87] -> 0x60ad60 (fill
 // to the new maximum). Churches per pattern: work/native/two-regions.txt from the launcher.
+static int g_flasks_final_for = -1;  // the host's start value of its charges is final for this map request
 static int two_churches(unsigned pat) {
     char path[MAX_PATH], line[64];
     next_to_dll(path, sizeof path, "two-regions.txt");
@@ -2513,6 +2517,7 @@ static void church_pins_log(char *model) {
     logf("churches: map pins on pattern %u (map type %u, +0x240 map size %llu): %d churches%s", pat, (unsigned char)model[0x60], size, n, out);
 }
 static void two_regions_flasks(void) {
+    if (g_as_ally && g_join == 4) return;  // an ally's charges come from the host's (enter_watch)
     // Run 44: the log read 3 at the first InGame frame, the user had 4 at the start (relics or the game
     // add to it after that frame). So the count is read once the start flight is over (TWO_FLASK_DELAY_MS
     // into the expedition) and topped up from what it is then: total = charges + churches >= 7.
@@ -2530,6 +2535,7 @@ static void two_regions_flasks(void) {
     char *gm = *(char **)(g_base + 0x3c13258), *gdm = *(char **)(g_base + 0x3c078d0), *pgd = gdm ? *(char **)(gdm + 8) : NULL;
     if (!gm || !pgd) return;
     done_for = g_two_requests;
+    g_flasks_final_for = g_two_requests;
     unsigned pat = *(unsigned *)(gm + 0xb4c);
     two_regions_churches_log(pat);
     int churches = two_churches(pat), extra;
@@ -3903,8 +3909,9 @@ static int g_reward_pending; // 1 won, 2 lost: applied at the expedition's rewar
 // module (0x427b70 / 0x427b80 / 0x427b90, 0x428bf0). The same calls here. Runes (+0x6c) are not touched;
 // the highest level +0x10c is put back to its own value when the level is restored.
 static int g_level_set, g_own_level, g_own_top_level;
-#define JOIN_LEVEL_CUT_PERCENT 40  // the joiner's level = max(1, floor(host level * (100 - this) / 100))
-#define JOIN_LEVEL_CUT_ALLIES 0    // 0: invaders only (the user decides about allies); 1: allies too
+#define JOIN_LEVEL_CUT_PERCENT 40  // a cut joiner's level = max(1, floor(host level * (100 - this) / 100))
+#define JOIN_LEVEL_CUT_ALLIES 1    // the host's summons: cut (the user's rule)
+#define JOIN_LEVEL_CUT_INVADERS 0  // invaders: the host's level exactly (decision 24)
 static int level_apply(int level, const char *why) {
     char *ps = *(char **)(g_base + 0x3c078d0), *chr = local_player();
     char *pd = ps ? *(char **)(ps + 8) : NULL;
@@ -4464,6 +4471,26 @@ static void enter_watch(char *sm) {
         applied = nowt;
         team_log("enter test, team effect lost right after the sync: put on again");
     }
+    // The host's summons: HP flask charges = max(ALLY_FLASK_MIN, host's - ALLY_FLASK_CUT), once, as soon as the host's
+    // lobby carries its final count (nrpvp_hp); set with the game's own 0x20d9d0 and filled with 0x60ad60 as a church
+    // does, so later churches still add one each (0x5fdad0 raises +0xff by one). The host's slot +0xff is logged too:
+    // whether the slot carries the count is not established (its level at +0x68 is).
+    static DWORD flask_done_for;
+    if (g_as_ally && g_enter_world && chr && flask_done_for != g_enter_tick) {
+        const char *hp = g_candidate ? g_steam.get_data(g_steam.mm, g_candidate, LOBBY_HP_KEY) : NULL;
+        char *ps = *(char **)(g_base + 0x3c078d0), *pd = ps ? *(char **)(ps + 8) : NULL, *slots = ps ? *(char **)(ps + 0x10) : NULL;
+        if (hp && *hp && pd && !IsBadReadPtr(pd, 0x110)) {
+            int host = atoi(hp), n = host - ALLY_FLASK_CUT, before = (unsigned char)pd[0xff];
+            if (n < ALLY_FLASK_MIN) n = ALLY_FLASK_MIN;
+            if (n > 14) n = 14;
+            flask_done_for = g_enter_tick;
+            ((void (*)(char *, unsigned char, unsigned char))(g_base + 0x20d9d0))(pd, (unsigned char)n, (unsigned char)pd[0x100]);
+            ((void (*)(void))(g_base + 0x60ad60))();
+            int s0 = slots && !IsBadReadPtr(slots, 2 * 0x8a0) ? (unsigned char)slots[0xff] : -1, s1 = slots && !IsBadReadPtr(slots, 2 * 0x8a0) ? (unsigned char)slots[0x8a0 + 0xff] : -1;
+            logf("ally flasks: host has %d HP charges (its lobby); ours %d -> %d (host's - %d, at least %d), filled | slots +0xff: %d %d",
+                 host, before, (unsigned char)pd[0xff], ALLY_FLASK_CUT, ALLY_FLASK_MIN, s0, s1);
+        }
+    }
     // decision 24: once the world sync is through and the host's slot holds its level, take that level
     if (g_enter_world && chr && !g_level_set) {
         char *ps = *(char **)(g_base + 0x3c078d0);
@@ -4474,9 +4501,9 @@ static void enter_watch(char *sm) {
             int no = *(int *)(sl + 8), lv = *(int *)(sl + 0x68);
             if (no != host_no || lv < 1 || lv > 15) continue;
             g_own_level = *(int *)(pd + 0x68), g_own_top_level = *(int *)(pd + 0x10c);
-            // the user's formula: the joiner gets the host's level less JOIN_LEVEL_CUT_PERCENT, never below 1
-            // (host 1 -> 1, 2 -> 1, 3 -> 1, 5 -> 3, 10 -> 6, 15 -> 9); allies only when JOIN_LEVEL_CUT_ALLIES is 1
-            int cut = !g_as_ally || JOIN_LEVEL_CUT_ALLIES, want = cut ? lv * (100 - JOIN_LEVEL_CUT_PERCENT) / 100 : lv;
+            // the user's formula: an ally gets the host's level less JOIN_LEVEL_CUT_PERCENT, never below 1 (host 1 -> 1,
+            // 2 -> 1, 3 -> 1, 5 -> 3, 10 -> 6, 15 -> 9); an invader the host's level (decision 24)
+            int cut = g_as_ally ? JOIN_LEVEL_CUT_ALLIES : JOIN_LEVEL_CUT_INVADERS, want = cut ? lv * (100 - JOIN_LEVEL_CUT_PERCENT) / 100 : lv;
             if (want < 1) want = 1;
             logf("level: host (player %d) is level %d; joiner (%s) level %d (highest %d) -> %d (%s)", no, lv, g_as_ally ? "ally" : "invader",
                  g_own_level, g_own_top_level, want, cut ? "host's level less the cut, at least 1" : "the host's level");
@@ -5089,6 +5116,18 @@ static void host_expedition(int step) {
         if (g_host_test == 2) {
             lobby_mark();
             lobby_position();
+            {  // the host's HP flask charges for its summons, once decision 26 has set the start value (or no two-region map)
+                char *gdm = *(char **)(g_base + 0x3c078d0), *pgd = gdm ? *(char **)(gdm + 8) : NULL;
+                static int published = -1;
+                static u64 for_lobby;
+                if (for_lobby != g_lobby) for_lobby = g_lobby, published = -1;
+                if (g_lobby && pgd && (!g_two_active || g_flasks_final_for == g_two_requests) && (unsigned char)pgd[0xff] != published) {
+                    char text[8];
+                    published = (unsigned char)pgd[0xff];
+                    snprintf(text, sizeof text, "%d", published);
+                    lobby_set(LOBBY_HP_KEY, text);
+                }
+            }
             if (g_lobby && !g_self_check && lobby_search_frame("host self-check")) g_self_check = 1;
         }
     } else if (g_in_expedition) {
