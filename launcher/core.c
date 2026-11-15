@@ -8,6 +8,7 @@
 #define _FILE_OFFSET_BITS 64
 #include "core.h"
 #include "data0_key.h"
+#include "data2_key.h"
 
 #include <stdarg.h>
 #include <stdint.h>
@@ -38,7 +39,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 17
+#define BUILD_FORMAT 19
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
                               "porbr", "rusru", "spaar", "spaes", "thath", "zhocn", "zhotw"};
@@ -176,9 +177,12 @@ static u64 fnv1a64(const u8 *p, size_t n) {
 
 #define LIMBS 64
 static u32 g_n0inv, g_r2[LIMBS];
+// The archive header key in use (data0 unless a map-pair test reads data2: rsa_use).
+static const u32 *g_rsa_n = DATA0_N;
+static u32 g_rsa_e = DATA0_E;
 
 static void mont_mul(u32 *r, const u32 *a, const u32 *b) {
-    const u32 *n = DATA0_N;
+    const u32 *n = g_rsa_n;
     u32 t[LIMBS + 2] = {0};
     for (int i = 0; i < LIMBS; i++) {
         u64 c = 0, s;
@@ -220,8 +224,8 @@ static void mont_mul(u32 *r, const u32 *a, const u32 *b) {
 }
 
 static void rsa_init(void) {
-    u32 x = DATA0_N[0];
-    for (int i = 0; i < 5; i++) x *= 2 - DATA0_N[0] * x;  // inverse of n mod 2^32 (Newton)
+    u32 x = g_rsa_n[0];
+    for (int i = 0; i < 5; i++) x *= 2 - g_rsa_n[0] * x;  // inverse of n mod 2^32 (Newton)
     g_n0inv = 0 - x;
     u32 r[LIMBS] = {1};
     for (int i = 0; i < 2 * 32 * LIMBS; i++) {  // r = 2^(2*2048) mod n by repeated doubling
@@ -235,18 +239,23 @@ static void rsa_init(void) {
         if (!ge) {
             ge = 1;
             for (int j = LIMBS - 1; j >= 0; j--)
-                if (r[j] != DATA0_N[j]) { ge = r[j] > DATA0_N[j]; break; }
+                if (r[j] != g_rsa_n[j]) { ge = r[j] > g_rsa_n[j]; break; }
         }
         if (ge) {
             u64 borrow = 0;
             for (int j = 0; j < LIMBS; j++) {
-                u64 d = (u64)r[j] - DATA0_N[j] - borrow;
+                u64 d = (u64)r[j] - g_rsa_n[j] - borrow;
                 r[j] = (u32)d;
                 borrow = (d >> 32) & 1;
             }
         }
     }
     memcpy(g_r2, r, sizeof r);
+}
+
+static void rsa_use(const u32 *n, u32 e) {  // switch the archive header key (data0 / data2)
+    g_rsa_n = n, g_rsa_e = e;
+    rsa_init();
 }
 
 // in: 256 bytes big-endian. out: 255 bytes big-endian (the value is below 2^2040 for valid data).
@@ -257,7 +266,7 @@ static void rsa_block(const u8 *in, u8 *out) {
     mont_mul(acc, one, g_r2);
     for (int bit = 31; bit >= 0; bit--) {
         mont_mul(acc, acc, acc);
-        if (DATA0_E >> bit & 1) mont_mul(acc, acc, cm);
+        if (g_rsa_e >> bit & 1) mont_mul(acc, acc, cm);
     }
     mont_mul(acc, acc, one);
     u8 full[256];
@@ -878,9 +887,9 @@ static int no_rain(buf p) {
 // resolved values of all of them go to work/native/test-settings.toml, which the DLL reads.
 #include "../mod/dll/settings.h"
 #include "ui.h"
-static signed char g_set[SETTINGS_COUNT];
+static short g_set[SETTINGS_COUNT];
 static int setting(int i) { return g_set[i] > 0; }
-static int load_settings(const char *path, signed char v[SETTINGS_COUNT]) {  // 0: no file
+static int load_settings(const char *path, short v[SETTINGS_COUNT]) {  // 0: no file
     buf t = read_file(path);
     char bad[300];
     if (!t.p) {
@@ -896,7 +905,7 @@ static int read_settings(void) {
     char path[1300], on[200] = "";
     snprintf(path, sizeof path, "%s" SEP "test-settings.toml", g_app);
     int found = load_settings(path, g_set);
-    g_set[S_DEBUG_LOG] = (signed char)core_load_debug();  // the window's "Debug log" box decides
+    g_set[S_DEBUG_LOG] = (short)core_load_debug();  // the window's "Debug log" box decides
     for (int i = 0; i < SETTINGS_COUNT; i++)
         if (g_set[i]) snprintf(on + strlen(on), sizeof on - strlen(on), " %s", SETTING_NAMES[i]);
     logf_(found ? "Test settings:%s" : "Test settings:%s (no test-settings.toml next to the launcher)", on[0] ? on : " none");
@@ -928,15 +937,36 @@ static int slow_time_wanted(void) { return setting(S_SLOW_TIME); }
 static int one_region(void) { int r = g_set[S_ONE_REGION]; return r >= 1 && r <= 5 ? r : 0; }
 static int two_regions_wanted(void) { return !one_region(); }
 static int map_draw_group(void) { int g = g_set[S_MAP_GROUP]; return g >= 1 && g <= 8 ? g - 1 : -1; }
-static int merged_slot(int pat) { return pat >= 0 && pat < TWO_PATTERNS_ && pat % 40 < 25; }
+static int merged_slot(int pat);
+// Regions and pairs (pair = 0 the released Mountaintop + Rotted Woods; 1..3 test pairs, dist/pair-test). A region:
+// its patterns' position in each night-boss group of 40, map type (760x - 7600 = set digit = generator region
+// argument), region flag, area code of SmallBaseAndSpotAttachPoint +0xc, field tiles (0x1406ab3c0), name.
+typedef struct { int off, kind, flag, area, x0, x1, z0, z1; const char *name, *of, *tiles; } region_t;
+static const region_t R_MT = {20, 1, 7601, 11, 42, 43, 38, 39, "Mountaintop", "Mountaintop's", "Mountaintop"},
+                      R_CR = {25, 2, 7602, 12, 43, 44, 38, 39, "Crater", "Crater's", "Crater"},
+                      R_RW = {30, 3, 7603, 13, 44, 45, 36, 37, "Rotted Woods", "Rotted Woods'", "woods"},
+                      R_NK = {35, 5, 7605, 15, 42, 43, 36, 37, "Noklateo", "Noklateo's", "Noklateo"};
+// A pair: base region a (its patterns are the drawn slots' sources and its set is drawn; map type a), added region
+// b (its tiles take b's rows; 44_37, which the game gives to Noklateo, keeps a's small bases), start group
+// (SortieStartingPoint +0xc for set 190; its exclusion column +0x10 must name neither region), whether b's
+// tree-site rows (set 500) are copied, and the far halves to compose (west 10_09 / east 11_09: a's variant file
+// with b's tiles of that half taken from b's).
+typedef struct { const region_t *a, *b; int start, tree, halves; } two_pair_t;  // halves: bit 0 west, bit 1 east
+static const two_pair_t TWO_PAIRS[4] = {{&R_MT, &R_RW, 701, 1, 0}, {&R_MT, &R_NK, 708, 0, 1}, {&R_CR, &R_RW, 701, 1, 2}, {&R_CR, &R_NK, 704, 0, 3}};
+static const two_pair_t *two_pair(void) { int p = g_set[S_PAIR]; return &TWO_PAIRS[p >= 1 && p <= 3 ? p : 0]; }
+static const region_t *pair_a(void) { return two_pair()->a; }
+static const region_t *pair_b(void) { return two_pair()->b; }
+// the drawn slots: plain 40g+0..19 and the base region's 40g+a..a+4
+static int merged_slot(int pat) { return pat >= 0 && pat < TWO_PATTERNS_ && (pat % 40 < 20 || (pat % 40 >= pair_a()->off && pat % 40 < pair_a()->off + 5)); }
+static int a_slot(int pat) { return pat >= 0 && pat < TWO_PATTERNS && pat % 40 >= pair_a()->off && pat % 40 < pair_a()->off + 5; }
 static void merge_sources(int slot, int *a_pat, int *b_pat) {
     int g = slot / 40, n = slot % 40, i = 0, j = 0;
-    if (n >= 20) i = j = n - 20;
+    if (n >= 20) i = j = n - pair_a()->off;
     else {
         for (int k = 0, at = 0; k < 25; k++)
             if (k / 5 != k % 5 && at++ == n) { i = k / 5, j = k % 5; break; }
     }
-    *a_pat = 40 * g + 20 + i, *b_pat = 40 * g + 30 + j;
+    *a_pat = 40 * g + pair_a()->off + i, *b_pat = 40 * g + pair_b()->off + j;
 }
 
 // game's regulation.bin -> work/build/regulation.bin with our Target list row.
@@ -1061,7 +1091,7 @@ static void pattern_kinds(buf flags, signed char kind[TWO_PATTERNS]) {
 static int two_pairs_ok(const signed char kind[TWO_PATTERNS]) {  // 40g+20..24 Mountaintop, 40g+30..34 Rotted Woods
     for (int g = 0; g < 8; g++)
         for (int k = 0; k < 5; k++)
-            if (kind[40 * g + 20 + k] != 1 || kind[40 * g + 30 + k] != 3) return 0;
+            if (kind[40 * g + pair_a()->off + k] != pair_a()->kind || kind[40 * g + pair_b()->off + k] != pair_b()->kind) return 0;
     return 1;
 }
 #define SPOT_PAIRS_MAX 2048
@@ -1079,7 +1109,7 @@ static int drop_gone_b(const u8 *row, void *ctx) {  // a Mountaintop pattern's s
     attach_sets *s = ctx;
     int pat = (int)rd32(row + 4);
     u32 at = rd32(row + 8);
-    return pat >= 0 && pat < TWO_PATTERNS && pat % 40 >= 20 && pat % 40 < 25 && at < ATTACH_MAX && s->woods[at];
+    return a_slot(pat) && at < ATTACH_MAX && s->woods[at];
 }
 static int spot_taken(const attach_sets *s, u32 at, const u8 *has) {  // another point of at's spot is in has
     for (int i = 0; i < s->pairs; i++)
@@ -1153,6 +1183,11 @@ static int spot_doubles(buf bases, const attach_sets *s) {
 // region's own patterns never use the points in its area (checked on the tables: 0 of 80 / 66 / 104 /
 // 112), the other patterns do. (Run 37 used a usage statistic instead and kept 32 Mountaintop small
 // bases inside the Rotted Woods.)
+// The added region's field tiles for its small bases (Noklateo without 44_37: see the pair table).
+static int two_added_tile(int x, int z) {
+    const region_t *b = pair_b();
+    return x >= b->x0 && x <= b->x1 && z >= b->z0 && z <= b->z1;
+}
 static int attach_points(buf points, attach_sets *s) {
     memset(s, 0, sizeof *s);
     int in_a = 0, in_b = 0;
@@ -1161,18 +1196,20 @@ static int attach_points(buf points, attach_sets *s) {
         u32 id = rd32(points.p + 0x40 + i * 24);
         const u8 *row = points.p + rd64(points.p + 0x40 + i * 24 + 8);
         if (id >= ATTACH_MAX) continue;
-        if (rd32(row + 0xc) == 11) s->gone_a[id] = 1, in_a++;
-        if (rd32(row + 0xc) == 13) s->gone_b[id] = 1, in_b++;
-        s->woods[id] = row[4] == 60 && row[5] >= 44 && row[5] <= 45 && row[6] >= 36 && row[6] <= 37;  // +4 area, +5 X, +6 Z
+        if (rd32(row + 0xc) == (u32)pair_a()->area) s->gone_a[id] = 1, in_a++;
+        if (rd32(row + 0xc) == (u32)pair_b()->area) s->gone_b[id] = 1, in_b++;
+        s->woods[id] = row[4] == 60 && two_added_tile(row[5], row[6]);  // +4 area, +5 X, +6 Z
     }
-    logf_("two-regions: attach points in the Mountaintop's area %d, in the Rotted Woods' %d", in_a, in_b);
+    logf_("two-regions: attach points in the %s area %d, in the %s %d", pair_a()->of, in_a, pair_b()->of, in_b);
     return in_a > 0 && in_b > 0;
 }
 // Churches (SmallBaseAndSpotDefine rows with map icon 3, "Church": +0x2c; their small-base ids as
 // int16s at +4..+0x2b) per two-regions pattern -> work/native/two-regions.txt ("pattern churches"),
 // which the DLL reads for decision 26 (more HP flask charges at the start).
 // Every church of the composed pattern counts (run 49: church 104 in Noklateo's area stands on pattern 22).
-static int write_churches(buf define, buf bases) {
+// Also one line per church of each pattern: "church <pattern> <attach point> <area> <X> <Z> <x> <z>" (the
+// point's tile +4..+6 and position +0x38 / +0x40 in SmallBaseAndSpotAttachPoint), for the DLL's debug log.
+static int write_churches(buf define, buf bases, buf points) {
     short church[64];
     int nc = 0;
     u64 dsize = param_row_size(define);
@@ -1210,6 +1247,22 @@ static int write_churches(buf define, buf bases) {
             if (count[pat] < lo) lo = count[pat];
             if (count[pat] > hi) hi = count[pat];
         }
+    for (u32 i = 0; param_row_size(points) >= 0x44 && i < rd16(bases.p + 0x0A); i++) {
+        const u8 *row = bases.p + rd64(bases.p + 0x40 + i * 24 + 8);
+        int pat = (int)rd32(row + 4), m = (int)rd32(row + 0xc);
+        u32 at = rd32(row + 8);
+        int is_church = 0;
+        for (int k = 0; k < nc && !is_church; k++) is_church = church[k] == m;
+        if (pat < 0 || pat >= TWO_PATTERNS || !merged_slot(pat) || !is_church) continue;
+        for (u32 j = 0; j < rd16(points.p + 0x0A); j++) {
+            if (rd32(points.p + 0x40 + j * 24) != at) continue;
+            const u8 *pt = points.p + rd64(points.p + 0x40 + j * 24 + 8);
+            float x, z;
+            memcpy(&x, pt + 0x38, 4), memcpy(&z, pt + 0x40, 4);
+            fprintf(f, "church %d %u %u %u %u %d %d\n", pat, at, pt[4], pt[5], pt[6], (int)x, (int)z);
+            break;
+        }
+    }
     fclose(f);
     logf_("two-regions: churches on the 200 merged patterns: %d..%d (%d church small-base ids)", lo, hi, nc);
     char per[200 * 9] = "";
@@ -1217,6 +1270,68 @@ static int write_churches(buf define, buf bases) {
         if (merged_slot(pat)) snprintf(per + strlen(per), sizeof per - strlen(per), " %d:%d", pat, count[pat]);
     logf_("two-regions: churches per pattern:%s", per);
     return nc > 0;
+}
+// Night boss arenas (run 44, pattern 19: day-1 site 1009 on 45_36, its arena under the woods' terrain, 7501 never
+// came). LotResultPlayAreaParam (row id = pattern): +8 / +0xc the day-1 / day-2 site (PlayAreaCreateParam row),
+// +0x10 / +0x12 the night bosses = their arena small maps (4924 = m49_24 ...; SmallBaseMapVariationParam row of that
+// id, its modifier = +0x18 / +0x1c), so the boss line-up stays with the row and only the site moves. A site
+// (PlayAreaCreateParam): +4..+6 tile, +8 / +0xc position, +0x10 / +0x14 day flags, +0x18 required map type,
+// +0x1c / +0x20 excluded map types, +0x24 the arena's attach point (same tile). The arena small map is placed for
+// the terrain of its source's map, so on a merged map a site may not lie on the added region's tiles (Noklateo:
+// with 44_37, which the DLL gives Noklateo's variant) and may not be one the game excludes for either region.
+// A slot's site that fails is replaced, per day, by the same day's site of the base region's patterns of the
+// same night boss group (40g + off .. +4, in order), then of the group's other patterns, always a site the base
+// region's own patterns use that day (so its terrain is the one that map shows); never the other day's.
+static buf g_pac;  // PlayAreaCreateParam (map_tables)
+static const u8 *pac_row(int id) {
+    for (u32 i = 0; g_pac.p && i < rd16(g_pac.p + 0x0A); i++)
+        if ((int)rd32(g_pac.p + 0x40 + i * 24) == id) return g_pac.p + rd64(g_pac.p + 0x40 + i * 24 + 8);
+    return NULL;
+}
+static int site_added_tile(int x, int z) { return two_added_tile(x, z) || (pair_b() == &R_NK && x == 44 && z == 37); }
+static int site_ok(int id) {
+    const u8 *r = pac_row(id);
+    if (!r || param_row_size(g_pac) < 0x28 || r[4] != 60 || site_added_tile(r[5], r[6])) return 0;
+    int req = (int)rd32(r + 0x18), e1 = (int)rd32(r + 0x1c), e2 = (int)rd32(r + 0x20), aa = pair_a()->area, ba = pair_b()->area;
+    return e1 != aa && e1 != ba && e2 != aa && e2 != ba && (req == 0 || req == aa);
+}
+static int arena_sites(buf p, u8 rows[][256]) {
+    int fixed[2] = {0, 0}, bad = 0, nd = 0;
+    int dsite[64], dday[64], dcount[64];
+    for (u32 i = 0; i < rd16(p.p + 0x0A); i++) {
+        int id = (int)rd32(p.p + 0x40 + i * 24);
+        if (!merged_slot(id)) continue;
+        u8 *row = p.p + rd64(p.p + 0x40 + i * 24 + 8);
+        int g = id / 40;
+        for (int d = 0; d < 2; d++) {
+            int cur = (int)rd32(row + 8 + 4 * d), other = (int)rd32(row + 12 - 4 * d);
+            if (!site_ok(cur)) {
+                int pick = -1;
+                for (int k = 0; k < 45 && pick < 0; k++) {
+                    int pat = 40 * g + (k < 5 ? pair_a()->off + k : k - 5);
+                    int c = (int)rd32(rows[pat] + 8 + 4 * d), base_uses = 0;
+                    for (int q = 0; q < TWO_PATTERNS && !base_uses; q++)  // a site the base region's own maps use that day
+                        base_uses = q % 40 >= pair_a()->off && q % 40 < pair_a()->off + 5 && (int)rd32(rows[q] + 8 + 4 * d) == c;
+                    if (site_ok(c) && base_uses && c != other) pick = c;
+                }
+                if (pick < 0) { bad++, logf_("two-regions: check failed: pattern %d: no day-%d site for its arena off the %s tiles", id, d + 1, pair_b()->tiles); continue; }
+                wr32(row + 8 + 4 * d, (u32)pick), fixed[d]++, cur = pick;
+            }
+            int k = 0;
+            while (k < nd && (dsite[k] != cur || dday[k] != d)) k++;
+            if (k == nd && nd < 64) dsite[nd] = cur, dday[nd] = d, dcount[nd++] = 0;
+            if (k < 64) dcount[k]++;
+        }
+    }
+    char line[1400];
+    int at = 0;
+    for (int k = 0; k < nd; k++) {
+        const u8 *r = pac_row(dsite[k]);
+        at += snprintf(line + at, sizeof line - (size_t)at, " day %d: %d (%02d_%02d) x%d;", dday[k] + 1, dsite[k], r ? r[5] : 0, r ? r[6] : 0, dcount[k]);
+    }
+    logf_("two-regions: arena sites: day 1 moved on %d slots, day 2 on %d (sites on the %s tiles or excluded for a region); check: %s; sites:%s",
+          fixed[0], fixed[1], pair_b()->tiles, bad ? "FAILED" : "every site off those tiles", line);
+    return !bad;
 }
 // table: 0 map flags, 1 play area (unchanged), 2 small bases, 3 MapPatternSet. flags: the game's map flag table.
 static buf map_test_table(buf src, int table, buf flags, buf points, int two) {
@@ -1245,12 +1360,12 @@ static buf map_test_table(buf src, int table, buf flags, buf points, int two) {
             u8 *row = p.p + rd64(p.p + 0x40 + i * 24 + 8);
             if (id >= 1000) continue;
             int digit = id % 10, n = (int)rd32(row + 4);
-            if ((digit == 0 || digit == 1) && (group < 0 || id / 10 == group) && n == (digit ? 5 : 20))
+            if ((digit == 0 || digit == pair_a()->kind) && (group < 0 || id / 10 == group) && n == (digit ? 5 : 20))
                 wr32(row, (u32)(n * 400)), wr16(row + 0xe, (unsigned short)(n * 400)), kept++;
             else wr32(row, 0), wr16(row + 0xe, 0), zeroed++;
         }
         ok = kept == (group < 0 ? 16 : 2);
-        logf_("two-regions: MapPatternSet: %d sets (plain 20 x 400, Mountaintop 5 x 400; group %d, -1 any) drawn, %d weighted 0", kept, group + 1, zeroed);
+        logf_("two-regions: MapPatternSet: %d sets (plain 20 x 400, %s 5 x 400; group %d, -1 any) drawn, %d weighted 0", kept, pair_a()->name, group + 1, zeroed);
     } else if (table == 0 && two) {
         // Record rules (09 §12-14): the record's flags are the pattern's rows in row order (rows with modifier 0
         // and flag 0 left out; measurements 1-3); SetupMapPatternInfo (0x6b06f0) takes the LAST 7601..7606 of
@@ -1274,7 +1389,7 @@ static buf map_test_table(buf src, int table, buf flags, buf points, int two) {
             ok = remove_pattern(&p, slot) && copy_pattern_rows(&p, b_pat, slot, keep_map_type_row, NULL) == 1;
             int n = ok ? copy_pattern_rows(&p, 50000 + slot, slot, NULL, NULL) : 0;
             ok = ok && n > 0 && remove_pattern(&p, 50000 + slot);
-            if (ok) n += copy_pattern_rows(&p, b_pat, slot, keep_tree_row, NULL);
+            if (ok && two_pair()->tree) n += copy_pattern_rows(&p, b_pat, slot, keep_tree_row, NULL);
             got += n;
             u32 done = 0;  // the copied Rotted Woods region row (the slot's first row): set 500, modifier 0
             for (u32 i = 0; ok && i < rd16(p.p + 0x0A); i++) {
@@ -1282,7 +1397,7 @@ static buf map_test_table(buf src, int table, buf flags, buf points, int two) {
                 if ((int)rd32(row + 4) != slot) continue;
                 if (!done) {
                     done = 1;
-                    ok = rd32(row + 0x10) == 7603;
+                    ok = rd32(row + 0x10) == (u32)pair_b()->flag;
                     wr32(row + 8, 500), wr32(row + 0xc, 0);
                 }
             }
@@ -1307,13 +1422,13 @@ static buf map_test_table(buf src, int table, buf flags, buf points, int two) {
                 const u8 *row = p.p + rd64(p.p + 0x40 + i * 24 + 8);
                 if ((int)rd32(row + 4) != slot) continue;
                 u32 f = rd32(row + 0x10), set = rd32(row + 8);
-                if (f >= 7601 && f <= 7606) last = (int)f, saw7603 |= f == 7603;
+                if (f >= 7601 && f <= 7606) last = (int)f, saw7603 |= f == (u32)pair_b()->flag;
                 if (set >= 3000 && set < 3200 && f >= 7700 && f < 7740) day[f >= 7720]++;
             }
-            if (last != 7601 || !saw7603 || day[0] > 1 || day[1] > 1)
-                ok = 0, logf_("two-regions: check failed: pattern %d region flags end in %d (7603 %s), sudden events %d / %d", slot, last, saw7603 ? "before" : "missing", day[0], day[1]);
+            if (last != pair_a()->flag || !saw7603 || day[0] > 1 || day[1] > 1)
+                ok = 0, logf_("two-regions: check failed: pattern %d region flags end in %d (%d %s), sudden events %d / %d", slot, last, pair_b()->flag, saw7603 ? "before" : "missing", day[0], day[1]);
         }
-        if (ok) logf_("two-regions: %d map flag rows in the 200 merged patterns; check: 7603 before 7601 (last) everywhere, at most one sudden event per day", got);
+        if (ok) logf_("two-regions: %d map flag rows in the 200 merged patterns; check: %d before %d (last) everywhere, at most one sudden event per day", got, pair_b()->flag, pair_a()->flag);
         // Start point group (modifier set 190 -> SortieStartingPoint +0xc): with the Rotted Woods added, the
         // start flight showed neither the hawk nor the character for group 708 (45_38 / 45_39, tiles that
         // then load the Rotted Woods' variant: runs 33..35, 43, 44) and was fine for group 701 (west edge,
@@ -1324,10 +1439,11 @@ static buf map_test_table(buf src, int table, buf flags, buf points, int two) {
         for (u32 i = 0; ok && i < rd16(p.p + 0x0A); i++) {
             u8 *row = p.p + rd64(p.p + 0x40 + i * 24 + 8);
             int pat = (int)rd32(row + 4);
-            if (merged_slot(pat) && rd32(row + 8) == 190 && rd32(row + 0xc) != 701)
-                wr32(row + 0xc, 701), moved++;
+            if (merged_slot(pat) && rd32(row + 8) == 190 && rd32(row + 0xc) != (u32)two_pair()->start)
+                wr32(row + 0xc, (u32)two_pair()->start), moved++;
         }
-        logf_("two-regions: start point group set to 701 (west edge) on %d of the 200 merged patterns", moved);
+        if (two_pair()->start == 701) logf_("two-regions: start point group set to 701 (west edge) on %d of the 200 merged patterns", moved);
+        else logf_("two-regions: start point group set to %d on %d of the 200 merged patterns", two_pair()->start, moved);
     } else if (table == 1 && two) {  // each plain slot takes its Mountaintop source's play-area row (id = pattern)
         u64 size = param_row_size(p);
         int copied = 0;
@@ -1345,7 +1461,8 @@ static buf map_test_table(buf src, int table, buf flags, buf points, int two) {
             memcpy(row, src_rows[a_pat], size), wr32(row + 4, (u32)id), copied++;
         }
         ok = size <= 256 && copied == 160;
-        logf_("two-regions: play-area rows of the Mountaintop sources copied into %d plain slots", copied);
+        logf_("two-regions: play-area rows of the %s sources copied into %d plain slots", pair_a()->name, copied);
+        if (ok) ok = arena_sites(p, src_rows);
     } else if (table == 2 && two) {
         static attach_sets sets;
         ok = two_pairs_ok(kind) && attach_points(points, &sets) && spot_pairs(points, p, &sets);
@@ -1355,9 +1472,9 @@ static buf map_test_table(buf src, int table, buf flags, buf points, int two) {
             const u8 *row = p.p + rd64(p.p + 0x40 + i * 24 + 8);
             int pat = (int)rd32(row + 4);
             u32 at = rd32(row + 8);
-            if (pat >= 0 && pat < TWO_PATTERNS && pat % 40 >= 20 && pat % 40 < 25 && at < ATTACH_MAX && sets.woods[at] != sets.gone_b[at]) odd++;
+            if (a_slot(pat) && at < ATTACH_MAX && sets.woods[at] != sets.gone_b[at]) odd++;
         }
-        if (odd) logf_("two-regions: check failed: %d Mountaintop small bases where woods tile and Rotted Woods area disagree", odd), ok = 0;
+        if (odd) logf_("two-regions: check failed: %d %s small bases where %s tile and %s area disagree", odd, pair_a()->name, pair_b()->tiles, pair_b()->name), ok = 0;
         if (ok) {
             buf less = param_remove_rows(p, drop_gone_b, &sets, &removed);
             ok = less.p != NULL;
@@ -1383,8 +1500,8 @@ static buf map_test_table(buf src, int table, buf flags, buf points, int two) {
                 if (total > most) most = total;
                 ok = total < 128;  // the game reads at most 127 per pattern
             }
-        logf_("two-regions: small bases per tile: %d Mountaintop ones on the woods tiles removed, %d of the Rotted Woods' on them added (most on one pattern %d)",
-              removed, added, most);
+        logf_("two-regions: small bases per tile: %d %s ones on the %s tiles removed, %d of the %s on them added (most on one pattern %d)",
+              removed, pair_a()->name, pair_b()->tiles, added, pair_b()->of, most);
         if (ok && spot_doubles(p, &sets)) ok = 0, logf_("two-regions: check failed: two small bases on one spot");
         else if (ok) logf_("two-regions: check: no merged pattern has two small bases on one spot");
     }
@@ -1424,16 +1541,17 @@ static int map_tables(buf bundle, int index[4], buf maps[4]) {
     int two = two_regions_wanted();
     for (int t = 0; t < 4; t++)
         if ((index[t] = bnd4_find(bundle, NAMES[t])) < 0) return 0;
-    int ap = bnd4_find(bundle, "\\SmallBaseAndSpotAttachPoint.param");
-    if (ap < 0) return 0;
+    int ap = bnd4_find(bundle, "\\SmallBaseAndSpotAttachPoint.param"), pc = bnd4_find(bundle, "\\PlayAreaCreateParam.param");
+    if (ap < 0 || pc < 0) return 0;
+    g_pac = bnd4_file(bundle, pc);
     for (int t = 0; t < 4; t++) {
         if (!two && t != 3) continue;
         if (!(maps[t] = map_test_table(bnd4_file(bundle, index[t]), t, bnd4_file(bundle, index[0]), bnd4_file(bundle, ap), two)).p) return 0;
     }
     if (two) {
-        chest_group_report(maps[0]);
+        if (!g_set[S_PAIR]) chest_group_report(maps[0]);  // its table is the Rotted Woods' sites
         int d = bnd4_find(bundle, "\\SmallBaseAndSpotDefine.param");
-        if (d < 0 || !write_churches(bnd4_file(bundle, d), maps[2])) return 0;
+        if (d < 0 || !write_churches(bnd4_file(bundle, d), maps[2], bnd4_file(bundle, ap))) return 0;
     }
     return 1;
 }
@@ -1483,7 +1601,7 @@ static int build_regulation(const char *game_dir) {
         // taking zlib here, a zstd compressor is the upgrade path.
         if (one_region()) logf_("one-region (test): maps of region %d only, the game's own patterns%s", one_region(),
                                 map_draw_group() >= 0 ? "; test: only one night boss group (map-group)" : "");
-        else logf_("Two-region maps: every map is the Mountaintop with the Rotted Woods (200 compositions)%s",
+        else logf_("Two-region maps: every map is the %s with the %s (200 compositions)%s", pair_a()->name, pair_b()->name,
                    map_draw_group() >= 0 ? "; test: only one night boss group (map-group)" : "");
         step = bnd4_replace(bundle, index, param);
         patched = bnd4_replace(step, sp_index, speffect);
@@ -1565,7 +1683,7 @@ static tpf_tex tpf_find(buf tpf, const u8 *name_utf16, size_t name_bytes) {
 static int build_two_region_map(const char *game_dir, buf bhd, const char *bdt) {
     char path[1300];
     buf pack[3] = {{0}};  // 00 plain, 01 the Mountaintop, 03 the Rotted Woods
-    static const int IDS[3] = {0, 1, 3};
+    const int IDS[3] = {0, pair_a()->kind, pair_b()->kind};
     int ok = 1, merged = 0;
     for (int k = 0; k < 3; k++) {
         snprintf(path, sizeof path, "/menu/71_maptile_m%02d.tpf.dcx", IDS[k]);
@@ -1595,7 +1713,7 @@ static int build_two_region_map(const char *game_dir, buf bhd, const char *bdt) 
             ok = ok && write_file(path, out.p, out.n);
         }
         free(out.p);
-        logf_("two-regions: map screen built (%d blocks of the Rotted Woods over the Mountaintop's tiles)", merged);
+        logf_("two-regions: map screen built (%d blocks of the %s over the %s tiles)", merged, pair_b()->name, pair_a()->of);
     } else
         logf_("The game's map screen textures look different than expected; two-regions cannot be applied.");
     for (int k = 0; k < 3; k++) free(pack[k].p);
@@ -1931,6 +2049,276 @@ static int write_profile(void) {
     return 1;
 }
 
+// --- Map pair test (pair = 1: Mountaintop + Noklateo), offline parts -------------------------------------
+// The west half of the grid (X 42-43) is one far map, m60_10_09_V2 (V = the region's tile variant digit:
+// 1 Mountaintop, 5 Noklateo); a half loads one variant, so this pair needs one composed half: the Mountaintop
+// file (m60_10_09_12) with the Noklateo tiles 42-43 x 36-37 taken from m60_10_09_52. Map files and pieces are in
+// data2. Rules from the game's own files (analysis/flagcat/msbw.py, compose.py: every map reproduced byte for byte):
+// MSB = 16-byte header, then lists {i32 version, i32 count+1, i64 name, i64 entries[count], i64 next}, the name
+// right after the table, entries in order; an entry is the bytes up to the next one (offsets inside are relative).
+// Index fields: model +0x8 type / +0xc index in type, point +0x8 / +0xc, event +0xc / +0x10, part +0xc / +0x10
+// (sequential per type), part +0x14 model index, model +0x18 number of parts using it, asset parts (type 13)
+// +0x368 / +0x36c / +0x374 their own index or -1, treasure (event type 4) type data +8 and ObjAct (7) +4 a part index
+// (event type data offset at +0x20). Entry names begin with the tile, "m60_XX_ZZ_VV-...", except map pieces
+// "mGGXXZZNN_nnnn" (group, tile, piece number; the model is "mGGXXZZNN").
+// Pieces: the loader asks for "%s:/%s/%s/%s.mapbnd" = map:/m60/<half>/<half>_<model digits>.mapbnd, so a Noklateo
+// piece goes into the composed half's folder under the half's name. Lighting: the environment maps
+// ("maptpf:/%s/%s/%s_Envmap_%02d.tpf") and probes ("%s:/%s/%s/%s%s.ivinfobnd") are per half name, so the composed
+// half keeps the Mountaintop's (the Noklateo tiles lit with the Mountaintop's probes; to be seen in the game).
+typedef struct { int ver; buf name; int n, cap; buf *e; } msb_list;
+typedef struct { u8 head[16]; int nl; msb_list l[8]; } msb_file;
+static int msb_parse(buf d, msb_file *m) {
+    memset(m, 0, sizeof *m);
+    if (d.n < 32 || memcmp(d.p, "MSB ", 4)) return 0;
+    memcpy(m->head, d.p, 16);
+    for (u64 off = 16; off && m->nl < 8;) {
+        if (off + 16 > d.n) return 0;
+        msb_list *L = &m->l[m->nl++];
+        L->ver = (int)rd32(d.p + off);
+        int cnt1 = (int)rd32(d.p + off + 4);
+        u64 no = rd64(d.p + off + 8), table = off + 16, end;
+        if (cnt1 < 1 || table + 8ull * cnt1 > d.n || no != table + 8ull * cnt1) return 0;
+        u64 next = rd64(d.p + table + 8ull * (cnt1 - 1));
+        end = next ? next : d.n;
+        L->n = L->cap = cnt1 - 1;
+        L->e = xalloc(sizeof(buf) * (L->n + 1));
+        u64 first = L->n ? rd64(d.p + table) : end;
+        if (first < no || first > end) return 0;
+        L->name.p = d.p + no, L->name.n = first - no;
+        for (int i = 0; i < L->n; i++) {
+            u64 a = rd64(d.p + table + 8ull * i), b = i + 1 < L->n ? rd64(d.p + table + 8ull * (i + 1)) : end;
+            if (a >= b || b > d.n) return 0;
+            L->e[i].p = d.p + a, L->e[i].n = b - a;
+        }
+        off = next;
+    }
+    return m->nl == 6;
+}
+static buf msb_write(const msb_file *m) {
+    size_t n = 16;
+    for (int i = 0; i < m->nl; i++) {
+        n += 16 + 8 * (m->l[i].n + 1) + m->l[i].name.n;
+        for (int k = 0; k < m->l[i].n; k++) n += m->l[i].e[k].n;
+    }
+    buf o = {xalloc(n), n};
+    memcpy(o.p, m->head, 16);
+    size_t at = 16;
+    for (int i = 0; i < m->nl; i++) {
+        const msb_list *L = &m->l[i];
+        size_t start = at, size = 16 + 8 * (L->n + 1) + L->name.n;
+        for (int k = 0; k < L->n; k++) size += L->e[k].n;
+        wr32(o.p + at, (u32)L->ver), wr32(o.p + at + 4, (u32)(L->n + 1));
+        at += 16 + 8 * (L->n + 1);
+        wr64(o.p + start + 8, at);
+        memcpy(o.p + at, L->name.p, L->name.n), at += L->name.n;
+        for (int k = 0; k < L->n; k++) {
+            wr64(o.p + start + 16 + 8 * k, at);
+            memcpy(o.p + at, L->e[k].p, L->e[k].n), at += L->e[k].n;
+        }
+        wr64(o.p + start + 16 + 8 * L->n, i + 1 < m->nl ? start + size : 0);
+    }
+    return o;
+}
+static void msb_name(buf e, char *out, size_t cap) {  // the entry's UTF-16 name, ASCII only
+    size_t k = 0;
+    u64 no = e.n >= 8 ? rd64(e.p) : 0;
+    for (u64 i = no; i + 1 < e.n && k + 1 < cap && (e.p[i] || e.p[i + 1]); i += 2) out[k++] = (char)e.p[i];
+    out[k] = 0;
+}
+static int msb_tile(buf e, int *x, int *z) {  // "m60_XX_ZZ_VV-..." or a map piece "mGGXXZZNN_nnnn"
+    char nm[64];
+    int g, n;
+    msb_name(e, nm, sizeof nm);
+    if (sscanf(nm, "m60_%2d_%2d_", x, z) == 2) return 1;
+    return nm[0] == 'm' && strlen(nm) >= 9 && nm[9] == '_' && sscanf(nm + 1, "%2d%2d%2d%2d", &g, x, z, &n) == 4;
+}
+static int g_half_x0, g_half_x1;  // the X range of the half being composed (west 42-43, east 44-45)
+// Index within type: sequential per type value in list order, any type value.
+typedef struct { u32 type[128]; int count[128], n; } type_counter;
+static int type_next(type_counter *c, u32 t) {
+    for (int i = 0; i < c->n; i++) if (c->type[i] == t) return c->count[i]++;
+    if (c->n < 128) c->type[c->n] = t, c->count[c->n++] = 1;
+    return 0;
+}
+static int pair_b_tile(int x, int z) {  // the added region's tiles in that half (Noklateo with 44_37, as the game's table)
+    const region_t *b = pair_b();
+    int in = (x >= b->x0 && x <= b->x1 && z >= b->z0 && z <= b->z1) || (b == &R_NK && x == 44 && z == 37);
+    return in && x >= g_half_x0 && x <= g_half_x1;
+}
+static buf dup_buf(buf b) { buf o = {xalloc(b.n ? b.n : 1), b.n}; memcpy(o.p, b.p, b.n); return o; }
+// A (first variant, kept outside B's tiles) + B (on B's tiles) -> composed MSB; *from_b gets B's map-piece model
+// names (as "digits") that the composed file uses and A does not have.
+static buf msb_compose(buf da, buf db, char names_b[][16], int *nb, int cap) {
+    msb_file A, B, M;
+    buf none = {0};
+    if (!msb_parse(da, &A) || !msb_parse(db, &B) || A.nl != B.nl) return logf_("pair: map file not in the expected format"), none;
+    enum { MODEL = 0, EVENT = 1, POINT = 2, PARTS = 5 };
+    memcpy(&M, &A, sizeof M);
+    // models: union by name (A first), then only the ones parts use
+    int na = A.l[MODEL].n, nbm = B.l[MODEL].n, nm = 0;
+    buf *mod = xalloc(sizeof(buf) * (na + nbm + 1));
+    int *map_a = xalloc(sizeof(int) * (na + 1)), *map_b = xalloc(sizeof(int) * (nbm + 1)), *from_b = xalloc(sizeof(int) * (na + nbm + 1));
+    char a_name[64], b_name[64];
+    for (int i = 0; i < na; i++) mod[nm] = A.l[MODEL].e[i], from_b[nm] = 0, map_a[i] = nm++;
+    for (int i = 0; i < nbm; i++) {
+        msb_name(B.l[MODEL].e[i], b_name, sizeof b_name);
+        int k = 0;
+        for (; k < nm; k++) {
+            msb_name(mod[k], a_name, sizeof a_name);
+            if (!strcmp(a_name, b_name)) break;
+        }
+        if (k == nm) mod[nm] = B.l[MODEL].e[i], from_b[nm] = 1, nm++;
+        map_b[i] = k;
+    }
+    // parts: A's outside B's tiles, B's on them; model index remapped; own-index fields; index in type
+    int pa = A.l[PARTS].n, pb = B.l[PARTS].n, np = 0, x, z;
+    buf *parts = xalloc(sizeof(buf) * (pa + pb + 1));
+    int *src_is_b = xalloc(sizeof(int) * (pa + pb + 1)), *src_i = xalloc(sizeof(int) * (pa + pb + 1));
+    for (int i = 0; i < pa; i++)
+        if (!(msb_tile(A.l[PARTS].e[i], &x, &z) && pair_b_tile(x, z))) parts[np] = dup_buf(A.l[PARTS].e[i]), src_is_b[np] = 0, src_i[np++] = i;
+    for (int i = 0; i < pb; i++)
+        if (msb_tile(B.l[PARTS].e[i], &x, &z) && pair_b_tile(x, z)) parts[np] = dup_buf(B.l[PARTS].e[i]), src_is_b[np] = 1, src_i[np++] = i;
+    int *use = xalloc(sizeof(int) * (nm + 1));
+    memset(use, 0, sizeof(int) * (nm + 1));
+    for (int i = 0; i < np; i++) {
+        int old = (int)rd32(parts[i].p + 0x14), nw = src_is_b[i] ? (old >= 0 && old < nbm ? map_b[old] : -1) : (old >= 0 && old < na ? map_a[old] : -1);
+        if (nw < 0) return logf_("pair: a part's model index is out of range"), none;
+        wr32(parts[i].p + 0x14, (u32)nw), use[nw]++;
+    }
+    int *renum = xalloc(sizeof(int) * (nm + 1)), kept = 0;
+    buf *mout = xalloc(sizeof(buf) * (nm + 1));
+    for (int k = 0; k < nm; k++) {
+        renum[k] = use[k] ? kept : -1;
+        if (!use[k]) continue;
+        mout[kept] = dup_buf(mod[k]);
+        wr32(mout[kept].p + 0x18, (u32)use[k]);
+        if (from_b[k] && rd32(mout[kept].p + 8) == 0 && *nb < cap) {  // a map piece of B's
+            msb_name(mout[kept], b_name, sizeof b_name);
+            if (b_name[0] == 'm' && strlen(b_name) < 16) strcpy(names_b[(*nb)++], b_name + 1);
+        }
+        kept++;
+    }
+    type_counter tc;
+    memset(&tc, 0, sizeof tc);  // model index in type
+    for (int k = 0; k < kept; k++) wr32(mout[k].p + 0xc, (u32)type_next(&tc, rd32(mout[k].p + 8)));
+    memset(&tc, 0, sizeof tc);
+    for (int i = 0; i < np; i++) {
+        wr32(parts[i].p + 0x14, (u32)renum[rd32(parts[i].p + 0x14)]);
+        u32 t = rd32(parts[i].p + 0xc);
+        wr32(parts[i].p + 0x10, (u32)type_next(&tc, t));
+        if (t == 13 && parts[i].n >= 0x378)
+            for (int o = 0x368; o <= 0x374; o += 4) if (o != 0x370 && (int)rd32(parts[i].p + o) >= 0) wr32(parts[i].p + o, (u32)i);
+    }
+    // events: A's outside, B's on B's tiles; part references by name
+    int ea = A.l[EVENT].n, eb = B.l[EVENT].n, ne = 0, lost = 0;
+    buf *ev = xalloc(sizeof(buf) * (ea + eb + 1));
+    for (int s2 = 0; s2 < 2; s2++) {
+        const msb_file *S = s2 ? &B : &A;
+        for (int i = 0; i < S->l[EVENT].n; i++) {
+            int on_b = msb_tile(S->l[EVENT].e[i], &x, &z) && pair_b_tile(x, z);
+            if (on_b != s2) continue;
+            buf e = dup_buf(S->l[EVENT].e[i]);
+            u32 et = rd32(e.p + 0xc);
+            u64 to = e.n >= 0x30 ? rd64(e.p + 0x20) : 0;
+            int fo = et == 4 ? 8 : et == 7 ? 4 : -1;
+            if (fo >= 0 && to && to + fo + 4 <= e.n) {
+                int old = (int)rd32(e.p + to + fo), nw = -1;
+                if (old >= 0 && old < S->l[PARTS].n) {
+                    char want[64], have[64];
+                    msb_name(S->l[PARTS].e[old], want, sizeof want);
+                    for (int k = 0; k < np && nw < 0; k++) {
+                        msb_name(parts[k], have, sizeof have);
+                        if (!strcmp(want, have)) nw = k;
+                    }
+                    lost += nw < 0;
+                }
+                wr32(e.p + to + fo, (u32)nw);
+            }
+            ev[ne++] = e;
+        }
+    }
+    memset(&tc, 0, sizeof tc);
+    for (int i = 0; i < ne; i++) wr32(ev[i].p + 0x10, (u32)type_next(&tc, rd32(ev[i].p + 0xc)));
+    // points: by tile, index in type renumbered
+    int qa = A.l[POINT].n, qb = B.l[POINT].n, nq = 0;
+    buf *pt = xalloc(sizeof(buf) * (qa + qb + 1));
+    for (int i = 0; i < qa; i++) if (!(msb_tile(A.l[POINT].e[i], &x, &z) && pair_b_tile(x, z))) pt[nq++] = dup_buf(A.l[POINT].e[i]);
+    for (int i = 0; i < qb; i++) if (msb_tile(B.l[POINT].e[i], &x, &z) && pair_b_tile(x, z)) pt[nq++] = dup_buf(B.l[POINT].e[i]);
+    memset(&tc, 0, sizeof tc);
+    for (int i = 0; i < nq; i++) wr32(pt[i].p + 0xc, (u32)type_next(&tc, rd32(pt[i].p + 8)));
+    M.l[MODEL].e = mout, M.l[MODEL].n = kept;
+    M.l[PARTS].e = parts, M.l[PARTS].n = np;
+    M.l[EVENT].e = ev, M.l[EVENT].n = ne;
+    M.l[POINT].e = pt, M.l[POINT].n = nq;
+    buf out = msb_write(&M);
+    // read back: counts, model indices in range and use counts, own-index fields
+    msb_file R;
+    int bad = !msb_parse(out, &R) || R.l[PARTS].n != np || R.l[MODEL].n != kept;
+    for (int i = 0; !bad && i < np; i++) {
+        u32 mi = rd32(R.l[PARTS].e[i].p + 0x14);
+        bad = mi >= (u32)kept;
+    }
+    int from_b_parts = 0;
+    for (int i = 0; i < np; i++) from_b_parts += src_is_b[i];
+    logf_("pair: composed half: %d parts (%d %s, %d %s), %d models, %d events, %d points, %d %s pieces; check: %s%s",
+          np, np - from_b_parts, pair_a()->name, from_b_parts, pair_b()->name, kept, ne, nq, *nb, pair_b()->name, bad ? "FAILED" : "read back fine",
+          lost ? ", event part references lost" : "");
+    return bad ? none : out;
+}
+static int compose_one_half(const char *game_dir, buf bhd, const char *bdt_path, int east) {
+    char to[1300], from[300], an[64], bn[64], half[8];
+    int av = pair_a()->kind, bv = pair_b()->kind;
+    snprintf(half, sizeof half, "%s", east ? "11_09" : "10_09");
+    g_half_x0 = east ? 44 : 42, g_half_x1 = east ? 45 : 43;
+    snprintf(an, sizeof an, "m60_%s_%d2", half, av), snprintf(bn, sizeof bn, "m60_%s_%d2", half, bv);
+    snprintf(from, sizeof from, "/map/mapstudio/%s.msb.dcx", an);
+    buf a = archive_read(bhd, bdt_path, from);
+    snprintf(from, sizeof from, "/map/mapstudio/%s.msb.dcx", bn);
+    buf b = archive_read(bhd, bdt_path, from);
+    buf ra = a.p ? dcx_read(game_dir, a) : a, rb = b.p ? dcx_read(game_dir, b) : b;
+    static char names[512][16];
+    int n = 0, ok = 0, copied = 0;
+    if (ra.p && rb.p) {
+        logf_("pair: composing %s from %s with the %s tiles of %s", an, an, pair_b()->name, bn);
+        buf m = msb_compose(ra, rb, names, &n, 512);
+        if (m.p) {
+            buf d = dcx_write(m);
+            snprintf(to, sizeof to, "%s" SEP "work" SEP "build" SEP "map" SEP "mapstudio" SEP "%s.msb.dcx", g_app, an);
+            make_parents(to);
+            ok = d.p && write_file(to, d.p, d.n);
+            free(d.p), free(m.p);
+        }
+    } else logf_("pair: %s or %s not found in data2", an, bn);
+    for (int i = 0; ok && i < n; i++) {  // b's pieces, under the composed half's name (bytes as in the archive)
+        snprintf(from, sizeof from, "/map/m60/%s/%s_%s.mapbnd.dcx", bn, bn, names[i]);
+        buf p = archive_read(bhd, bdt_path, from);
+        if (!p.p) { logf_("pair: piece %s missing in data2", from); ok = 0; break; }
+        snprintf(to, sizeof to, "%s" SEP "work" SEP "build" SEP "map" SEP "m60" SEP "%s" SEP "%s_%s.mapbnd.dcx", g_app, an, an, names[i]);
+        make_parents(to);
+        ok = write_file(to, p.p, p.n), copied += ok;
+        free(p.p);
+    }
+    free(a.p), free(b.p), free(ra.p), free(rb.p);
+    if (ok) logf_("pair (test): %s + %s %s half %s written (map file + %d %s pieces under the half's name; lighting: the %s)", pair_a()->name,
+                  pair_b()->name, east ? "east" : "west", an, copied, pair_b()->name, pair_a()->of);
+    return ok;
+}
+static int build_pair_half(const char *game_dir) {
+    char bhd_path[1100], bdt_path[1100];
+    snprintf(bhd_path, sizeof bhd_path, "%s" SEP "data2.bhd", game_dir);
+    snprintf(bdt_path, sizeof bdt_path, "%s" SEP "data2.bdt", game_dir);
+    rsa_use(DATA2_N, DATA2_E);
+    buf enc = read_file(bhd_path), bhd = enc.p ? rsa_decrypt(enc) : enc;
+    free(enc.p);
+    rsa_use(DATA0_N, DATA0_E);
+    if (!bhd.p || memcmp(bhd.p, "BHD5", 4)) return logf_("pair: data2 could not be read"), 0;
+    int ok = 1;
+    for (int east = 0; ok && east < 2; east++)
+        if (two_pair()->halves >> east & 1) ok = compose_one_half(game_dir, bhd, bdt_path, east);
+    free(bhd.p);
+    return ok;
+}
+
 int core_build(const char *game_dir) {
     char bhd_path[1100], bdt_path[1100], from[1300], to[1300];
     if (!core_check_game(game_dir)) return logf_("This is not the game's folder: %s", game_dir), 0;
@@ -1950,7 +2338,7 @@ int core_build(const char *game_dir) {
     // BUILD_FORMAT: bump when the set of files the launcher builds changes.
     snprintf(stamp, sizeof stamp, "%016llx%016llx", (unsigned long long)fnv1a64(enc.p, enc.n),
              (unsigned long long)(fnv1a64(dll.p, dll.n) + BUILD_FORMAT +
-                                     ((u64)slow_time_wanted() << 41) + ((u64)(map_draw_group() + 1) << 49) + ((u64)one_region() << 53)));
+                                     ((u64)slow_time_wanted() << 41) + ((u64)(map_draw_group() + 1) << 49) + ((u64)one_region() << 53) + ((u64)g_set[S_PAIR] << 57)));
     free(dll.p);
     buf old_stamp = read_file(stamp_path);
     int same = old_stamp.n == 32 && !memcmp(old_stamp.p, stamp, 32);
@@ -1978,6 +2366,7 @@ int core_build(const char *game_dir) {
     if (ok && one_region()) remove_two_region_map(), logf_("one-region (test): region %d only, no two-region map", one_region());
     else if (ok) ok = build_two_region_map(game_dir, bhd, bdt_path);
     free(bhd.p);
+    if (ok && two_pair()->halves) ok = build_pair_half(game_dir);
     if (!ok) return 0;
     logf_("Menu icons added");
     if (!build_regulation(game_dir)) return 0;
@@ -2159,12 +2548,12 @@ int core_selftest(void) {
     }
     {  // test settings: values, comments, CRLF, case, a retired key (no-rain), unknown keys and bad values, a missing file
         static const char t[] = "# c\r\nteam-test = true\r\n  NO-RAIN=FALSE # x\r\nslow-time\t= True\r\ntwo-regions = true\r\n"
-                                "nope = true\r\nloot-test = yes\r\n\r\ndebug-log = false\r\ntest-level = 15\r\nmap-group = 3";
-        signed char v[SETTINGS_COUNT];
+                                "nope = true\r\nloot-test = yes\r\n\r\ndebug-log = false\r\ntest-level = 15\r\nmap-group = 3\r\nult-pvp = 250\r\none-region = 1000";
+        short v[SETTINGS_COUNT];
         char bad[64];
-        static const signed char want[SETTINGS_COUNT] = {1, 1, -1, -1, 0, -1, 15, -1, -1, 3, -1};
-        int good = settings_parse(t, sizeof t - 1, v, bad, sizeof bad) == 2 && !memcmp(v, want, sizeof v) &&
-                   !strcmp(bad, "nope = true, loot-test = yes");
+        static const short want[SETTINGS_COUNT] = {1, 1, -1, -1, 0, -1, 15, -1, -1, 3, -1, -1, -1, -1, 250, -1};
+        int good = settings_parse(t, sizeof t - 1, v, bad, sizeof bad) == 3 && !memcmp(v, want, sizeof v) &&
+                   !strcmp(bad, "nope = true, loot-test = yes, one-region = 1000");
         good = good && !load_settings("/nonexistent/test-settings.toml", v);
         for (int i = 0; i < SETTINGS_COUNT; i++) good = good && v[i] == setting_default(i);
         if (!good) { ok = 0; logf_("selftest: test settings parser failed"); }

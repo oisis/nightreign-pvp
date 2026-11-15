@@ -85,7 +85,7 @@ static void logf(const char *fmt, ...) {
 // Test settings: test-settings.toml next to the DLL (the launcher writes it at every start from the
 // file next to the launcher; the dev build copies $W/test-settings.toml). Read once, at load.
 #include "settings.h"
-static signed char g_settings[SETTINGS_COUNT];
+static short g_settings[SETTINGS_COUNT];
 static int setting(int i) { return g_settings[i] > 0; }
 static void next_to_dll(char *path, size_t cap, const char *name) {
     snprintf(path, cap, "%s", log_path);
@@ -101,13 +101,13 @@ static void settings_load(void) {
     if (f) fclose(f);
     if (settings_parse(text, n, g_settings, bad, sizeof bad)) logf("settings: lines not used: %s", bad);
     for (int i = 0; i < SETTINGS_COUNT; i++) {
-        if (g_settings[i] < 0 || !f) g_settings[i] = g_settings[i] < 0 || !f ? (signed char)(-1 - setting_default(i)) : g_settings[i];
+        if (g_settings[i] < 0 || !f) g_settings[i] = g_settings[i] < 0 || !f ? (short)(-1 - setting_default(i)) : g_settings[i];
         int v = g_settings[i] < 0 ? -1 - g_settings[i] : g_settings[i];
         char num[8];
         snprintf(num, sizeof num, "%d", v);
         logf("settings: %s = %s (%s)", SETTING_NAMES[i], setting_is_number(i) ? num : v ? "true" : "false",
              !f ? "no test-settings.toml next to the DLL, default" : g_settings[i] < 0 ? "not in the file, default" : path);
-        g_settings[i] = (signed char)v;
+        g_settings[i] = (short)v;
     }
     for (int i = 0; i < SETTINGS_COUNT; i++)  // the empty marker files of earlier test builds
         for (int txt = 0; txt < 2; txt++) {
@@ -791,7 +791,8 @@ static void generate_hook(unsigned long long a1, unsigned long long a2, unsigned
     // map-region (test): the region digit asked for (1..5); 9 (plain sets) leaves the argument alone, plain
     // sets are always candidates. The launcher left weights only on that region's sets.
     // one-region (measurement only): that region's digit; the launcher left weights only on its sets.
-    int want = g_settings[S_ONE_REGION] >= 1 && g_settings[S_ONE_REGION] <= 5 ? g_settings[S_ONE_REGION] : 1;  // decision 35: Mountaintop / plain sets
+    int want = g_settings[S_ONE_REGION] >= 1 && g_settings[S_ONE_REGION] <= 5 ? g_settings[S_ONE_REGION]
+               : g_settings[S_PAIR] == 2 || g_settings[S_PAIR] == 3 ? 2 : 1;  // decision 35: Mountaintop / plain sets; pairs 2 / 3: the Crater
     if (want && g_join != 4 && v3 && !IsBadReadPtr(v3, 32)) {
         unsigned char *b = v3[1], *e = v3[2], *cap = v3[3];
         if (b && e > b) {
@@ -1245,6 +1246,37 @@ static void finish_down_hook(char *chr, char state, float t) {
 static void finish_hit_hook(char *chr, char *attacker, char *hit) {
     float before = chr && !IsBadReadPtr(chr, 0x740) ? *(float *)(chr + 0x714) : -1;
     ((void (*)(char *, char *, char *))(g_base + 0x66dec0))(chr, attacker, hit);
+    // revive-hits (test setting): 0x66dec0 lowers the gauge by the attack's rescue amount (hit +0x150, times
+    // hit +0x258, times GameSystemCommonParam +0x40c.. by down count in one mode), whoever hits. Here, on the
+    // downed player's own machine and only in an invasion, a hit that counted takes a fixed share of the
+    // gauge's cap instead (cap = +0x380 / +0x384 / +0x388 by down count +0x730): the other side 0.55 (two hits
+    // finish), the own side 0.2 (five hits raise). Between hits the gauge refills at +0x38c.. % of its cap per
+    // second once the hit grace (+0x71c, GameSystemCommonParam +0x2f8) is over (0x674eb0).
+    if (setting(S_REVIVE_HITS) && chr && chr == local_player() && !IsBadReadPtr(chr, 0x740) && chr[0x710] == 1 && before > 0 &&
+        *(float *)(chr + 0x714) < before && attacker && attacker != chr && !IsBadReadPtr(attacker, 0x200)) {
+        int victim_invader = our_speffect_active(chr) == 1, attacker_invader = our_speffect_active(attacker) == 1;
+        if (victim_invader || g_host_switched) {
+            int other = victim_invader ? !attacker_invader : attacker_invader;
+            unsigned count = (unsigned char)chr[0x730];
+            float cap = gscp_float(count <= 1 ? 0x380 : count == 2 ? 0x384 : 0x388), left = before - cap * (other ? 0.55f : 0.2f);
+            // A reviving ultimate (AtkParam_Pc reviveDamageCorrection 9999: Guardian's dive / landing, 700000801 / 807;
+            // 4000: Recluse; ordinary ultimates 225, skills up to 600): its rescue amount (hit +0x150 times +0x258, as
+            // 0x66dec0 takes it) is taken as such when it reaches the full gauge of a third down (+0x388, 240).
+            // ponytail: threshold from the data's ratios, not from a measured hit scale; the log line shows the amount.
+            float amount = *(float *)(hit + 0x150) * *(float *)(hit + 0x258), full3 = gscp_float(0x388);
+            int ult = full3 > 0 && amount >= full3;
+            if (ult) left = 0;
+            if (cap > 0) {
+                logf("revive hits: %s hit on the downed %s (%s): gauge %.1f -> %.1f (game %.1f, cap %.0f, hit amount %.1f)",
+                     other ? "other side's" : "own side's", victim_invader ? "invader" : "host",
+                     ult ? (other ? "reviving ultimate: finished at once" : "reviving ultimate: raised at once") : other ? "2-hit rule" : "5-hit rule",
+                     before, left > 0 ? left : 0, *(float *)(chr + 0x714), cap, amount);
+                *(float *)(chr + 0x714) = left > 0 ? left : 0;
+                // as 0x66dec0 does: the hitter's handle (+8) goes to +0x728 when the gauge reaches 0, else -1
+                *(unsigned long long *)(chr + 0x728) = left > 0 ? 0xffffffffffffffffull : *(unsigned long long *)(attacker + 8);
+            }
+        }
+    }
     logf("finish test: gauge call (0x43dac3): %s character, attacker %p (ours %d), gauge %.1f -> %.1f", chr == local_player() ? "local" : "remote",
          (void *)attacker, attacker && !IsBadReadPtr(attacker, 0x200) ? our_speffect_active(attacker) : -1, before,
          chr ? *(float *)(chr + 0x714) : -1);
@@ -1275,6 +1307,71 @@ static void finish_hit_hook(char *chr, char *attacker, char *hit) {
 // all). Here [16][77] of that table gets the Enemy object of [2][77]. Only team 16, our invader, attacks
 // with that row. (Runs 13-16 changed the same entry of the other table, 0x399a120, the "is it an
 // enemy" table of the HUD and the hit-source checks, which this path does not ask.)
+// ult-pvp (test setting, percent 0..999; 0 and 100 = unchanged, above 100 stronger): the player damage module's hit receive (vtable
+// CSPlayerDamageModule 0x2c11d00 slot 7, 0x440fb0: module, attacker, hit) hands the hit to 0x436530; there the
+// damage is applied either directly (HP -= (int) hit +0x144, 0x490320) or through 0x43d260 -> 0x43be60, which
+// subtracts hit +0x280 (int) from HP (0x426130 on the data module, HP at **(chr+0x1b8) +0x140). Nothing on that path
+// writes +0x280 / +0x144, so both arrive final. The attack row: hit +0x44 = 1 for AtkParam_Pc (param 7 + kind,
+// 0x6d1b60 -> 0xe6d630), +0x40 = row id. Ultimates: AtkParam_Pc 700000000-700999999, 790000000-790999999 and the
+// Executor's projectile rows. Scaled when the victim and the attacker are players (vfunc +0x118) of different sides
+// (our team effect on exactly one of them). debug-log: every such ultimate hit, and the first 10 other
+// player-versus-player hits unchanged, with the victim's HP before and after the original call.
+#define RVA_PLAYER_DMG_VTABLE 0x2c11d00
+#define RVA_PLAYER_HIT_RECV   0x440fb0
+static int ult_row(int kind, int id) {
+    static const int EXECUTOR[] = {10135, 10175, 10255, 10400, 10405, 10455, 10700};
+    if (kind != 1) return 0;
+    if ((id >= 700000000 && id < 701000000) || (id >= 790000000 && id < 791000000)) return 1;
+    for (unsigned i = 0; i < sizeof EXECUTOR / sizeof *EXECUTOR; i++) if (id == EXECUTOR[i]) return 1;
+    return 0;
+}
+// Bullets: the bullet hit dispatch 0x33c120(hit, victim, bullet) takes the owner from the bullet (0x63f840 on
+// bullet +0xb0, a handle) and calls slot 7 with that owner when it is a character (entity type 1; CSBulletIns is
+// type 3, CSWorldGeomIns type 6), so an ultimate projectile reaches this hook with its owner as the attacker.
+// The Executor's beast form: its melee rows (behaviour variation 3000, AtkParam_Pc 3000xxx) are shared with 160
+// weapons, so the form is recognised by its marker SpEffect 707100 ("Is Beast Form") on the attacker instead.
+static int speffect_on(char *chr, unsigned id);
+#define EXECUTOR_BEAST_SPEFFECT 707100
+static int chr_is_player(char *c) {
+    return c && !IsBadReadPtr(c, 0x200) && ((char (*)(void *))(*(void ***)c)[0x118 / 8])(c);
+}
+static int chr_hp(char *c) {
+    char **m = c && !IsBadReadPtr(c + 0x1b8, 8) ? *(char ***)(c + 0x1b8) : NULL;
+    return m && *m && !IsBadReadPtr(*m + 0x140, 4) ? *(int *)(*m + 0x140) : -1;
+}
+static void player_hit_hook(char *module, long long *attacker, char *hit) {
+    char *victim = module ? ((char *(*)(void *))(g_base + 0x42c120))(module) : NULL;
+    char *att = NULL;
+    if (attacker && !IsBadReadPtr(attacker, 8) && ((int (*)(void *))(*(void ***)attacker)[0x10 / 8])(attacker) == 1) att = (char *)attacker;
+    int pvp = hit && victim && att && att != victim && chr_is_player(victim) && chr_is_player(att) &&
+              (our_speffect_active(victim) == 1) != (our_speffect_active(att) == 1);
+    int kind = pvp ? *(int *)(hit + 0x44) : -1, id = pvp ? *(int *)(hit + 0x40) : -1;
+    int beast = pvp && speffect_on(att, EXECUTOR_BEAST_SPEFFECT), ult = pvp && (ult_row(kind, id) || beast);
+    int n = g_settings[S_ULT_PVP], d0 = pvp ? *(int *)(hit + 0x280) : 0, hp0 = pvp ? chr_hp(victim) : 0;
+    float f0 = pvp ? *(float *)(hit + 0x144) : 0;
+    if (ult && n > 0 && n != 100) *(int *)(hit + 0x280) = (int)((long long)d0 * n / 100), *(float *)(hit + 0x144) = f0 * (float)n / 100.0f;
+    ((void (*)(char *, long long *, char *))(g_base + RVA_PLAYER_HIT_RECV))(module, attacker, hit);
+    static int others;
+    if (pvp && g_debug_log && (ult || others < 10)) {
+        others += !ult;
+        logf("ult-pvp: %s%s hit on a player: AtkParam_%s %d, damage +0x280 %d -> %d, +0x144 %.1f -> %.1f, victim HP %d -> %d",
+             ult ? "ultimate" : "ordinary", beast ? " (Executor beast form)" : "", kind == 1 ? "Pc" : "Npc", id, d0, *(int *)(hit + 0x280), f0, *(float *)(hit + 0x144), hp0,
+             chr_hp(victim));
+    }
+}
+static void ult_pvp_install(void) {
+    void **slot = (void **)(g_base + RVA_PLAYER_DMG_VTABLE) + 7;
+    DWORD old;
+    if (*slot != (void *)(g_base + RVA_PLAYER_HIT_RECV) || !VirtualProtect(slot, 8, PAGE_READWRITE, &old)) {
+        logf("ult-pvp: player damage module slot 7 not as expected (%p), not hooked", *slot);
+        return;
+    }
+    *slot = (void *)player_hit_hook;
+    VirtualProtect(slot, 8, old, &old);
+    int n = g_settings[S_ULT_PVP];
+    logf("ult-pvp: player hit receive hooked (ultimates against players at %d %%%s)", n ? n : 100,
+         n && n != 100 ? "" : ", unchanged; log only with debug-log");
+}
 static void finish_relation_patch(void) {
     void **table = (void **)(g_base + 0x398d410);
     void **entry = table + 16 * 0x51 + 77, *enemy = table[2 * 0x51 + 77];
@@ -1354,6 +1451,7 @@ static char *map_model_hook(char *model, unsigned long long a2) {
 // Logged: which model the map screen gets; the pin dump below follows that model.
 static char *volatile g_map_dialog_model;
 static void md_pins(const char *when);
+static void church_pins_log(char *model);
 static void *map_dialog_hook(void *a, void *b, void *c, unsigned long long d, char *model) {
     g_map_dialog_model = model;
     int kind = -1;
@@ -1362,6 +1460,7 @@ static void *map_dialog_hook(void *a, void *b, void *c, unsigned long long d, ch
     logf("marker test: map screen built with view model %p (kind %d of the models seen)", (void *)model, kind);
     void *r = ((void *(*)(void *, void *, void *, unsigned long long, char *))(g_base + 0xac53a0))(a, b, c, d, model);
     md_pins("map screen built");
+    church_pins_log(model);
     return r;
 }
 // Map-only hide (decision 19). The map screen's list controls (CS::WorldMapItemControl, built by 0xacd1f0
@@ -1588,7 +1687,10 @@ static void reward_hook(unsigned long long a1, unsigned a2) {
 // flag, 7601, there: 0x6b06f0). The event flags come from the record (the launcher puts a 7603 row before
 // 7601; OnMapEnter sets both). Host and invader alike. Event flag calls: 0x5e7260 get (man, &id, tag), 0x5e79f0 set
 // (man, &id, on, tag, notify 0, 0), the manager at 0x3c115a8.
-static int two_pattern(unsigned pat) { return pat < 320 && pat % 40 < 25; }  // the plain and Mountaintop slots (decision 35)
+static int pair_base_off(void) { int p = g_settings[S_PAIR]; return p == 2 || p == 3 ? 25 : 20; }  // Crater base for pairs 2 / 3
+static int two_pattern(unsigned pat) {  // the plain and base-region slots (decision 35; pairs 2 / 3: Crater 25..29)
+    return pat < 320 && (pat % 40 < 20 || (pat % 40 >= (unsigned)pair_base_off() && pat % 40 < (unsigned)pair_base_off() + 5));
+}
 static int two_flag(int id, int set, int on) {  // set: 0 read, 1 write
     char *man = *(char **)(g_base + 0x3c115a8);
     if (!man) return -1;
@@ -2109,6 +2211,21 @@ static void flag_log_frame(void) {  // InGame, every frame
         logf("flags: 20 s after the map load, %d tile flags on (read from storage):%s", on, line);
     }
 }
+// The two regions of the two-region map, as data (decision 35's pair; other pairs need their own rows, and
+// their tile sets from 0x6ab3c0: 1 Mountaintop 42-43 x 38-39, 2 Crater 43-44 x 38-39, 3 Rotted Woods 44-45 x
+// 36-37, 4 every field tile, 5 Noklateo 42-43 x 36-37 and 44_37): region flag (7601..7606), variant digit, tiles.
+typedef struct { int flag, variant, x0, x1, z0, z1, xe, ze; const char *name; } two_region;  // xe/ze: one extra tile (-1 none)
+static const two_region TWO_BASE_REGIONS[2] = {{7601, 1, 42, 43, 38, 39, -1, -1, "Mountaintop"}, {7602, 2, 43, 44, 38, 39, -1, -1, "Crater"}};
+#define TWO_BASE (TWO_BASE_REGIONS[g_settings[S_PAIR] == 2 || g_settings[S_PAIR] == 3])  // the pattern's own region (map type)
+// The region laid over its tiles: pair = 0 the Rotted Woods; pair = 1 (test) Noklateo, with 44_37, which the game's
+// table gives to Noklateo and whose variant-5 file it loads once 7605 is in the region list (its tile scripts
+// m60_44_37_50 need that tile's own flag space; small bases there stay the Mountaintop's, launcher).
+static const two_region TWO_ADDED_PAIRS[2] = {{7603, 3, 44, 45, 36, 37, -1, -1, "Rotted Woods"},
+                                              {7605, 5, 42, 43, 36, 37, 44, 37, "Noklateo"}};
+#define TWO_ADDED (TWO_ADDED_PAIRS[g_settings[S_PAIR] == 1 || g_settings[S_PAIR] == 3])  // pairs 1 / 3 Noklateo, 0 / 2 the Rotted Woods
+static int two_on_tile(const two_region *r, unsigned x, unsigned z) {
+    return ((int)x >= r->x0 && (int)x <= r->x1 && (int)z >= r->z0 && (int)z <= r->z1) || ((int)x == r->xe && (int)z == r->ze);
+}
 static int g_two_active, g_two_requests;  // the current map is a two-regions one (not the hub); map requests
 // The tile list (0x5e7d40) asks 0x6ab300(&tile map id, -1) at 0x5e7ff6 whether a tile has flags of its own
 // variant (ids 10 X%10 Y%10 V dd nnn) or the base ones (10 XX YY d nnn). 0x6ab3c0 says yes only for the
@@ -2119,8 +2236,31 @@ static int g_two_active, g_two_requests;  // the current map is a two-regions on
 static unsigned char tile_flag_space_hook(unsigned *id, int a) {
     unsigned char r = ((unsigned char (*)(unsigned *, int))(g_base + 0x6ab300))(id, a);
     unsigned m = id ? *id : 0, x = m >> 16 & 0xff, y = m >> 8 & 0xff;
-    if (!r && g_two_active && m >> 24 == 60 && x >= 44 && x <= 45 && y >= 36 && y <= 37 && (m >> 4 & 0xf) == 3) r = 1;
+    if (!r && g_two_active && m >> 24 == 60 && two_on_tile(&TWO_ADDED, x, y) && (int)(m >> 4 & 0xf) == TWO_ADDED.variant) r = 1;
     return r;
+}
+// Per-tile variant (pair >= 1, test): CS::GameMan::CalcGetReplaceMapIdByDisaster 0x6ab7a0(out, &map id, mode) gives a
+// tile or half the variant of the FIRST region flag in gm +0xbb8 whose variant file exists (mode 0; 0x6b4cb0 checks
+// the file table). For Mountaintop + Rotted Woods that already gives each tile its region (the Mountaintop has
+// variant files only on X 42-43, the Rotted Woods only on X 44-45), but the Crater and Noklateo have variant files
+// on all 16 tiles and the Mountaintop on every west tile, so for the other pairs the second region's tiles would
+// load the first region's variant. Here (27 call sites, all calls): a field tile (area 60, low nibble 0) of the
+// second region's set gets that region's variant; everything else stays the game's choice.
+static const unsigned VARIANT_SITES[] = {0x6362a7, 0x6363e6, 0x6363fb, 0x6396ae, 0x6396c3, 0x639ac2, 0x646ce1, 0x646d2f, 0x64a112,
+                                         0x64aa02, 0x64b5c0, 0x64cafc, 0x64cb71, 0x64cc25, 0x64d9b7, 0x64db8c, 0x64dc47, 0x64dcf6,
+                                         0x64dd98, 0x69ceb3, 0x69cfa2, 0x6ab5c6, 0x6ab63d, 0x6ab723, 0x6b0dcb, 0xbedc9f, 0xe7b48c};
+static int g_variant_forced;
+static unsigned *variant_hook(unsigned *out, unsigned *id, unsigned long long mode) {
+    ((unsigned *(*)(unsigned *, unsigned *, unsigned long long))(g_base + 0x6ab7a0))(out, id, mode);
+    if ((mode & 0xff) || !g_two_active || !id) return out;
+    unsigned m = *id, x = m >> 16 & 0xff, z = m >> 8 & 0xff;
+    if (m >> 24 == 60 && (m & 0xf) == 0 && two_on_tile(&TWO_ADDED, x, z)) {
+        unsigned want = (m & 0xffffff00u) | ((unsigned)TWO_ADDED.variant << 4);
+        if (*out != want && g_variant_forced++ < 40)
+            logf("pair: tile m60_%02u_%02u: variant %u -> %d (%s)", x, z, *out >> 4 & 0xf, TWO_ADDED.variant, TWO_ADDED.name);
+        *out = want;
+    }
+    return out;
 }
 // No rain (fixed, every player): the raindrops outside the circle and the circle's wall are one effect, the
 // play-area effect (GPARAM group "PlayAreaEffect": RainDrop and Border fields, values in mapbase.gparam). The
@@ -2226,10 +2366,9 @@ static unsigned long long outside_circle_hook(char *mgr, float *pos) {
 #define RVA_PIN_ROW_SHOWN 0x6af290
 static unsigned long long pin_row_shown_hook(unsigned long long type, unsigned *id) {
     unsigned v = *id, area = v >> 24, x = (v >> 16) & 0xff, z = (v >> 8) & 0xff;
-    if (g_settings[S_ONE_REGION] < 1 && area >= 0x3c && area <= 0x58 && (v & 0xf) == 0 && (x == 44 || x == 45) &&
-        (z == 36 || z == 37)) {
+    if (g_settings[S_ONE_REGION] < 1 && area >= 0x3c && area <= 0x58 && (v & 0xf) == 0 && two_on_tile(&TWO_ADDED, x, z)) {
         norain_first(12, "map pins: a woods-tile row decided by the Rotted Woods rule");
-        return ((v >> 4) & 0xf) == 3;
+        return (int)((v >> 4) & 0xf) == TWO_ADDED.variant;
     }
     return ((unsigned long long (*)(unsigned long long, unsigned *))(g_base + RVA_PIN_ROW_SHOWN))(type, id);
 }
@@ -2256,7 +2395,7 @@ static unsigned *map_request_hook(unsigned *out, unsigned *request) {
     g_two_requests++;
     int *flags = (int *)(gm + 0xbb8);
     long long *count = (long long *)(gm + 0xbd0);
-    static const int WANT[2] = {7601, 7603};
+    const int WANT[2] = {TWO_BASE.flag, TWO_ADDED.flag};
     for (int w = 0; w < 2; w++) {
         int have = 0;
         for (long long i = 0; i < *count && i < 4; i++) have |= flags[i] == WANT[w];
@@ -2287,6 +2426,77 @@ static int two_churches(unsigned pat) {
     if (f) fclose(f);
     return found;
 }
+// debug-log: the churches of this expedition's pattern, once, from the launcher's "church" lines in
+// two-regions.txt (attach point, its tile and local x / z from SmallBaseAndSpotAttachPoint). The compass
+// word is the church's place on the 4 x 4 field grid m60_42..45_36..39 (centre on the corner of 43/44 and
+// 37/38), taking gridX as west -> east and gridZ as south -> north, tile-local x / z with the same axes
+// and the tile centre as 0 (an assumption from the ids, not read from code). The player's own position
+// (block and raw position) is logged next to it.
+static int player_position(float out[3], unsigned *block);
+static void two_regions_churches_log(unsigned pat) {
+    if (!g_debug_log) return;
+    char path[MAX_PATH], line[128];
+    next_to_dll(path, sizeof path, "two-regions.txt");
+    FILE *f = fopen(path, "r");
+    int n = 0;
+    while (f && fgets(line, sizeof line, f)) {
+        unsigned p, at, area, gx, gz;
+        int x, z;
+        if (sscanf(line, "church %u %u %u %u %u %d %d", &p, &at, &area, &gx, &gz, &x, &z) != 7 || p != pat) continue;
+        float ex = (float)((int)gx - 44) * 256.0f + (float)x, nz = (float)((int)gz - 38) * 256.0f + (float)z;
+        const char *ns = nz > 128 ? "north" : nz < -128 ? "south" : "", *ew = ex > 128 ? "east" : ex < -128 ? "west" : "";
+        logf("churches: %d: attach point %u, tile m%02u_%02u_%02u, in the tile x %d z %d; on the map: %s%s%s (%.0f m east, %.0f m north of the centre)",
+             ++n, at, area, gx, gz, x, z, ns, *ns && *ew ? "-" : "", *ns || *ew ? ew : "centre", ex, nz);
+    }
+    if (f) fclose(f);
+    float pp[3];
+    unsigned block = 0;
+    if (player_position(pp, &block)) logf("churches: %d on pattern %u; you: block %08x, position %.0f %.0f %.0f", n, pat, block, pp[0], pp[1], pp[2]);
+    else logf("churches: %d on pattern %u", n, pat);
+}
+// Run 44 (pattern 19): 4 churches in the record, the user saw 1 on the map. Every church's map rows
+// (WorldMapPointParam 100+ / 2100+, +0x10 the attach point) say tile variant 0, which the pin rule 0x6af290 passes
+// for map type 1 on all four tiles (42_37, 43_36, 44_38, 45_39 are not Mountaintop terrain for 0x6ab3c0); their
+// attach entities exist in the loaded halves (10_09_12: 101 / 104, 11_09_32: 110 / 117). What is left: IsOpen
+// (eventFlagId0 73000 + point must be on; 74000 + point is logged too) and the view model's +0x240 map (std::map,
+// key = attach point at node +0x1c, value at +0x20: the pin constructor takes u16 +0 / +2 / +4, u8 +0x17, u16
+// +0x20 from it, defaults when the key is missing). Logged each time the map screen is built, per church.
+static void church_pins_log(char *model) {
+    char *gm = *(char **)(g_base + 0x3c13258), *man = flag_man();
+    if (!g_debug_log || !g_two_active || !gm || !man || !model || IsBadReadPtr(model, 0x250)) return;
+    unsigned pat = *(unsigned *)(gm + 0xb4c);
+    char path[MAX_PATH], line[128], out[700] = "";
+    next_to_dll(path, sizeof path, "two-regions.txt");
+    FILE *f = fopen(path, "r");
+    int n = 0;
+    char *head = *(char **)(model + 0x240);
+    unsigned long long size = *(unsigned long long *)(model + 0x248);
+    while (f && fgets(line, sizeof line, f)) {
+        unsigned p, at, area, gx, gz;
+        int x, z;
+        if (sscanf(line, "church %u %u %u %u %u %d %d", &p, &at, &area, &gx, &gz, &x, &z) != 7 || p != pat) continue;
+        unsigned num = 0, *np = ((unsigned *(*)(unsigned *, unsigned, unsigned, unsigned, unsigned))(g_base + 0x6772b0))(&num, area, gx, gz, 0);
+        unsigned key = np ? *np : num;
+        int gate = ((unsigned char (*)(unsigned char, unsigned *))(g_base + 0x6af290))((unsigned char)model[0x60], &key) != 0;
+        char *found = NULL;  // lower_bound in the std::map, then key check
+        if (head && !IsBadReadPtr(head, 0x20)) {
+            char *nd = *(char **)(head + 8), *best = head;
+            for (int k = 0; nd && !IsBadReadPtr(nd, 0x30) && !nd[0x19] && k < 64; k++)
+                if (*(int *)(nd + 0x1c) < (int)at) nd = *(char **)(nd + 0x10);
+                else best = nd, nd = *(char **)nd;
+            if (best != head && *(int *)(best + 0x1c) == (int)at) found = best + 0x20;
+        }
+        char ent[64] = "missing";
+        if (found && !IsBadReadPtr(found, 0x22))
+            snprintf(ent, sizeof ent, "%u/%u/%u/%u/%u", *(unsigned short *)found, *(unsigned short *)(found + 2), *(unsigned short *)(found + 4),
+                     (unsigned char)found[0x17], *(unsigned short *)(found + 0x20));
+        snprintf(out + strlen(out), sizeof out - strlen(out), " | %u (m%02u_%02u_%02u): rule %d, %u=%d %u=%d, +0x240 %s", at, area, gx, gz,
+                 gate, 73000 + at, flag_state_in(man, 73000 + at), 74000 + at, flag_state_in(man, 74000 + at), ent);
+        n++;
+    }
+    if (f) fclose(f);
+    logf("churches: map pins on pattern %u (map type %u, +0x240 map size %llu): %d churches%s", pat, (unsigned char)model[0x60], size, n, out);
+}
 static void two_regions_flasks(void) {
     // Run 44: the log read 3 at the first InGame frame, the user had 4 at the start (relics or the game
     // add to it after that frame). So the count is read once the start flight is over (TWO_FLASK_DELAY_MS
@@ -2306,6 +2516,7 @@ static void two_regions_flasks(void) {
     if (!gm || !pgd) return;
     done_for = g_two_requests;
     unsigned pat = *(unsigned *)(gm + 0xb4c);
+    two_regions_churches_log(pat);
     int churches = two_churches(pat), extra;
     unsigned char hp = (unsigned char)pgd[0xff], fp = (unsigned char)pgd[0x100];
     // Churches already taken are in the charges (run 48: one taken before this ran was counted twice). The
@@ -2372,9 +2583,13 @@ static void hook_acceptance(void) {
     if (1) {
         hook_call(0x674f37, 0x66f3b0, (void *)finish_down_hook, "finish test: going down");
         hook_call(0x43dac3, 0x66dec0, (void *)finish_hit_hook, "finish test: gauge hit");
+        if ((g_settings[S_ULT_PVP] && g_settings[S_ULT_PVP] != 100) || g_debug_log) ult_pvp_install();
     }
     hook_call(0xc27a41, 0x6b06f0, (void *)map_request_hook, "two-regions: map request");
     hook_call(0x5e7ff6, 0x6ab300, (void *)tile_flag_space_hook, "two-regions: tile flag space");
+    if (g_settings[S_PAIR] >= 1)
+        for (unsigned i = 0; i < sizeof VARIANT_SITES / sizeof *VARIANT_SITES; i++)
+            hook_call(VARIANT_SITES[i], 0x6ab7a0, (void *)variant_hook, "pair: per-tile variant");
     hook_call(0x68e1d2, 0x696170, (void *)norain_circle_hook, "no rain: play-area effect off after the circle update");
     hook_call(0x68e1ea, 0x698c90, (void *)norain_circle2_hook, "no rain: play-area effect off after the second circle update");
     hook_call(0x68e229, 0x6953b0, (void *)norain_sound_hook, "no rain: circle edge sound skipped");
@@ -3861,6 +4076,40 @@ static int our_speffect_active(char *chr) {
         if (e[0] == ref.row && !(*(unsigned *)((char *)e + 0x68) & 0x800c0003)) return 1;
     return 0;
 }
+// no-sprint (test setting): the player's behaviour script (c0000.hks, SpeedUpdate / SpeedUpdate2, read with
+// analysis/hks) caps the move speed at run (ChangeMoveSpeedIndex(2)) and skips ExecSprintStart while the
+// character has SpEffect 100220 (env 1116 = has SpEffect; the row is a bare marker: no fields, spCategory 20,
+// effectEndurance 0). So the local player gets 100220 through the game's own add (0x3c7fd0) whenever it is
+// not on. ponytail: re-added every frame because an endurance-0 effect's lifetime is not read; the log
+// says once a second whether it was on.
+#define NO_SPRINT_SPEFFECT 100220
+static int speffect_on(char *chr, unsigned id) {
+    struct { char *row; unsigned id; unsigned char flag; } ref = {0};
+    ((void (*)(void *, unsigned))(g_base + RVA_SPEFFECT_ROW))(&ref, id);
+    char *module = *(char **)(chr + CHR_SPEFFECTS);
+    if (!ref.row || !module) return 0;
+    int n = 0;
+    for (char **e = *(char ***)(module + 8); e && n < 512; e = (char **)e[7], n++)
+        if (e[0] == ref.row && !(*(unsigned *)((char *)e + 0x68) & 0x800c0003)) return 1;
+    return 0;
+}
+static void no_sprint_frame(void) {
+    if (!setting(S_NO_SPRINT)) return;
+    char *chr = local_player();
+    if (!chr || IsBadReadPtr(chr, 0x200)) return;
+    static DWORD next;
+    static int seen_on, frames, added;
+    int on = speffect_on(chr, NO_SPRINT_SPEFFECT);
+    frames++, seen_on += on;
+    // Run 44: on in 21 of 42 frames when added only while off: an added copy is still there at this point one frame
+    // later and gone the next, so it lives through one effect update. Added every frame, a copy is always there
+    // (at most two at once, each ends by itself). ponytail: the effect update's order against the script is not read.
+    ((void (*)(void *, int, unsigned char))(g_base + RVA_ADD_SPEFFECT))(chr, NO_SPRINT_SPEFFECT, 0), added++;
+    if (GetTickCount() - next < 0x80000000u) {
+        logf("no sprint: SpEffect %d on in %d of %d frames (added %d times) in the last second", NO_SPRINT_SPEFFECT, seen_on, frames, added);
+        next = GetTickCount() + (frames > 0 && seen_on == frames ? 30000 : 1000), seen_on = frames = added = 0;
+    }
+}
 static void team_log(const char *when) {
     char *chr = local_player();
     if (!chr) {
@@ -4263,6 +4512,134 @@ static void slow_time_frame(int first) {
     }
 }
 
+// boss-flow (test setting, own expedition only; the invader's clock follows the host's, 0x6987b0): only the
+// circle clock is driven, every phase flag is the game's own. Chain (common 1100 / 1103 / 1107, common_func
+// 90055000 / 90055001 / 90065900): the arena 90055000 (day n) sets 7501 / 7506 when the clock is in
+// 23:00:00-23:59:59 and the player is in its MSB area (or at 23:59); 90055001 sets 7504 / 7509 after that, at
+// 23:59 with the wave dead; the night boss's death gives 7502 / 7507; 1100 then 7503 -> 1103 resets the clock
+// (2003[89], 20 s later) -> 1100 sets 7505 once the clock is in 0:00-22:59:59; day 2 ends in 7508 and the final.
+// Here (boss-flow 2; 1 is the same with a running day held at 22:59): frozen from the start (+0x118 and +0x11c 0 every frame); the first region boss dead (Ice Dragon flags or
+// Lordsworn Captain) -> clock 23:00:00 through 0x68ff30, still frozen; 7501 -> running again (the game stops it at
+// 23:59 itself); 7505 -> frozen; the second region boss dead (queued if it died earlier) -> 23:00:00; 7506 ->
+// running for good.
+#define RVA_PA_SET_TIME 0x68ff30  // (manager, hour, minute, second): adds the differences to +0xf8 / +0x100
+enum { BF_WAIT, BF_DAY1, BF_NIGHT1_WAIT, BF_NIGHT1, BF_DAY2, BF_NIGHT2_WAIT, BF_NIGHT2 };
+static const char *const BF_NAME[] = {"waiting for the circle clock", "day 1", "night 1 at 23:00, frozen until 7501",
+                                      "night 1, running", "day 2", "night 2 at 23:00, frozen until 7506", "night 2, running (done)"};
+// boss-flow = 1 (the user's choice): the day runs as in the game and the clock is only held at 22:59:00 while the
+// region boss is alive. The circle's phase is recomputed from the clock every frame (0x696170: phase index
+// from the phase table's hour:minute ranges; a change only raises +0x15b, calls the HUD notice and the result
+// log 0x691270), so a jump from any hour to 23:00 lands in the night phase without passing the others.
+// Held 5 min (real time) at 22:59 with no region boss dead, the clock goes back to the day's start and runs again,
+// as often as needed (the user's rule). common 1100 waits for 7502 before its 0:00-22:59:59 check, so 7505 is
+// not set by this; the time-ranged scripts before 23:00 are one-shot by their own flags or restart anyway (1905).
+static int g_bf_held, g_bf_repeats;
+static DWORD g_bf_hold_tick;
+#define BF_REPEAT_MS 300000
+// The day's start time, where common 1103's "Reset Time of Day" (2003[89] -> 0x5fea00 -> 0x68c1b0) takes it:
+// table 0x92 row 0 (0xe76d50) bytes +0x2d0 hour / +0x2d1 minute (the game prefers the debug properties
+// Game.PlayAreaTime.GameStartHour / Minute, which we never set). 7:00 when the table is not there.
+static void bf_day_start(int *h, int *m) {
+    char tmp[16];
+    char **p = ((char **(*)(void *))(g_base + 0xe76d50))(tmp);
+    *h = 7, *m = 0;
+    if (p && *p && (unsigned char)(*p)[0x2d0] < 24 && (unsigned char)(*p)[0x2d1] < 60) *h = (unsigned char)(*p)[0x2d0], *m = (unsigned char)(*p)[0x2d1];
+}
+static int g_bf_state;
+static float g_bf_base;
+static int bf_flag(unsigned id) {
+    char *m = flag_man();
+    return m && flag_state_in(m, id) == 1;
+}
+// pair = 1 (test, Mountaintop + Noklateo): Noklateo has ten field bosses (90015002: 1026500800 / 810 / 820 / 830 /
+// 840 / 850 / 860, 1027500800, 1036500800, 1037500800) and no one region boss; none is counted yet (the user's
+// choice), so on that pair only the Mountaintop's boss brings a night. Their flags are in the log line.
+static const unsigned NOKLATEO_BOSSES[10] = {1026500800, 1026500810, 1026500820, 1026500830, 1026500840,
+                                             1026500850, 1026500860, 1027500800, 1036500800, 1037500800};
+static int bf_bosses_dead(void) {  // regions whose boss is dead: Mountaintop (Ice Dragon, by tile variant) + Rotted Woods (Captain)
+    int p = g_settings[S_PAIR], crater = p == 2 || p == 3, nk = p == 1 || p == 3;
+    int mt = !crater && (bf_flag(1028100800) || bf_flag(1029100800) || bf_flag(1039100800) || bf_flag(1039100801));
+    return mt + (nk ? 0 : bf_flag(1056300800));  // Crater and Noklateo region bosses: open (none counted)
+}
+static void bf_log(char *pa, const char *what) {
+    unsigned long long v = *(unsigned long long *)(pa + PA_TIME);
+    logf("boss-flow: %s -> %s (circle clock %02u:%02u:%02u, rate %.3f, base %.3f; 7501..7509: %d%d%d%d%d %d%d%d%d; region bosses dead %d: dragon %d%d%d%d captain %d; not counted: woods 44_36 / 44_37 / 45_37 bosses %d%d%d)",
+         what, BF_NAME[g_bf_state], (unsigned)(v >> 34) & 0x1f, (unsigned)(v >> 39) & 0x3f, (unsigned)(v >> 45) & 0x3f,
+         *(float *)(pa + PA_RATE), *(float *)(pa + PA_BASE_RATE), bf_flag(7501), bf_flag(7502), bf_flag(7503), bf_flag(7504),
+         bf_flag(7505), bf_flag(7506), bf_flag(7507), bf_flag(7508), bf_flag(7509), bf_bosses_dead(), bf_flag(1028100800),
+         bf_flag(1029100800), bf_flag(1039100800), bf_flag(1039100801), bf_flag(1056300800), bf_flag(1046300800),
+         bf_flag(1047300800), bf_flag(1057300800));
+}
+static void boss_flow_frame(int first) {
+    if (first) g_bf_state = BF_WAIT, g_bf_held = 0, g_bf_repeats = 0;
+    if (!setting(S_BOSS_FLOW) || g_bf_state == BF_NIGHT2) return;
+    char *pa = *(char **)(g_base + RVA_PLAY_AREA_PTR);
+    if (!pa) return;
+    int dead = bf_bosses_dead(), was = g_bf_state;
+    const char *why = NULL;
+    if (g_bf_state == BF_WAIT) {
+        g_bf_base = *(float *)(pa + PA_BASE_RATE);
+        g_bf_state = BF_DAY1, why = g_settings[S_BOSS_FLOW] != 2 ? "expedition start (boss-flow 1: running, held at 22:59)" : "expedition start (boss-flow 2: frozen all day)";
+    } else if (g_bf_state == BF_DAY1 && dead >= 1) {
+        ((void (*)(char *, int, int, int))(g_base + RVA_PA_SET_TIME))(pa, 23, 0, 0);
+        g_bf_state = BF_NIGHT1_WAIT, why = "first region boss dead, clock set to 23:00:00";
+    } else if (g_bf_state == BF_NIGHT1_WAIT && bf_flag(7501)) {
+        g_bf_state = BF_NIGHT1, why = "7501 on, clock released";
+    } else if (g_bf_state == BF_NIGHT1 && bf_flag(7505)) {
+        g_bf_state = BF_DAY2, why = "7505 on (day 2), clock frozen again";
+    } else if (g_bf_state == BF_DAY2 && dead >= 2) {
+        ((void (*)(char *, int, int, int))(g_base + RVA_PA_SET_TIME))(pa, 23, 0, 0);
+        g_bf_state = BF_NIGHT2_WAIT, why = "second region boss dead, clock set to 23:00:00";
+    } else if (g_bf_state == BF_NIGHT2_WAIT && bf_flag(7506)) {
+        g_bf_state = BF_NIGHT2, why = "7506 on, clock released";
+    }
+    int day = g_bf_state == BF_DAY1 || g_bf_state == BF_DAY2, frozen = g_bf_state == BF_NIGHT1_WAIT || g_bf_state == BF_NIGHT2_WAIT;
+    if (day && g_settings[S_BOSS_FLOW] != 2) {  // boss-flow 1 (the user's choice): running, held at 22:59:00
+        unsigned long long v = *(unsigned long long *)(pa + PA_TIME);
+        unsigned secs = (((unsigned)(v >> 34) & 0x1f) * 60 + ((unsigned)(v >> 39) & 0x3f)) * 60 + ((unsigned)(v >> 45) & 0x3f);
+        if (secs >= (22 * 60 + 59) * 60) {  // also past it (a long frame): back to 22:59:00
+            if (!g_bf_held) {
+                ((void (*)(char *, int, int, int))(g_base + RVA_PA_SET_TIME))(pa, 22, 59, 0);
+                g_bf_held = 1, g_bf_hold_tick = GetTickCount(), bf_log(pa, "22:59 reached, held until the region boss is dead");
+            }
+            frozen = 1;
+            if (GetTickCount() - g_bf_hold_tick >= BF_REPEAT_MS) {  // the user's rule: 5 min held -> the day again
+                int h, m;
+                bf_day_start(&h, &m);
+                ((void (*)(char *, int, int, int))(g_base + RVA_PA_SET_TIME))(pa, h, m, 0);
+                *(float *)(pa + PA_RATE) = g_bf_base, *(float *)(pa + PA_BASE_RATE) = g_bf_base;
+                g_bf_held = 0, frozen = 0, g_bf_repeats++;
+                char what[120];
+                snprintf(what, sizeof what, "held 5 min at 22:59, region boss alive: clock back to %02d:%02d, the day again (repeat %d)", h, m, g_bf_repeats);
+                bf_log(pa, what);
+            }
+        }
+    } else if (day)
+        frozen = 1;
+    if (frozen) *(float *)(pa + PA_RATE) = 0.0f, *(float *)(pa + PA_BASE_RATE) = 0.0f;
+    else if (g_bf_state != was || g_bf_held) *(float *)(pa + PA_RATE) = g_bf_base, *(float *)(pa + PA_BASE_RATE) = g_bf_base;
+    if (!frozen || !day) g_bf_held = 0;
+    if (g_bf_state != was) {
+        bf_log(pa, why);
+        if (g_settings[S_PAIR] == 1 || g_settings[S_PAIR] == 3) {
+            char line[200];
+            int at = 0;
+            for (int k = 0; k < 10; k++) at += snprintf(line + at, sizeof line - (size_t)at, " %u:%d", NOKLATEO_BOSSES[k], bf_flag(NOKLATEO_BOSSES[k]));
+            logf("boss-flow: Noklateo field bosses (not counted):%s", line);
+        }
+        if (g_settings[S_PAIR] == 2 || g_settings[S_PAIR] == 3) {  // Crater field bosses (90015002 on 43_38 / 43_39 / 44_38 / 44_39)
+            static const unsigned CRATER_BOSSES[8] = {1038202800, 1039202800, 1039202810, 1048202800, 1048202830, 1049202800, 1049202810, 1049202820};
+            char line[200];
+            int at = 0;
+            for (int k = 0; k < 8; k++) at += snprintf(line + at, sizeof line - (size_t)at, " %u:%d", CRATER_BOSSES[k], bf_flag(CRATER_BOSSES[k]));
+            logf("boss-flow: Crater field bosses (not counted):%s", line);
+        }
+    }
+    static DWORD next;  // and every 30 s, so a stuck link shows
+    if (was == BF_WAIT) next = GetTickCount() + 30000;
+    else if (GetTickCount() - next < 0x80000000u) bf_log(pa, "every 30 s"), next = GetTickCount() + 30000;
+}
+
 // Host: publish where the host is. Checked every LOBBY_POS_PERIOD_MS; written when the block changed,
 // otherwise only when the host moved at least LOBBY_POS_MIN_MOVE and LOBBY_POS_MIN_GAP_MS passed since
 // the last write (or LOBBY_POS_REFRESH_MS passed), and never while someone is joining. Kept sparse
@@ -4314,6 +4691,7 @@ static void host_test_create(void);
 static int host_test_leave(void);
 static void host_expedition(int step) {
     if (step == QM_STEP_INGAME) {
+        int first_frame = !g_in_expedition;
         if (!g_in_expedition) {
             team_test_frame(1);
             slow_time_frame(1);
@@ -4335,6 +4713,7 @@ static void host_expedition(int step) {
         }
         team_test_frame(0);
         slow_time_frame(0);
+        boss_flow_frame(first_frame);
         flag_log_frame();
         md_frame(g_expedition_start_tick);
         // test-level (test setting, own expedition only): the level set once, 5 s into the expedition,
@@ -4576,6 +4955,7 @@ static void step_hook(void *ctrl, void *time, int step) {
             if (v != seen[k] && changes < 40) changes++, logf("two-regions: event flag %d is %s", WATCH[k], v ? "on" : "off"), seen[k] = v;
         }
     }
+    no_sprint_frame();
     static int told_invader;
     if (g_join != 4) {
         if (told_invader) told_invader = 0, logf("role: no longer an invader; own expeditions host again");
