@@ -1224,6 +1224,20 @@ static float gscp_u16(unsigned off) {
     char **p = ((char **(*)(void *))(g_base + 0xe76d50))(tmp);
     return p && *p ? (float)*(unsigned short *)(*p + off) : 0;
 }
+// The invader's reward for finishing one of the host's summons (the user's rule; recipient to be confirmed: kept in
+// summon_kill_reward). Who finished a downed player is known only on that player's own machine: the rescue gauge
+// is lowered there (0x66dec0, our finish_hit_hook; the gauge calls on the attacker's machine are never for a remote
+// character, logs), and an empty gauge by the other side is where we end the down (+0x728 = the hitter's handle,
+// timer 0 -> death). So the summon's machine names the finisher in its Steam lobby member data by its session
+// player number only (nrpvp_finished = "<player number>,<count>": no Steam id or name in lobby data); the numbers
+// are the same on every machine of the session (member +0xd4: host 1, joiners 2.. in every log of both sides) and
+// differ between two invaders. An invader whose own number (its own member's +0xd4) is named, with a count it has
+// not seen since it arrived, gets REWARD_RUNES_SUMMON_KILL through the game's rune add (0x2098c0, player data
+// +0x6c), outside the one-tenth rule. Once per finish; with two invaders only the named one.
+#define LOBBY_FINISHED_KEY "nrpvp_finished"
+#define REWARD_RUNES_SUMMON_KILL 10000
+static void summon_finished_by(char *attacker);
+static void summon_kill_reward_give(unsigned long long summon);  // the one place that decides who gets it and how much
 static int finish_side_ok(char *chr) {  // a down of this local character counts as by the other side
     return chr && chr == local_player() && (our_speffect_active(chr) == 1 || side_count(0) > 0);
 }
@@ -1318,6 +1332,7 @@ static void finish_hit_hook(char *chr, char *attacker, char *hit) {
     *(float *)(chr + 0x714) = 0.5f;
     *(float *)(chr + 0x718) = 0;
     logf("finish test: emptied by the other side: gauge 0 -> 0.5 (no stand-up), timer %.2f -> 0 (bleed-out death)", timer);
+    if (g_as_ally && g_join == 4) summon_finished_by(attacker);
 }
 // Task 2 (finish-test). Whether an attack may hit a character is decided on the attacker's machine in
 // 0x436370 (called from the hit dispatch 0x43ed80 before the target's damage module, slot 7 = 0x437010,
@@ -1380,6 +1395,35 @@ static void player_hit_hook(char *module, long long *attacker, char *hit) {
              ult ? "ultimate" : "ordinary", beast ? " (Executor beast form)" : "", kind == 1 ? "Pc" : "Npc", id, d0, *(int *)(hit + 0x280), f0, *(float *)(hit + 0x144), hp0,
              chr_hp(victim));
     }
+}
+// Runes from a kill (read 2026-11-15). Every machine pays the kill itself: 0x3de710 (the dying enemy, once: its
+// +500 bit 4) takes NpcParam +0x2c (row via vt+0x1a0) times the enemy's own rune multiplier (0x506e30 on its
+// effects) and calls 0x668380(local player, amount, enemy, flag) at 0x3de800; 0x51da30 does the same for a kill
+// reported in a session packet (the amount from the packet, before any player's multiplier) at 0x51dc0b.
+// 0x668380 rounds the float and calls PlayerIns vt+0x5d0 (0x668300), which multiplies by the player's own rune
+// rate (0x508510 on its effects: 99240 soulRate etc.) and adds through 0x2098c0 (player data +0x6c, capped
+// 999999999; also +0x70 and +0x110 totals). So the host and the invader start from the same base amount; their
+// gains differ only by their own rune multipliers. Other rune sources (items 0x668060, event awards 0x600d20,
+// our reward, level-up spending in 0xfdee30) do not pass here. The invader (our team effect on it) gets a
+// tenth of the base: floor(base / 10), at least 1 when the base was above 0; then its own multiplier applies.
+#define RUNE_KILL_FN 0x668380
+#define INVADER_RUNE_SHARE 10  // the invader gets 1 / this of a kill's runes
+static char *local_player(void);
+static int rune_kill_hook(char *chr, float amount, char *enemy, unsigned char flag) {
+    float full = amount;
+    int cut = chr && chr == local_player() && amount > 0 && our_speffect_active(chr) == 1;
+    if (cut) {
+        amount = (float)(int)(amount / INVADER_RUNE_SHARE);
+        if (amount < 1) amount = 1;
+    }
+    int got = ((int (*)(char *, float, char *, unsigned char))(g_base + RUNE_KILL_FN))(chr, amount, enemy, flag);
+    if (cut && g_debug_log) logf("runes: invader's kill reward cut to 1/%d: base %.1f -> %.1f, gained %d (own multiplier applied)", INVADER_RUNE_SHARE,
+                                 full, amount, got);
+    return got;
+}
+static void rune_install(void) {
+    hook_call(0x3de800, RUNE_KILL_FN, (void *)rune_kill_hook, "runes: kill reward (own kill)");
+    hook_call(0x51dc0b, RUNE_KILL_FN, (void *)rune_kill_hook, "runes: kill reward (reported kill)");
 }
 static void ult_pvp_install(void) {
     void **slot = (void **)(g_base + RVA_PLAYER_DMG_VTABLE) + 7;
@@ -2605,6 +2649,7 @@ static void hook_acceptance(void) {
         hook_call(0x674f37, 0x66f3b0, (void *)finish_down_hook, "finish test: going down");
         hook_call(0x43dac3, 0x66dec0, (void *)finish_hit_hook, "finish test: gauge hit");
         if ((g_settings[S_ULT_PVP] && g_settings[S_ULT_PVP] != 100) || g_debug_log) ult_pvp_install();
+        rune_install();
     }
     hook_call(0xc27a41, 0x6b06f0, (void *)map_request_hook, "two-regions: map request");
     hook_call(0x5e7ff6, 0x6ab300, (void *)tile_flag_space_hook, "two-regions: tile flag space");
@@ -4223,6 +4268,62 @@ static void no_sprint_frame(void) {
         next = GetTickCount() + (frames > 0 && seen_on == frames ? 30000 : 1000), seen_on = frames = added = 0;
     }
 }
+static void summon_kill_reward_give(unsigned long long summon) {
+    char *gdm = *(char **)(g_base + 0x3c078d0), *pd = gdm ? *(char **)(gdm + 8) : NULL;
+    if (!pd || IsBadReadPtr(pd, 0x120)) return;
+    int before = *(int *)(pd + 0x6c);
+    ((int (*)(char *, int))(g_base + 0x2098c0))(pd, REWARD_RUNES_SUMMON_KILL);
+    logf("summon kill: we finished the host's summon (member %04x): %d runes added (%d -> %d)", id_tag(summon), REWARD_RUNES_SUMMON_KILL,
+         before, *(int *)(pd + 0x6c));
+}
+// The summon's side: name the invader who finished us (see LOBBY_FINISHED_KEY).
+static void summon_finished_by(char *attacker) {
+    static int count;
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR), num[8];
+    if (!sm || !attacker || IsBadReadPtr(attacker, 0x200) || !g_diag.set_member || !g_candidate) return;
+    int pn = *(int *)((char *(*)(void *, void *))(g_base + 0x66c6f0))(attacker, num);
+    char *b = *(char **)(sm + SM_PLAYERS_BEGIN), *e = *(char **)(sm + SM_PLAYERS_BEGIN + 8);
+    for (char *x = b; b && x < e && !IsBadReadPtr(x, SM_PLAYER_SIZE); x += SM_PLAYER_SIZE)
+        if (!x[0xe1] && *(int *)(x + 0xd4) == pn) {
+            char text[24];
+            snprintf(text, sizeof text, "%d,%d", pn, ++count);
+            g_diag.set_member(g_steam.mm, g_candidate, LOBBY_FINISHED_KEY, text);
+            logf("summon kill: finished by player %d, count %d published", pn, count);
+            return;
+        }
+    logf("summon kill: finisher (player %d) not found among the session's members", pn);
+}
+// The invader's side: one reward per new count that names us.
+static void summon_kill_reward(void) {
+    static DWORD next, for_enter;
+    static unsigned long long who[8];
+    static int seen[8];
+    if (!g_invader_in_world() || !g_diag.get_member || !g_diag.member || !g_candidate) return;
+    if (for_enter != g_enter_tick) for_enter = g_enter_tick, memset(who, 0, sizeof who), memset(seen, 0, sizeof seen), next = 0;
+    if ((int)(GetTickCount() - next) < 0) return;
+    next = GetTickCount() + 500;
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);  // our own session player number (our member's +0xd4)
+    char *b = sm ? *(char **)(sm + SM_PLAYERS_BEGIN) : NULL, *e = sm ? *(char **)(sm + SM_PLAYERS_BEGIN + 8) : NULL;
+    int self = -1;
+    for (char *x = b; b && x < e && !IsBadReadPtr(x, SM_PLAYER_SIZE); x += SM_PLAYER_SIZE)
+        if (x[0xe1]) self = *(int *)(x + 0xd4);
+    if (self < 1) return;
+    int n = g_steam.members(g_steam.mm, g_candidate);
+    for (int i = 0; i < n && i < 8; i++) {
+        unsigned long long id = g_diag.member(g_steam.mm, g_candidate, i);
+        const char *v = id ? g_diag.get_member(g_steam.mm, g_candidate, id, LOBBY_FINISHED_KEY) : NULL;
+        int named = 0, count = 0;
+        if (!v || sscanf(v, "%d,%d", &named, &count) != 2) count = 0;
+        int k = 0;
+        while (k < 8 && who[k] && who[k] != id) k++;
+        if (k == 8) continue;
+        if (!who[k]) { who[k] = id, seen[k] = count; continue; }  // the first look: what was there before we came
+        if (count > seen[k]) {
+            seen[k] = count;
+            if (named == self) summon_kill_reward_give(id);
+        }
+    }
+}
 // Invasion notices on the host's and every ally's screen: an invader is a remote player character that carries
 // our team effect 90071610 (its own machine puts it on at arrival; the others get it through the effect sync, as
 // the host's logs of every invasion show: "base team 2 effective 16 our effect 1"). Once per character: the
@@ -5402,6 +5503,7 @@ static void step_hook(void *ctrl, void *time, int step) {
     }
     no_sprint_frame();
     if (step == QM_STEP_INGAME || g_join_in_world()) invader_notice_frame();
+    summon_kill_reward();
     static int told_invader;
     if (g_join != 4) {
         if (told_invader) told_invader = 0, logf("role: no longer an invader; own expeditions host again");
