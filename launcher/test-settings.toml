@@ -10,7 +10,7 @@ no-host = false           # test: your own expedition opens no host session (nob
 test-level = 0            # test: your own expedition sets your level to this number 5 s after the start (0 = off)
 boss-flow = 0             # test (host only): 1 = the day runs and the circle clock waits at 22:59 until a region boss is dead (after 5 min there the day starts again); 2 = clock stands still all day (comparison)
 revive-hits = false       # test, invasions: a downed player is finished by the other side in 2 hits, raised by its own side in 5
-no-sprint = false         # test: no fast run (sprint); running stays
+no-sprint = true          # the fast run (sprint) is off; false turns it back on
 ult-pvp = 100             # test, invasions: ultimate damage against players of the other side in percent (100 = unchanged, 0..999)
 ally = false              # test, joining player only: "Invasion" joins the host's expedition as an ally (squad member) instead of an invader
 party = 0                 # test only: a number mixed into the squad matchmaking key, to keep test runs apart (0 = off)

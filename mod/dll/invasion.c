@@ -4196,6 +4196,16 @@ static int speffect_on(char *chr, unsigned id) {
         if (e[0] == ref.row && !(*(unsigned *)((char *)e + 0x68) & 0x800c0003)) return 1;
     return 0;
 }
+static char *speffect_entry(char *chr, unsigned id) {  // the active entry of SpEffect id on chr, or NULL
+    struct { char *row; unsigned id; unsigned char flag; } ref = {0};
+    ((void (*)(void *, unsigned))(g_base + RVA_SPEFFECT_ROW))(&ref, id);
+    char *module = *(char **)(chr + CHR_SPEFFECTS);
+    if (!ref.row || !module) return NULL;
+    int n = 0;
+    for (char **e = *(char ***)(module + 8); e && n < 512; e = (char **)e[7], n++)
+        if (e[0] == ref.row && !(*(unsigned *)((char *)e + 0x68) & 0x800c0003)) return (char *)e;
+    return NULL;
+}
 static void no_sprint_frame(void) {
     if (!setting(S_NO_SPRINT)) return;
     char *chr = local_player();
@@ -4460,12 +4470,28 @@ static void enter_watch(char *sm) {
     // the ally is there and ends by itself within 30 s after it has left. Like the invader's red, it is put on
     // the ally's own character only; the others see it through the game's effect sync (the host saw our team
     // effect on the invader's character, runs 13 ff.). Not our team effect: no rule keys on it.
-    static DWORD ally_look_at;
-    if (g_as_ally && g_enter_world && chr && GetTickCount() - ally_look_at >= ALLY_LOOK_RENEW_MS) {
-        int first = !ally_look_at || GetTickCount() - ally_look_at > 2 * ALLY_LOOK_RENEW_MS;
-        ally_look_at = GetTickCount() | 1;
-        ((void (*)(void *, int, unsigned char))(g_base + RVA_ADD_SPEFFECT))(chr, ALLY_LOOK_SPEFFECT, 0);
-        if (first) logf("ally: gold look (SpEffect %d) put on, renewed every %u s", ALLY_LOOK_SPEFFECT, ALLY_LOOK_RENEW_MS / 1000);
+    // Run of 818477c: the gold came tens of seconds after landing (it waited for the world sync's StartIngame, step
+    // 22) and dropped out now and then (30 s copies added every 20 s: an add while the effect is still on does not
+    // seem to restart it, so the copy ended at 30 s and the next add came at 40 s; not read in code). Now: from the
+    // first frame the ally's character stands in a field map of the host's world (map load under way, block area
+    // 0x3c; the start flight included), every frame: if the effect is not on, it is put on at once. Each change of
+    // the state and each add is logged with the effect entry's first floats (+0x8..+0x18: is one the time left?).
+    if (g_as_ally && g_join == 4 && chr && g_move >= 3 && (*(unsigned *)(chr + CHR_BLOCK_ID) >> 24) == 0x3c) {
+        static int was_on = -1, adds;
+        int on_now = speffect_on(chr, ALLY_LOOK_SPEFFECT);
+        if (!on_now) {
+            ((void (*)(void *, int, unsigned char))(g_base + RVA_ADD_SPEFFECT))(chr, ALLY_LOOK_SPEFFECT, 0);
+            if (adds++ < 40) logf("ally: gold look (SpEffect %d) %s (add %d, block %08x)", ALLY_LOOK_SPEFFECT,
+                                  was_on < 0 ? "put on at the first frame in the field" : "was off: put on again", adds, *(unsigned *)(chr + CHR_BLOCK_ID));
+        }
+        static DWORD next;
+        char *e = speffect_entry(chr, ALLY_LOOK_SPEFFECT);
+        if (e && (int)(GetTickCount() - next) >= 0 && adds < 60) {
+            next = GetTickCount() + 5000;
+            logf("ally: gold look entry %p: +8 %.2f +c %.2f +10 %.2f +14 %.2f +18 %.2f", (void *)e, *(float *)(e + 8), *(float *)(e + 0xc),
+                 *(float *)(e + 0x10), *(float *)(e + 0x14), *(float *)(e + 0x18));
+        }
+        was_on = on_now;
     }
     if (g_enter_effect > 0 && chr && !reapplied && nowt - applied < 5000 && nowt - applied > 300 && our_speffect_active(chr) == 0) {
         reapplied = 1;
