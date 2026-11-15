@@ -850,7 +850,9 @@ static int g_as_ally;                       // joiner: this join is as an ally
 // gathered over our Steam lobby instead of FromSoftware's matchmaking. Phases below (party code).
 enum { PARTY_OFF, PARTY_PENDING, PARTY_GUEST_WAIT, PARTY_HOST_CREATE, PARTY_HOST_STARTED, PARTY_GUEST };
 static int g_party, g_party_host, g_party_guest;
-static char g_party_code[16];  // "k" + hash of the menu's password, or the test setting's number
+static char g_party_code[16];  // the pool key: "p" + hash of base, game version, protocol, password, test salt
+static unsigned long long g_party_old_lobby;  // our own last lobby: never taken for another host's
+static unsigned long long g_party_lowest;  // the lowest-id lobby with our key in the last party search (not ours)
 static int g_in_expedition;
 static void party_host_over(void);
 #define LOBBY_PARTY_KEY "nrpvp_party"   // a gathering host's party code
@@ -3114,15 +3116,20 @@ static void log_start(char *ctrl, int step) {
 #define TEXT_SEARCHING      131162    // added to CL_MenuText by build_msg.py / the launcher
 #define TEXT_SEARCH_CANCELLED 131163
 #define TEXT_PARTY_WAIT     131167    // "Waiting for the squad's host..."
+#define TEXT_INVADER_LEFT   131168    // "The invader has left"
+#define TEXT_YOU_INVADED    131169    // "You have invaded another squad's expedition!"
 static char *summon_queue(void) {
     char *menu = *(char **)(g_base + RVA_MENU_MAN_PTR);
     return menu ? menu + MENU_MAN_SUMMON_QUEUE : NULL;
 }
-static void notice(int which) {  // 0 searching, 1 cancelled, 2 party: waiting for the host / joining it
-    static _Alignas(16) char text[3][0x100];  // built once and kept: the game never frees them for us
-    static void *ready[3];
-    static const int ID[3] = {TEXT_SEARCHING, TEXT_SEARCH_CANCELLED, TEXT_PARTY_WAIT};
-    if (which < 0 || which > 2) return;
+// 0 searching, 1 cancelled, 2 party: waiting for the host / joining it, 3 an invader arrived (the game's own line
+// 338280 "Another Condemned has invaded!"), 4 the invader died (the game's 336101 "INVADER VANQUISHED"), 5 the
+// invader left (ours), 6 the invader's own arrival (ours). The game's lines come in every language it has.
+static void notice(int which) {
+    static _Alignas(16) char text[7][0x100];  // built once and kept: the game never frees them for us
+    static void *ready[7];
+    static const int ID[7] = {TEXT_SEARCHING, TEXT_SEARCH_CANCELLED, TEXT_PARTY_WAIT, 338280, 336101, TEXT_INVADER_LEFT, TEXT_YOU_INVADED};
+    if (which < 0 || which > 6) return;
     if (!ready[which]) ready[which] = ((void *(*)(void *, int))(g_base + RVA_MENU_TEXT_CTOR))(text[which], ID[which]);
     ((unsigned char (*)(void *))(g_base + RVA_SUMMON_MESSAGE))(ready[which]);
 }
@@ -3743,7 +3750,9 @@ static int lobby_search_frame(const char *who) {
     logf("%s: request %u completed after %lums: result %s, failed %u, %u lobbies", who, g_list_count, now - g_list_tick,
          got ? "read" : "NOT read", failed, result.matching);
     if (!got || failed) return 1;
-    u64 chosen = 0;
+    u64 chosen = 0, fit[50];
+    int nfit = 0;
+    g_party_lowest = 0;
     for (unsigned i = 0; i < result.matching && i < 50; i++) {
         u64 id = g_steam.by_index(g_steam.mm, (int)i);
         const char *game = g_steam.get_data(g_steam.mm, id, LOBBY_GAME_KEY), *squad = g_steam.get_data(g_steam.mm, id, LOBBY_SQUAD_KEY);
@@ -3758,6 +3767,12 @@ static int lobby_search_frame(const char *who) {
              game ? game : "?", squad ? squad : "?", free ? free : "?", g_steam.members(g_steam.mm, id),
              g_steam.limit(g_steam.mm, id), own ? "our own lobby" : fits ? (g_as_ally ? "has a free ally place" : "has a free invader slot") : "no slot for us");
         if (fits && !chosen) chosen = id;  // Steam sorts by distance: the first that fits
+        if (fits && !(g_party && id == g_party_old_lobby)) fit[nfit++] = id;
+        if (g_party && !own && id != g_party_old_lobby && (!g_party_lowest || id < g_party_lowest)) g_party_lowest = id;
+    }
+    if (g_party) {  // the pool: a random host among those with a free place (our own old lobby left out)
+        chosen = nfit ? fit[(GetTickCount() ^ (DWORD)(uintptr_t)&nfit) % (unsigned)nfit] : 0;
+        if (nfit > 1) logf("%s: %d hosts with a free place, one taken at random", who, nfit);
     }
     if (chosen) logf("%s: %s lobby %llu", who, g_join_test ? "candidate" : "would join (join-test is off)", chosen);
     else logf("%s: no lobby to join", who);
@@ -3888,6 +3903,8 @@ static int g_reward_pending; // 1 won, 2 lost: applied at the expedition's rewar
 // module (0x427b70 / 0x427b80 / 0x427b90, 0x428bf0). The same calls here. Runes (+0x6c) are not touched;
 // the highest level +0x10c is put back to its own value when the level is restored.
 static int g_level_set, g_own_level, g_own_top_level;
+#define JOIN_LEVEL_CUT_PERCENT 40  // the joiner's level = max(1, floor(host level * (100 - this) / 100))
+#define JOIN_LEVEL_CUT_ALLIES 0    // 0: invaders only (the user decides about allies); 1: allies too
 static int level_apply(int level, const char *why) {
     char *ps = *(char **)(g_base + 0x3c078d0), *chr = local_player();
     char *pd = ps ? *(char **)(ps + 8) : NULL;
@@ -4131,6 +4148,8 @@ static int join_leave(void) {
 #define CHR_BASE_TEAM      0x74
 #define CHR_SPEFFECTS      0x190
 #define TEAM_TEST_SPEFFECT 90071610
+#define ALLY_LOOK_SPEFFECT 90071611  // the ally's gold phantom look only (launcher: SPEFFECT_ALLY_ROW)
+#define ALLY_LOOK_RENEW_MS 20000
 #define TEAM_TEST_START_MS 90000
 #define TEAM_TEST_LEN_MS   180000
 static int g_team_test;        // 0 off, 1 waiting, 2 applied, 3 over
@@ -4183,6 +4202,53 @@ static void no_sprint_frame(void) {
     if (GetTickCount() - next < 0x80000000u) {
         logf("no sprint: SpEffect %d on in %d of %d frames (added %d times) in the last second", NO_SPRINT_SPEFFECT, seen_on, frames, added);
         next = GetTickCount() + (frames > 0 && seen_on == frames ? 30000 : 1000), seen_on = frames = added = 0;
+    }
+}
+// Invasion notices on the host's and every ally's screen: an invader is a remote player character that carries
+// our team effect 90071610 (its own machine puts it on at arrival; the others get it through the effect sync, as
+// the host's logs of every invasion show: "base team 2 effective 16 our effect 1"). Once per character: the
+// effect appearing = arrived (the character is in our world and admitted); the effect gone while the character is
+// still there = died (death removes it); the character gone with the effect still on = left.
+static void invader_notice_frame(void) {
+    static char *seen[8];
+    static int on[8], told[8];
+    static DWORD next;
+    if ((int)(GetTickCount() - next) < 0) return;
+    next = GetTickCount() + 250;
+    char *wcm = *(char **)(g_base + RVA_WORLD_CHR_MAN), *me = wcm ? *(char **)(wcm + WCM_LOCAL_PLAYER) : NULL;
+    if (!wcm || g_invader_in_world()) return;
+    void **set = (void **)(wcm + 0x9a40);
+    if (IsBadReadPtr(set, 8) || IsBadReadPtr(*(void ***)set, 16)) return;
+    void **vt = *(void ***)set;
+    int count = ((int (*)(void *))vt[0])(set);
+    char *now[8] = {0};
+    for (int i = 0; i < count && i < 8; i++) {
+        char *c = ((char *(*)(void *, unsigned long long))vt[1])(set, (unsigned long long)i);
+        if (c && c != me && !IsBadReadPtr(c, 0x200)) now[i] = c;
+    }
+    for (int k = 0; k < 8; k++) {  // characters we followed: still there?
+        if (!seen[k]) continue;
+        int present = 0;
+        for (int i = 0; i < 8; i++) present |= now[i] == seen[k];
+        if (!present) {
+            if (on[k] && told[k] == 1) notice(5), logf("invasion notice: the invader left");
+            seen[k] = NULL, on[k] = told[k] = 0;
+        }
+    }
+    for (int i = 0; i < 8; i++) {
+        char *c = now[i];
+        if (!c) continue;
+        int k = 0;
+        while (k < 8 && seen[k] != c) k++;
+        if (k == 8) {
+            for (k = 0; k < 8 && seen[k]; k++) {}
+            if (k == 8) continue;
+            seen[k] = c, on[k] = told[k] = 0;
+        }
+        int eff = our_speffect_active(c) == 1;
+        if (eff && !on[k] && !told[k]) told[k] = 1, notice(3), logf("invasion notice: an invader has arrived (character %p)", (void *)c);
+        else if (!eff && on[k] && told[k] == 1) told[k] = 2, notice(4), logf("invasion notice: the invader was vanquished");
+        on[k] = eff;
     }
 }
 static void team_log(const char *when) {
@@ -4380,6 +4446,18 @@ static void enter_watch(char *sm) {
         g_enter_effect = -1;  // allies: no team effect (base team 2, Friend to the host's 2); death is the game's own
         team_log("enter test, ally: no team effect");
     }
+    // The ally's gold look: our row 90071611 (launcher: vfxId1 54220 = the game's gold phantom, PhantomParam 62;
+    // 30 s; no team change), put on in the host's world at once and again every 20 s, so it never lapses while
+    // the ally is there and ends by itself within 30 s after it has left. Like the invader's red, it is put on
+    // the ally's own character only; the others see it through the game's effect sync (the host saw our team
+    // effect on the invader's character, runs 13 ff.). Not our team effect: no rule keys on it.
+    static DWORD ally_look_at;
+    if (g_as_ally && g_enter_world && chr && GetTickCount() - ally_look_at >= ALLY_LOOK_RENEW_MS) {
+        int first = !ally_look_at || GetTickCount() - ally_look_at > 2 * ALLY_LOOK_RENEW_MS;
+        ally_look_at = GetTickCount() | 1;
+        ((void (*)(void *, int, unsigned char))(g_base + RVA_ADD_SPEFFECT))(chr, ALLY_LOOK_SPEFFECT, 0);
+        if (first) logf("ally: gold look (SpEffect %d) put on, renewed every %u s", ALLY_LOOK_SPEFFECT, ALLY_LOOK_RENEW_MS / 1000);
+    }
     if (g_enter_effect > 0 && chr && !reapplied && nowt - applied < 5000 && nowt - applied > 300 && our_speffect_active(chr) == 0) {
         reapplied = 1;
         ((void (*)(void *, int, unsigned char))(g_base + RVA_ADD_SPEFFECT))(chr, TEAM_TEST_SPEFFECT, 0);
@@ -4396,8 +4474,13 @@ static void enter_watch(char *sm) {
             int no = *(int *)(sl + 8), lv = *(int *)(sl + 0x68);
             if (no != host_no || lv < 1 || lv > 15) continue;
             g_own_level = *(int *)(pd + 0x68), g_own_top_level = *(int *)(pd + 0x10c);
-            logf("level: host (player %d) is level %d; invader level %d (highest %d)", no, lv, g_own_level, g_own_top_level);
-            if (level_apply(lv, "arrival at the host's level") >= 0) g_level_set = 1;
+            // the user's formula: the joiner gets the host's level less JOIN_LEVEL_CUT_PERCENT, never below 1
+            // (host 1 -> 1, 2 -> 1, 3 -> 1, 5 -> 3, 10 -> 6, 15 -> 9); allies only when JOIN_LEVEL_CUT_ALLIES is 1
+            int cut = !g_as_ally || JOIN_LEVEL_CUT_ALLIES, want = cut ? lv * (100 - JOIN_LEVEL_CUT_PERCENT) / 100 : lv;
+            if (want < 1) want = 1;
+            logf("level: host (player %d) is level %d; joiner (%s) level %d (highest %d) -> %d (%s)", no, lv, g_as_ally ? "ally" : "invader",
+                 g_own_level, g_own_top_level, want, cut ? "host's level less the cut, at least 1" : "the host's level");
+            if (level_apply(want, "arrival: level from the host's") >= 0) g_level_set = 1;
             break;
         }
     }
@@ -4405,6 +4488,7 @@ static void enter_watch(char *sm) {
         team_log("enter test, before the team effect");
         ((void (*)(void *, int, unsigned char))(g_base + RVA_ADD_SPEFFECT))(chr, TEAM_TEST_SPEFFECT, 0);
         g_enter_effect = 1;
+        notice(6), logf("invasion notice: you have invaded (shown to the invader)");
         applied = nowt;
         check_at = nowt + 1000;
     }
@@ -4794,7 +4878,8 @@ static int host_test_leave(void);
 // *(request +0x18), as 0xb67cc0 reads it; only its FNV-1a hash goes into the lobby, "k%08x"), else the test
 // setting's number. Not established: what the matching server would have written into the context (logged).
 static DWORD g_party_tick;
-static u64 g_party_old_lobby;  // our own last lobby: never taken for another host's
+static DWORD g_party_confirm;  // host: 0 not marked; tick of the marking (odd); 3 confirm search sent; 2 confirmed
+#define PARTY_CONFIRM_MS 3000
 static int g_party_marked_for;
 static char *party_ctx(char *ctrl) {
     char *ctx = ctrl ? *(char **)(ctrl + QM_CTRL_CONTEXT) : NULL;
@@ -4825,35 +4910,47 @@ static void party_host_over(void) {
     if (g_lobby) g_party_old_lobby = g_lobby;
     g_party = PARTY_OFF, g_party_host = 0;
 }
-// The password typed in the menu, hashed; 0 when none.
-static unsigned party_password_hash(char *request) {
-    if (request[0x48] != 1) return 0;
+// The menu's password (request +0x48 == 1, UTF-16 at *(request +8), else *(request +0x18), as 0xb67cc0 reads
+// it); NULL when none is typed.
+static unsigned short *party_password(char *request) {
+    if (request[0x48] != 1) return NULL;
     unsigned short *w = *(unsigned short **)(request + 8);
     if (!w) w = *(unsigned short **)(request + 0x18);
-    if (!w || IsBadReadPtr(w, 2) || !*w) return 0;
+    return w && !IsBadReadPtr(w, 2) && *w ? w : NULL;
+}
+// Matchmaking pools (the user's design): key = FNV-1a of a fixed base ("oisis"), the game version, our lobby
+// protocol, the password (none = the common pool of every mod player) and the test setting "party" when it is
+// above 0 (an extra salt, only to keep test runs apart). Only the hash goes into the lobby.
+static unsigned party_key_hash(char *request) {
     unsigned h = 2166136261u;
-    for (int i = 0; i < 64 && !IsBadReadPtr(w + i, 2) && w[i]; i++) h = (h ^ w[i]) * 16777619u, h = (h ^ (w[i] >> 8)) * 16777619u;
-    return h ? h : 1;
+    const char *base[3] = {"oisis", LOBBY_GAME, LOBBY_PROTO};
+    for (int k = 0; k < 3; k++)
+        for (const char *c = base[k]; *c; c++) h = (h ^ (unsigned char)*c) * 16777619u;
+    h = (h ^ '|') * 16777619u;
+    unsigned short *w = party_password(request);
+    for (int i = 0; w && i < 64 && !IsBadReadPtr(w + i, 2) && w[i]; i++) h = (h ^ (w[i] & 0xff)) * 16777619u, h = (h ^ (w[i] >> 8)) * 16777619u;
+    h = (h ^ '|') * 16777619u;
+    for (int salt = g_settings[S_PARTY]; salt > 0; salt /= 10) h = (h ^ (unsigned)('0' + salt % 10)) * 16777619u;
+    return h;
 }
 // Request seen (fill context): the menu's squad choice with a password or a party code.
 static void party_request(char *self, char *request) {
-    unsigned hash = party_password_hash(request);
+    int pw = party_password(request) != NULL;
     char code[16];
-    if (hash) snprintf(code, sizeof code, "k%08x", hash);
-    else if (g_settings[S_PARTY] > 0) snprintf(code, sizeof code, "%d", g_settings[S_PARTY]);
-    else return;
+    snprintf(code, sizeof code, "p%08x", party_key_hash(request));
     if (g_party) {  // already hosting or waiting: keep it (a reopened menu must not restart the party)
         logf("party: start request again while the party is under way (phase %d): kept as it is", g_party);
         return;
     }
     char *ctx = *(char **)(self + 8);
     snprintf(g_party_code, sizeof g_party_code, "%s", code);
-    g_party = PARTY_PENDING, g_party_tick = GetTickCount(), g_party_marked_for = -1;
+    g_party = PARTY_PENDING, g_party_tick = GetTickCount(), g_party_marked_for = -1, g_party_confirm = 0;
     g_as_ally = 1;
     if (!g_network_on) set_network(1);
-    logf("party: start request for a squad of %u, code from %s: network %s; looking for a host with this code",
+    logf("party: start request for a squad of %u, pool: %s%s: network %s; looking for a host in it",
          ctx && *(char **)ctx == g_base + RVA_QM_CONTEXT_VTABLE ? *(unsigned *)(ctx + QM_CTX_PLAYERS) : 0,
-         hash ? "the menu's password (hashed)" : "the test setting", g_network_on ? "up" : "NOT up");
+         pw ? "the menu's password" : "the common pool (no password)", g_settings[S_PARTY] > 0 ? " + test salt" : "",
+         g_network_on ? "up" : "NOT up");
 }
 static int party_lobby_go(u64 lobby) {
     const char *go = lobby ? g_steam.get_data(g_steam.mm, lobby, LOBBY_GO_KEY) : NULL;
@@ -4896,7 +4993,30 @@ static void party_frame(char *ctrl) {
         if (g_host_test != 2 || state != 3) return;
         lobby_mark();
         if (!g_lobby) return;
-        lobby_set(LOBBY_PARTY_KEY, g_party_code), lobby_set(LOBBY_GO_KEY, "0");
+        if (!g_party_confirm) {
+            lobby_set(LOBBY_PARTY_KEY, g_party_code), lobby_set(LOBBY_GO_KEY, "0");
+            g_party_confirm = GetTickCount() | 1;
+            logf("party: hosting in lobby %llu; one more search in %u s for another host who started at the same moment",
+                 g_lobby, PARTY_CONFIRM_MS / 1000);
+            return;
+        }
+        if (GetTickCount() - g_party_confirm < PARTY_CONFIRM_MS) return;
+        if (g_party_confirm != 2) {  // the confirming search, sent at once
+            if (g_party_confirm != 3) lobby_search_reset(), g_party_confirm = 3;
+            if (!lobby_search_frame("party confirm")) return;
+            g_party_confirm = 2;
+            if (g_party_lowest && g_party_lowest < g_lobby) {  // another host at the same moment, with the lower id: join it
+                logf("party: another host started at the same moment (lobby %llu, lower id than ours %llu): ours is given up",
+                     g_party_lowest, g_lobby);
+                g_party_old_lobby = g_lobby;
+                host_test_leave();
+                g_lobby = 0, g_host_test = 0, g_party_host = 0, g_party_confirm = 0;
+                g_party = PARTY_GUEST_WAIT, g_party_tick = GetTickCount();
+                lobby_search_reset();
+                return;
+            }
+            logf("party: no other host with a lower lobby id: ours stays");
+        }
         char *ctx = party_ctx(ctrl);
         if (!ctx) { party_end("context not as expected"); return; }
         ((void (*)(void *, unsigned char))(*(void ***)ctx)[0x48 / 8])(ctx, 1);  // the solo path
@@ -5208,6 +5328,7 @@ static void step_hook(void *ctrl, void *time, int step) {
         }
     }
     no_sprint_frame();
+    if (step == QM_STEP_INGAME || g_join_in_world()) invader_notice_frame();
     static int told_invader;
     if (g_join != 4) {
         if (told_invader) told_invader = 0, logf("role: no longer an invader; own expeditions host again");
@@ -5316,7 +5437,7 @@ static unsigned char online_check_hook(char *request) {
     size_t count = begin && end >= begin ? (size_t)(end - begin) : 0;
     for (size_t i = 0; i < count && i < 64; i++)
         if (begin[i] == INVASION_ROW) return 1;
-    if (request[REQ_PLAYERS_CHOICE] <= 1 && (g_settings[S_PARTY] > 0 || party_password_hash(request))) return 1;  // party: gathered by us
+    if (request[REQ_PLAYERS_CHOICE] <= 1) return 1;  // a squad expedition: gathered by us over Steam (party), never by the server
     return ((unsigned char (*)(void))(g_base + RVA_IS_ONLINE))();
 }
 

@@ -52,6 +52,9 @@ TEAM_INVADER, TEAM_TEST_SECONDS = 16, -1.0
 # phantomParamOverwriteId 60 (PhantomParam 60, "Red Phantom" in Smithbox's row names); vanilla
 # SpEffects 14559, 18698 and 99860 use it.
 RED_PHANTOM_VFX = 300050
+# Ally look (launcher: SPEFFECT_ALLY_ROW): row 90071611, vfxId1 54220 (like 300050 with PhantomParam 62, gold),
+# 30 s, team unchanged.
+SPEFFECT_ALLY_ROW, ALLY_PHANTOM_VFX, ALLY_SECONDS = 90071611, 54220, 30.0
 
 
 # Scarabs (decision 13): an invader on team 16 can hit them. NpcParam rows 41900000-41919999 (the
@@ -141,6 +144,12 @@ def team_row(row):
     struct.pack_into("<i", row, SPEFFECT_VFX1, RED_PHANTOM_VFX)
 
 
+def ally_row(row):
+    assert struct.unpack_from("<f", row, SPEFFECT_ENDURANCE)[0] == -1.0 and row[SPEFFECT_TEAM] == 0xFF
+    struct.pack_into("<f", row, SPEFFECT_ENDURANCE, ALLY_SECONDS)
+    struct.pack_into("<i", row, SPEFFECT_VFX1, ALLY_PHANTOM_VFX)
+
+
 def add_row(param):
     """Append a copy of TEMPLATE_ROW as NEW_ROW. Layout: 0x40 header, 24-byte row descriptors
     (id, pad, data offset, name offset), row data, strings."""
@@ -188,7 +197,8 @@ def main(src, dst, no_row=False, rain=True):
     # --no-row: repack without changing anything, to tell packing problems from param problems.
     patched = bundle if no_row else bnd4_replace(bundle, {
         PARAM: add_row(param),
-        SPEFFECT_PARAM: insert_row(speffect, SPEFFECT_TEMPLATE, SPEFFECT_TEAM_ROW, SPEFFECT_SIZE, team_row),
+        SPEFFECT_PARAM: insert_row(insert_row(speffect, SPEFFECT_TEMPLATE, SPEFFECT_TEAM_ROW, SPEFFECT_SIZE, team_row),
+                                   SPEFFECT_TEMPLATE, SPEFFECT_ALLY_ROW, SPEFFECT_SIZE, ally_row),
         NPC_PARAM: scarab_rows(npc),
         **({} if rain else {PLAY_AREA_PARAM: no_rain(next(b for n, b in bnd4_read(bundle) if n.endswith(PLAY_AREA_PARAM)))})})
 

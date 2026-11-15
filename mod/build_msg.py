@@ -26,6 +26,8 @@ OUR_TEXT = {
         131164: ("Cancel invasion", "Anuluj najazd"),
         131166: ("Begin invasion", "Rozpocznij najazd"),
         131167: ("Waiting for the squad's host...", "Oczekiwanie na hosta drużyny..."),  # party: the host is not in the field yet
+        131168: ("The invader has left", "Najeźdźca odszedł"),  # host / allies: an invader left without dying
+        131169: ("You have invaded another squad's expedition!", "Wkroczyłeś do wyprawy innej drużyny!"),  # the invader on arrival
     },
 }
 

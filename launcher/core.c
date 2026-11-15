@@ -58,6 +58,8 @@ static const struct { u32 id; const char *english, *polish; } OUR_TEXT[] = {
     {131164, "Cancel invasion", "Anuluj najazd"},
     {131166, "Begin invasion", "Rozpocznij najazd"},
     {131167, "Waiting for the squad's host...", "Oczekiwanie na hosta dru\xc5\xbcyny..."},
+    {131168, "The invader has left", "Naje\xc5\xba" "d\xc5\xba" "ca odszed\xc5\x82"},
+    {131169, "You have invaded another squad's expedition!", "Wkroczy\xc5\x82" "e\xc5\x9b do wyprawy innej dru\xc5\xbcyny!"},
 };
 #define OUR_TEXT_COUNT (sizeof OUR_TEXT / sizeof *OUR_TEXT)
 
@@ -801,6 +803,12 @@ static buf param_add_row(buf p) {
 #define SPEFFECT_PARAM "\\SpEffectParam.param"
 #define SPEFFECT_TEMPLATE 10101
 #define SPEFFECT_TEAM_ROW 90071610
+// The ally's look (no side change): our row 90071611, a copy of the same template with vfxId1 54220 (the game's
+// SpEffectVfxParam row like 300050, but phantomParamOverwriteId 62: PhantomParam 62, the gold phantom: edge
+// colour 200 160 120) and effectEndurance 30 s; the DLL puts it on again every 20 s while the ally is in the
+// host's world, so it ends by itself within 30 s once the ally has left. changeTeamType stays none (0xff).
+#define SPEFFECT_ALLY_ROW 90071611
+#define ALLY_PHANTOM_VFX 54220
 #define SPEFFECT_SIZE 0x400
 #define NPC_PARAM "\\NpcParam.param"
 #define NPC_TEAM 0x133
@@ -1574,9 +1582,9 @@ static int build_regulation(const char *game_dir) {
     if (memcmp(dcx, "DCX", 3) || memcmp(dcx + 0x28, "ZSTD", 4) || csize > enc.n - 16 - 0x4C)
         return free(enc.p), logf_("regulation.bin is not in the expected format"), 0;
     buf bundle = {xalloc((size_t)usize + (1 << 17)), usize};
-    buf patched = {0}, body = {0}, param = {0}, speffect = {0}, step = {0}, maps[4] = {{0}}, cur = {0};
+    buf patched = {0}, body = {0}, param = {0}, speffect = {0}, speffect2 = {0}, step = {0}, maps[4] = {{0}}, cur = {0};
     int ok = 0, index, sp_index, npc_index, area_index, map_index[4] = {-1, -1, -1, -1};
-    u8 *team_row = NULL;
+    u8 *team_row = NULL, *ally_row = NULL;
     if (nr_zstd_decompress(dcx + 0x4C, csize, bundle.p, (size_t)usize + (1 << 17)) != usize) {
         logf_("regulation.bin could not be unpacked");
     } else if ((index = bnd4_find(bundle, TARGET_PARAM)) < 0 || !(param = param_add_row(bnd4_file(bundle, index))).p) {
@@ -1585,6 +1593,9 @@ static int build_regulation(const char *game_dir) {
                !(speffect = param_insert_sorted(bnd4_file(bundle, sp_index), SPEFFECT_TEMPLATE, SPEFFECT_TEAM_ROW,
                                                 SPEFFECT_SIZE, &team_row)).p ||
                rd32(team_row + 0x08) != 0xBF800000 || team_row[0x16D] != 0xFF || rd32(team_row + 0x18C) != 0xFFFFFFFF) {
+        logf_("The game's SpEffectParam looks different than expected. The game may have been updated; the mod needs an update too.");
+    } else if (!(speffect2 = param_insert_sorted(speffect, SPEFFECT_TEMPLATE, SPEFFECT_ALLY_ROW, SPEFFECT_SIZE, &ally_row)).p ||
+               rd32(ally_row + 0x08) != 0xBF800000 || ally_row[0x16D] != 0xFF || rd32(ally_row + 0x18C) != 0xFFFFFFFF) {
         logf_("The game's SpEffectParam looks different than expected. The game may have been updated; the mod needs an update too.");
     } else if ((npc_index = bnd4_find(bundle, NPC_PARAM)) < 0 || !scarab_rows(bnd4_file(bundle, npc_index))) {
         logf_("The game's NpcParam looks different than expected. The game may have been updated; the mod needs an update too.");
@@ -1596,6 +1607,14 @@ static int build_regulation(const char *game_dir) {
         // effectEndurance stays -1 (the template's): until removed; death removes it
         team_row[0x16D] = 16;                // changeTeamType 16
         wr32(team_row + 0x18C, 300050);      // vfxId1: red phantom look
+        // the ally's row, in the second copy (team_row points into the first, which is not used further)
+        for (u32 i = 0; i < rd16(speffect2.p + 0x0A); i++)
+            if (rd32(speffect2.p + 0x40 + i * 24) == SPEFFECT_TEAM_ROW) {
+                u8 *r = speffect2.p + rd64(speffect2.p + 0x40 + i * 24 + 8);
+                r[0x16D] = 16, wr32(r + 0x18C, 300050);
+            }
+        { float t = 30.0f; u32 bits; memcpy(&bits, &t, 4); wr32(ally_row + 0x08, bits); }  // effectEndurance 30 s
+        wr32(ally_row + 0x18C, ALLY_PHANTOM_VFX);  // vfxId1: gold phantom look; team unchanged
         // Written as a zlib DCX, like our other files (the launcher has no zstd compressor). It has
         // to be compressed: the game crashes at start-up on a 55 MB regulation.bin of stored zstd
         // blocks. ponytail: unlike the game's own file this is not zstd; if the game ever stops
@@ -1605,7 +1624,7 @@ static int build_regulation(const char *game_dir) {
         else logf_("Two-region maps: every map is the %s with the %s (200 compositions)%s", pair_a()->name, pair_b()->name,
                    map_draw_group() >= 0 ? "; test: only one night boss group (map-group)" : "");
         step = bnd4_replace(bundle, index, param);
-        patched = bnd4_replace(step, sp_index, speffect);
+        patched = bnd4_replace(step, sp_index, speffect2);
         for (int t = 0; t < 4; t++)
             if (maps[t].p) cur = bnd4_replace(patched, map_index[t], maps[t]), free(patched.p), patched = cur;
         body = dcx_write(patched);
@@ -1621,7 +1640,7 @@ static int build_regulation(const char *game_dir) {
         ok = write_file(path, out.p, out.n);
         free(out.p);
     }
-    free(enc.p); free(bundle.p); free(param.p); free(speffect.p); free(step.p); free(patched.p); free(body.p);
+    free(enc.p); free(bundle.p); free(param.p); free(speffect.p); free(speffect2.p); free(step.p); free(patched.p); free(body.p);
     for (int t = 0; t < 4; t++) free(maps[t].p);
     return ok;
 }

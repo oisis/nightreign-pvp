@@ -13,4 +13,4 @@ revive-hits = false       # test, invasions: a downed player is finished by the 
 no-sprint = false         # test: no fast run (sprint); running stays
 ult-pvp = 100             # test, invasions: ultimate damage against players of the other side in percent (100 = unchanged, 0..999)
 ally = false              # test, joining player only: "Invasion" joins the host's expedition as an ally (squad member) instead of an invader
-party = 0                 # test: a code 1..999 for the 2- / 3-player expedition when no password is typed in the game's menu (the password is used when there is one); 0 = off
+party = 0                 # test only: a number mixed into the squad matchmaking key, to keep test runs apart (0 = off)

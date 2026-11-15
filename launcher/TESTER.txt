@@ -22,12 +22,14 @@ Optional test settings are in test-settings.toml next to the launcher (all false
                host's running expedition as an ally (a squad member: no red colour, the host's
                team, no invasion reward) instead of as an invader. The host needs no setting; up
                to two allies per host (squad of three), and invaders can still come on top.
-  party        Test. A code (1..999, 0 = off), the same for every player of the squad; not needed when
-               you type the same password in the game's own expedition menu (the password is used
-               then). With either, "2 players" / "3 players" works without FromSoftware's servers: the
-               first player to start it hosts and goes into the expedition at once; the others start
-               the same expedition with the same password and wait in the Roundtable Hold ("Waiting
-               for the squad's host...") until the host is in the field, then join it automatically.
+  party        Test only: a number (0 = off) mixed into the matchmaking key, to keep test runs apart.
+
+Squad expeditions ("2 players" / "3 players") work without FromSoftware's servers. Without a password
+you are paired with anyone running the mod (a random host with a free place); with a password typed in
+the game's expedition menu only with players who typed the same one. The first player hosts and goes
+into the expedition at once; the others start the same choice and wait in the Roundtable Hold ("Waiting
+for the squad's host...") until the host is in the field, then join it automatically. A summon looks
+like a gold phantom.
 
 Every expedition map has two Shifting Earth regions: the Mountaintop and the Rotted Woods (the map
 screen shows both), and more HP flask charges at the start (at least 7 with every church).
