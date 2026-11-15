@@ -57,7 +57,7 @@ static char *g_base;
 // are read, every line.
 static int g_debug_log = 1;
 static const char *const KEY_LINES[] = {
-    "loaded, game base", "unsupported game build", "net guard", "settings:", "Seamless Co-op", "guard broken",
+    "loaded, game base", "steam: ready", "unsupported game build", "net guard", "settings:", "Seamless Co-op", "guard broken",
     "not hooked", "not as expected", "not expected", "cannot", "failed", "NOT ", "not started", "not written",
     "host: session up", "host: expedition reached", "host: expedition over", "host: member admitted", "role: ",
     "host: no member left", "leave done", "join: search started", "joining lobby", "join -> ", "stopping (",
@@ -2997,7 +2997,12 @@ static int steam_ready(void) {
         g_steam.utils = utils();
         if (!g_steam.mm || !g_steam.utils) state = -1;
     }
-    logf("steam: %s (matchmaking %p, utils %p)", state > 0 ? "ready" : "NOT available", g_steam.mm, g_steam.utils);
+    // Lobbies are per Steam app: a game reporting another app id (a non-Steam copy on Spacewar 480, say)
+    // never sees lobbies of Steam copies of Nightreign, and they never see its lobbies.
+    unsigned (*app_id)(void *) = m ? (unsigned (*)(void *))GetProcAddress(m, "SteamAPI_ISteamUtils_GetAppID") : NULL;
+    unsigned app = state > 0 && app_id ? app_id(g_steam.utils) : 0;
+    logf("steam: %s (matchmaking %p, utils %p), app id %u%s", state > 0 ? "ready" : "NOT available", g_steam.mm, g_steam.utils,
+         app, app == 2622380 ? " (Nightreign)" : " - NOT Nightreign's 2622380: lobbies of Steam copies are not seen");
     if (state > 0) {  // for the connection log only; missing ones just leave it shorter
         void *(*user)(void) = (void *(*)(void))GetProcAddress(m, "SteamAPI_SteamUser_v021");
         void *(*net)(void) = (void *(*)(void))GetProcAddress(m, "SteamAPI_SteamNetworking_v006");
