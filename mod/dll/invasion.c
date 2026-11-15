@@ -3912,6 +3912,8 @@ static int g_level_set, g_own_level, g_own_top_level;
 #define JOIN_LEVEL_CUT_PERCENT 40  // a cut joiner's level = max(1, floor(host level * (100 - this) / 100))
 #define JOIN_LEVEL_CUT_ALLIES 1    // the host's summons: cut (the user's rule)
 #define JOIN_LEVEL_CUT_INVADERS 0  // invaders: the host's level exactly (decision 24)
+#define JOIN_CUT_FROM_LEVEL 4      // the cuts (level and flasks) apply only when the host is at least this level
+static int g_join_cut = -1;        // the decision at arrival: 1 cut, 0 the host's values, -1 not decided yet
 static int level_apply(int level, const char *why) {
     char *ps = *(char **)(g_base + 0x3c078d0), *chr = local_player();
     char *pd = ps ? *(char **)(ps + 8) : NULL;
@@ -4476,19 +4478,20 @@ static void enter_watch(char *sm) {
     // does, so later churches still add one each (0x5fdad0 raises +0xff by one). The host's slot +0xff is logged too:
     // whether the slot carries the count is not established (its level at +0x68 is).
     static DWORD flask_done_for;
-    if (g_as_ally && g_enter_world && chr && flask_done_for != g_enter_tick) {
+    if (!g_enter_world) g_join_cut = -1;
+    if (g_as_ally && g_enter_world && chr && g_join_cut >= 0 && flask_done_for != g_enter_tick) {
         const char *hp = g_candidate ? g_steam.get_data(g_steam.mm, g_candidate, LOBBY_HP_KEY) : NULL;
         char *ps = *(char **)(g_base + 0x3c078d0), *pd = ps ? *(char **)(ps + 8) : NULL, *slots = ps ? *(char **)(ps + 0x10) : NULL;
         if (hp && *hp && pd && !IsBadReadPtr(pd, 0x110)) {
-            int host = atoi(hp), n = host - ALLY_FLASK_CUT, before = (unsigned char)pd[0xff];
+            int host = atoi(hp), n = g_join_cut ? host - ALLY_FLASK_CUT : host, before = (unsigned char)pd[0xff];
             if (n < ALLY_FLASK_MIN) n = ALLY_FLASK_MIN;
             if (n > 14) n = 14;
             flask_done_for = g_enter_tick;
             ((void (*)(char *, unsigned char, unsigned char))(g_base + 0x20d9d0))(pd, (unsigned char)n, (unsigned char)pd[0x100]);
             ((void (*)(void))(g_base + 0x60ad60))();
             int s0 = slots && !IsBadReadPtr(slots, 2 * 0x8a0) ? (unsigned char)slots[0xff] : -1, s1 = slots && !IsBadReadPtr(slots, 2 * 0x8a0) ? (unsigned char)slots[0x8a0 + 0xff] : -1;
-            logf("ally flasks: host has %d HP charges (its lobby); ours %d -> %d (host's - %d, at least %d), filled | slots +0xff: %d %d",
-                 host, before, (unsigned char)pd[0xff], ALLY_FLASK_CUT, ALLY_FLASK_MIN, s0, s1);
+            logf("ally flasks: host has %d HP charges (its lobby); ours %d -> %d (%s), filled | slots +0xff: %d %d", host, before,
+                 (unsigned char)pd[0xff], g_join_cut ? "late summon: host's - 2, at least 1" : "early summon: the host's", s0, s1);
         }
     }
     // decision 24: once the world sync is through and the host's slot holds its level, take that level
@@ -4503,10 +4506,15 @@ static void enter_watch(char *sm) {
             g_own_level = *(int *)(pd + 0x68), g_own_top_level = *(int *)(pd + 0x10c);
             // the user's formula: an ally gets the host's level less JOIN_LEVEL_CUT_PERCENT, never below 1 (host 1 -> 1,
             // 2 -> 1, 3 -> 1, 5 -> 3, 10 -> 6, 15 -> 9); an invader the host's level (decision 24)
-            int cut = g_as_ally ? JOIN_LEVEL_CUT_ALLIES : JOIN_LEVEL_CUT_INVADERS, want = cut ? lv * (100 - JOIN_LEVEL_CUT_PERCENT) / 100 : lv;
+            // the user's rule: a summon of a host below JOIN_CUT_FROM_LEVEL is not late: the host's level and flasks
+            int cut = (g_as_ally ? JOIN_LEVEL_CUT_ALLIES : JOIN_LEVEL_CUT_INVADERS) && lv >= JOIN_CUT_FROM_LEVEL;
+            int want = cut ? lv * (100 - JOIN_LEVEL_CUT_PERCENT) / 100 : lv;
             if (want < 1) want = 1;
+            g_join_cut = cut;
             logf("level: host (player %d) is level %d; joiner (%s) level %d (highest %d) -> %d (%s)", no, lv, g_as_ally ? "ally" : "invader",
-                 g_own_level, g_own_top_level, want, cut ? "host's level less the cut, at least 1" : "the host's level");
+                 g_own_level, g_own_top_level, want,
+                 cut ? "late summon (host at level 4 or more): host's level less the cut, at least 1"
+                     : g_as_ally ? "early summon (host below level 4): the host's level" : "invader: the host's level");
             if (level_apply(want, "arrival: level from the host's") >= 0) g_level_set = 1;
             break;
         }
