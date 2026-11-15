@@ -53,8 +53,8 @@ TEAM_INVADER, TEAM_TEST_SECONDS = 16, -1.0
 # SpEffects 14559, 18698 and 99860 use it.
 RED_PHANTOM_VFX = 300050
 # Ally look (launcher: SPEFFECT_ALLY_ROW): row 90071611, vfxId1 54220 (like 300050 with PhantomParam 62, gold),
-# 30 s, team unchanged.
-SPEFFECT_ALLY_ROW, ALLY_PHANTOM_VFX, ALLY_SECONDS = 90071611, 54220, 30.0
+# no time limit (the DLL removes it when the ally's part ends; at 30 s it lapsed and blinked), team unchanged.
+SPEFFECT_ALLY_ROW, ALLY_PHANTOM_VFX, ALLY_SECONDS = 90071611, 54220, -1.0
 
 
 # Scarabs (decision 13): an invader on team 16 can hit them. NpcParam rows 41900000-41919999 (the

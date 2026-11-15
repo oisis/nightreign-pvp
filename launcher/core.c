@@ -39,7 +39,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 19
+#define BUILD_FORMAT 20
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
                               "porbr", "rusru", "spaar", "spaes", "thath", "zhocn", "zhotw"};
@@ -813,8 +813,8 @@ static buf param_add_row(buf p) {
 #define SPEFFECT_TEAM_ROW 90071610
 // The ally's look (no side change): our row 90071611, a copy of the same template with vfxId1 54220 (the game's
 // SpEffectVfxParam row like 300050, but phantomParamOverwriteId 62: PhantomParam 62, the gold phantom: edge
-// colour 200 160 120) and effectEndurance 30 s; the DLL puts it on again every 20 s while the ally is in the
-// host's world, so it ends by itself within 30 s once the ally has left. changeTeamType stays none (0xff).
+// colour 200 160 120) and the template's effectEndurance -1 (no time limit; at 30 s it lapsed and blinked); the
+// DLL puts it on in the host's world and removes it when the ally's part ends. changeTeamType stays none (0xff).
 #define SPEFFECT_ALLY_ROW 90071611
 #define ALLY_PHANTOM_VFX 54220
 #define SPEFFECT_SIZE 0x400
@@ -1621,7 +1621,7 @@ static int build_regulation(const char *game_dir) {
                 u8 *r = speffect2.p + rd64(speffect2.p + 0x40 + i * 24 + 8);
                 r[0x16D] = 16, wr32(r + 0x18C, 300050);
             }
-        { float t = 30.0f; u32 bits; memcpy(&bits, &t, 4); wr32(ally_row + 0x08, bits); }  // effectEndurance 30 s
+        // effectEndurance stays -1 (the template's): no time limit; the DLL removes it when the ally's part ends
         wr32(ally_row + 0x18C, ALLY_PHANTOM_VFX);  // vfxId1: gold phantom look; team unchanged
         // Written as a zlib DCX, like our other files (the launcher has no zstd compressor). It has
         // to be compressed: the game crashes at start-up on a 55 MB regulation.bin of stored zstd

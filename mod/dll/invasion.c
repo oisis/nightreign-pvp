@@ -4172,6 +4172,13 @@ static void level_restore(void) {
 }
 static void join_over(const char *why) {
     level_restore();
+    if (g_as_ally) {  // the ally's gold look (row 90071611) has no time limit: it goes when our part ends
+        char *me = local_player();
+        // 0x3cdd40 (chr, id): SpecialEffect remove by id, the shape of Elden Ring's ChrIns remove_speffect
+        // (chr+0x190 -> 0x504e80: find the entry with that id, unlink it with 0x50b5b0); 24 calls in the game
+        if (me && !IsBadReadPtr(me, 0x200))
+            logf("ally: gold look removed at the end (%s): %d", why, ((unsigned char (*)(void *, int))(g_base + 0x3cdd40))(me, 90071611));
+    }
     memset(g_hud_invaders, 0, sizeof g_hud_invaders);  // the host clears it in host_member_sync; a joiner here
     if (g_party_guest) g_party = PARTY_OFF, g_party_guest = 0, logf("party: guest's part over (%s)", why);
     g_join = 3;
@@ -4509,7 +4516,7 @@ static void crash_watch_members(void) {
     const char *role = g_join == 4 ? (g_as_ally ? "ally" : "invader") : g_host_test == 2 ? "host" : "no session role";
     char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR), *pd = *(char **)(g_base + 0x3c078d0);
     char *b = sm ? *(char **)(sm + SM_PLAYERS_BEGIN) : NULL, *e = sm ? *(char **)(sm + SM_PLAYERS_BEGIN + 8) : NULL;
-    int i = 0;
+    int i = 0, id_stale = -1, id_had = -1, id_slot = 0;
     for (char *m = b; b && m < e && i < 8 && !IsBadReadPtr(m, SM_PLAYER_SIZE); m += SM_PLAYER_SIZE, i++) {
         int slot = *(int *)(m + 0xd0), no = *(int *)(m + 0xd4), st = -1;
         if (!m[0xe1] && pd && slot >= 0 && slot < 8 && *(char **)(pd + 0x18) && !IsBadReadPtr(*(char **)(pd + 0x18) + slot, 1))
@@ -4517,8 +4524,25 @@ static void crash_watch_members(void) {
         if (st == 0x1f && (last_state[i] != 0x1f || last_no[i] != no))
             logf("crash watch: member player %d (slot %d) state 1f: its character is made now (we are the %s)", no, slot, role);
         last_state[i] = st, last_no[i] = no;
+        char *sd = !m[0xe1] && pd && slot >= 0 && slot < 2 && *(char **)(pd + 0x10) ? *(char **)(pd + 0x10) + slot * 0x8a0 : NULL;
+        if (sd && no != -1 && !IsBadReadPtr(sd + 8, 4) && *(int *)(sd + 8) != no) id_stale = no, id_had = *(int *)(sd + 8), id_slot = slot;
     }
     for (; i < 8; i++) last_state[i] = -1;
+    // Player ids (the player data +8 each player-handle lookup 0x5197e0 matches, and the id-keyed reads such as
+    // 0x209aa0 / 0x209bc0): the host's member add (0xdf5ae0) writes a newcomer's session number there only in
+    // lobby state 3 (the host); everywhere else only the game's sync 0x1fc260 does, from member +0xd4 for every
+    // member, and the game runs it at map entry (0xc27870). A member who arrives after a joiner's map entry (ours
+    // come mid-expedition) stays -1 on that joiner: its packets find no character there. So on any side, when a
+    // member with a session number has another id in its slot data, we run that same sync (only online:
+    // GameDataMan +0xd8 == 2, the branch that copies; the other branch resets the ids). At most once per second.
+    static DWORD id_next;
+    if (id_stale != -1 && pd && !IsBadReadPtr(pd + 0xd8, 1) && pd[0xd8] == 2 && (int)(GetTickCount() - id_next) >= 0) {
+        id_next = GetTickCount() + 1000;
+        ((void (*)(void))(g_base + 0x1fc260))();
+        char *sd = *(char **)(pd + 0x10) + id_slot * 0x8a0;
+        logf("crash watch: member player %d (slot %d) had player id %d here; the game's id sync run, now %d (we are the %s)", id_stale,
+             id_slot, id_had, *(int *)(sd + 8), role);
+    }
     char *wcm = *(char **)(g_base + RVA_WORLD_CHR_MAN), *me = wcm ? *(char **)(wcm + WCM_LOCAL_PLAYER) : NULL;
     void **set = wcm ? (void **)(wcm + 0x9a40) : NULL;
     if (!set || IsBadReadPtr(set, 8) || IsBadReadPtr(*(void ***)set, 16)) return;
@@ -4776,8 +4800,9 @@ static void enter_watch(char *sm) {
         team_log("enter test, ally: no team effect");
     }
     // The ally's gold look: our row 90071611 (launcher: vfxId1 54220 = the game's gold phantom, PhantomParam 62;
-    // 30 s; no team change), put on in the host's world at once and again every 20 s, so it never lapses while
-    // the ally is there and ends by itself within 30 s after it has left. Like the invader's red, it is put on
+    // no time limit, like the invader's red; no team change), removed in join_over. Run 62 had it at 30 s: it
+    // lapsed every 30 s and came back a frame later (a blink), as re-adding a running effect does not restart
+    // its time (seen with the 180 s team row, run 0a6833c2). Like the invader's red, it is put on
     // the ally's own character only; the others see it through the game's effect sync (the host saw our team
     // effect on the invader's character, runs 13 ff.). Not our team effect: no rule keys on it.
     // Run of 818477c: the gold came tens of seconds after landing (it waited for the world sync's StartIngame, step
