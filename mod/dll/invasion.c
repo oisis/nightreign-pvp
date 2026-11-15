@@ -62,7 +62,7 @@ static const char *const KEY_LINES[] = {
     "host: session up", "host: expedition reached", "host: expedition over", "host: member admitted", "role: ",
     "host: no member left", "leave done", "join: search started", "joining lobby", "join -> ", "stopping (",
     "in the host's world", "world sync at step", "invasion won", "invasion lost", "invasion neither", "level: ", "map test", "two-regions", "expedition: result", "reward test: won", "reward test: lost",
-    "expedition end requested", "flags: ", "map test",  "still down", "watchdog", "no map load", "went back", "code patch", "crash"};
+    "expedition end requested", "flags: ", "lag: ", "map test",  "still down", "watchdog", "no map load", "went back", "code patch", "crash"};
 static void logf(const char *fmt, ...) {
     char line[1024];
     va_list ap;
@@ -3828,6 +3828,166 @@ static int member_ally(u64 lobby, u64 id) {
     const char *r = g_diag.get_member && g_steam.mm && lobby ? g_diag.get_member(g_steam.mm, lobby, id, LOBBY_ROLE_KEY) : NULL;
     return r && !strcmp(r, "ally");
 }
+// --- Lag measurement (log "lag: ", every LAG_LOG_MS per other lobby member; tags only) ----------------------------
+// The game's transport is ISteamNetworking 006 (its only Steam networking interface: "SteamNetworking006"), which has
+// no round-trip time. The game's own "rtt" exists only as a field of a telemetry record (0x142101810 writes it as
+// JSON for the server; who fills it was not found), so we measure ourselves:
+// - ping: a 16-byte echo on our own P2P channel LAG_CHANNEL, sent once a second to each other lobby member and
+//   answered by its DLL. The game reads packets with ReadP2PPacket(..., channel); it never asks for this channel
+//   (the hook below logs every channel the game reads and stops the echo if it ever reads ours), so a peer without
+//   this DLL just leaves our 16 bytes a second unread in its Steam queue: nothing reaches its game code.
+// - passive, per member: packets and bytes the game reads from it and sends to it (vtable hooks on the same
+//   ISteamNetworking object, its slots 0 SendP2PPacket and 2 ReadP2PPacket), the largest gap between two packets
+//   read from it, and from GetP2PSessionState relay yes/no and the bytes / packets queued for send to it.
+// Nothing goes anywhere but to the session's own members, over the same Steam P2P sessions the game uses.
+#define LAG_CHANNEL 20050
+#define LAG_MAGIC 0x4750524eu  // "NRPG"
+#define LAG_LOG_MS 15000
+typedef unsigned char (*p2p_send_t)(void *, u64, const void *, unsigned, int, int);
+typedef unsigned char (*p2p_avail_t)(void *, unsigned *, int);
+typedef unsigned char (*p2p_read_t)(void *, void *, unsigned, unsigned *, u64 *, int);
+static p2p_send_t g_p2p_send;
+static p2p_avail_t g_p2p_avail;
+static p2p_read_t g_p2p_read;
+static volatile int g_lag_off;  // 1: the game read our channel itself, no more echo
+static volatile u64 g_lag_channels;  // bit c: the game read channel c (0..62); bit 63: a channel above 62
+static struct lag_peer {
+    volatile u64 id;
+    volatile LONG rx, rx_bytes, tx, tx_bytes;
+    volatile double last_rx, max_gap;
+    int rtt_n, rtt_min, rtt_max, rtt_sum, rtt_last, lost;
+    unsigned sent;
+} g_lag[8];
+static double lag_ms(void) {
+    static LARGE_INTEGER f;
+    LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
+}
+static struct lag_peer *lag_find(u64 id) {
+    for (int i = 0; i < 8; i++)
+        if (g_lag[i].id == id) return &g_lag[i];
+    return NULL;
+}
+static unsigned char lag_send_hook(void *self, u64 to, const void *data, unsigned n, int type, int channel) {
+    struct lag_peer *p = lag_find(to);
+    if (p) InterlockedIncrement(&p->tx), InterlockedExchangeAdd(&p->tx_bytes, (LONG)n);
+    return g_p2p_send(self, to, data, n, type, channel);
+}
+static unsigned char lag_read_hook(void *self, void *data, unsigned cap, unsigned *n, u64 *from, int channel) {
+    unsigned char ok = g_p2p_read(self, data, cap, n, from, channel);
+    if (channel == LAG_CHANNEL && !g_lag_off) g_lag_off = 1, logf("lag: the game reads P2P channel %d itself: echo stopped", LAG_CHANNEL);
+    g_lag_channels |= channel >= 0 && channel < 63 ? 1ull << channel : 1ull << 63;
+    struct lag_peer *p = ok && from ? lag_find(*from) : NULL;
+    if (p) {
+        double now = lag_ms(), last = p->last_rx;
+        if (last > 0 && now - last > p->max_gap) p->max_gap = now - last;
+        p->last_rx = now;
+        InterlockedIncrement(&p->rx), InterlockedExchangeAdd(&p->rx_bytes, n ? (LONG)*n : 0);
+    }
+    return ok;
+}
+static void lag_log(u64 lobby, u64 me, double window) {
+    u64 owner = g_diag.owner ? g_diag.owner(g_steam.mm, lobby) : 0;
+    const char *we = owner == me ? "host" : g_join == 4 ? (g_as_ally ? "ally" : "invader") : "member";
+    char ch[96] = "";
+    u64 m = g_lag_channels;
+    for (int c = 0; c < 64; c++)
+        if (m >> c & 1) snprintf(ch + strlen(ch), sizeof ch - strlen(ch), c == 63 ? " >62" : " %d", c);
+    for (int i = 0; i < 8; i++) {
+        struct lag_peer *p = &g_lag[i];
+        if (!p->id) continue;
+        struct { unsigned char active, connecting, error, relay; int bytes, packets; unsigned ip; unsigned short port; } st = {0};
+        int have = g_diag.p2p && g_diag.p2p(g_diag.net, p->id, &st);
+        char ping[96];
+        if (p->rtt_n) snprintf(ping, sizeof ping, "ping %d ms (avg %d, min %d, max %d, %d of %u answered; our echo)", p->rtt_last,
+                               p->rtt_sum / p->rtt_n, p->rtt_min, p->rtt_max, p->rtt_n, p->sent);
+        else snprintf(ping, sizeof ping, "ping none (0 of %u echoes answered: no DLL there, or lost)", p->sent);
+        LONG rx = InterlockedExchange(&p->rx, 0), rxb = InterlockedExchange(&p->rx_bytes, 0);
+        LONG tx = InterlockedExchange(&p->tx, 0), txb = InterlockedExchange(&p->tx_bytes, 0);
+        double s = window / 1000.0;
+        logf("lag: we are the %s; member %04x (%s): %s | game in %.0f pkt/s %.0f B/s, largest gap %.0f ms | game out %.0f pkt/s "
+             "%.0f B/s | p2p %s, relay %s, queued %d B in %d pkts | game channels:%s",
+             we, id_tag(p->id), p->id == owner ? "host" : member_ally(lobby, p->id) ? "ally" : "invader", ping, rx / s, rxb / s,
+             p->max_gap, tx / s, txb / s, have ? (st.active ? "active" : st.connecting ? "connecting" : "down") : "none",
+             have ? (st.relay ? "yes" : "no") : "?", st.bytes, st.packets, ch);
+        p->max_gap = 0, p->rtt_n = p->rtt_sum = p->rtt_max = p->sent = 0, p->rtt_min = 1 << 30;
+    }
+}
+static DWORD WINAPI lag_thread(LPVOID unused) {
+    (void)unused;
+    double next_ping = 0, next_log = lag_ms() + LAG_LOG_MS, window_from = lag_ms();
+    for (;;) {
+        Sleep(2);
+        u64 lobby = our_lobby(), me = g_diag.self ? g_diag.self(g_diag.user) : 0;
+        double now = lag_ms();
+        struct { unsigned magic, type, seq, t; } pk;
+        unsigned n = 0;
+        u64 from = 0;
+        while (g_p2p_avail(g_diag.net, &n, LAG_CHANNEL)) {
+            if (!g_p2p_read(g_diag.net, &pk, sizeof pk, &n, &from, LAG_CHANNEL)) break;
+            if (n != sizeof pk || pk.magic != LAG_MAGIC) continue;
+            if (pk.type == 0) {
+                pk.type = 1;
+                if (!g_lag_off) g_p2p_send(g_diag.net, from, &pk, sizeof pk, 0, LAG_CHANNEL);
+            } else if (pk.type == 1) {
+                struct lag_peer *p = lag_find(from);
+                double rtt = (unsigned)((u64)(lag_ms() * 1000.0) - pk.t) / 1000.0;  // t: our clock in us, mod 2^32
+                if (p && rtt < 60000) {
+                    int r = (int)(rtt + 0.5);
+                    p->rtt_last = r, p->rtt_sum += r, p->rtt_n++;
+                    if (r < p->rtt_min) p->rtt_min = r;
+                    if (r > p->rtt_max) p->rtt_max = r;
+                }
+            }
+        }
+        if (!lobby || !me) {
+            memset(g_lag, 0, sizeof g_lag);
+            next_log = now + LAG_LOG_MS, window_from = now;
+            continue;
+        }
+        if (now >= next_ping) {
+            next_ping = now + 1000;
+            int count = g_steam.members(g_steam.mm, lobby);
+            for (int i = 0; i < count && i < 8; i++) {  // keep the slots in step with the lobby
+                u64 id = g_diag.member(g_steam.mm, lobby, i);
+                if (!id || id == me) continue;
+                struct lag_peer *p = lag_find(id);
+                for (int k = 0; !p && k < 8; k++)
+                    if (!g_lag[k].id) memset(&g_lag[k], 0, sizeof g_lag[k]), g_lag[k].rtt_min = 1 << 30, g_lag[k].id = id, p = &g_lag[k];
+                if (!p) continue;
+                struct { unsigned magic, type, seq, t; } out = {LAG_MAGIC, 0, p->sent, (unsigned)(u64)(lag_ms() * 1000.0)};
+                if (!g_lag_off) p->sent++, g_p2p_send(g_diag.net, id, &out, sizeof out, 0, LAG_CHANNEL);
+            }
+            for (int k = 0; k < 8; k++) {  // members who left
+                int in = 0;
+                for (int i = 0; i < count && !in; i++) in = g_lag[k].id == g_diag.member(g_steam.mm, lobby, i);
+                if (g_lag[k].id && !in) g_lag[k].id = 0;
+            }
+        }
+        if (now >= next_log) {
+            lag_log(lobby, me, now - window_from);
+            next_log = now + LAG_LOG_MS, window_from = now;
+        }
+    }
+}
+static void lag_tick(void) {  // run thread; once Steam is ready: hooks and the echo thread
+    static int done;
+    if (done || !steam_ready() || !g_diag.net || !g_diag.member || !g_diag.self || !g_diag.user) return;
+    done = 1;
+    void **vt = *(void ***)g_diag.net;
+    DWORD old;
+    if (IsBadReadPtr(vt, 3 * 8) || !VirtualProtect(vt, 3 * 8, PAGE_READWRITE, &old)) {
+        logf("lag: cannot hook the P2P interface: no lag log");
+        return;
+    }
+    g_p2p_send = (p2p_send_t)vt[0], g_p2p_avail = (p2p_avail_t)vt[1], g_p2p_read = (p2p_read_t)vt[2];
+    vt[0] = (void *)lag_send_hook, vt[2] = (void *)lag_read_hook;
+    VirtualProtect(vt, 3 * 8, old, &old);
+    CreateThread(NULL, 0, lag_thread, NULL, 0, NULL);
+    logf("lag: measuring (echo on P2P channel %d, game packets counted per member, a line every %d s)", LAG_CHANNEL, LAG_LOG_MS / 1000);
+}
 // Remote session members other than the session host (the lobby owner): allies (want_allies 1) or invaders (0;
 // a member without a role is an invader). Recounted at most every 250 ms.
 static int side_count(int want_allies) {
@@ -6085,6 +6245,7 @@ static DWORD WINAPI run(LPVOID self) {
         watch_session();
         code_patch_check();
         level_watch();
+        lag_tick();
         if (1) marker_tick();
         if (1) finish_tick();
     }
