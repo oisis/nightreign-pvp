@@ -82,6 +82,128 @@ static void logf(const char *fmt, ...) {
     fclose(f);
 }
 
+
+// --- Crash logger ---------------------------------------------------------------------------------------
+// A fatal exception leaves its address in invasion.log, with the short log too. Last-chance only: the unhandled
+// exception filter (SetUnhandledExceptionFilter), so exceptions the game catches itself never reach it; C++
+// exceptions (0xe06d7363) and debugger codes are passed on untouched. If something else installs its own filter
+// later, crash_watch() (every second from our thread) puts ours back on top and chains to the other one (logged
+// once, by module + offset). Written with WriteFile on a handle opened in the handler: no heap, no CRT locks;
+// a static buffer and a one-shot guard. No paths and no ids: modules by base name only.
+static LPTOP_LEVEL_EXCEPTION_FILTER g_prev_filter;
+static volatile LONG g_crash_once;
+static char g_crash_buf[8192];
+static size_t g_crash_at;
+static char *g_dll_base;
+static size_t g_dll_size, g_exe_size;
+static void cb_str(const char *t) { while (*t && g_crash_at < sizeof g_crash_buf - 1) g_crash_buf[g_crash_at++] = *t++; }
+static void cb_hex(unsigned long long v) {
+    char t[19] = "0x", d[16];
+    int n = 0;
+    do d[n++] = "0123456789abcdef"[v & 15], v >>= 4; while (v && n < 16);
+    for (int i = 0; i < n; i++) t[2 + i] = d[n - 1 - i];
+    t[2 + n] = 0;
+    cb_str(t);
+}
+static size_t image_size(char *base) {
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+    if (!base || dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    return ((IMAGE_NT_HEADERS *)(base + dos->e_lfanew))->OptionalHeader.SizeOfImage;
+}
+static void cb_addr(unsigned long long a) {  // module + offset, or raw
+    if (g_base && a >= (unsigned long long)g_base && a < (unsigned long long)g_base + g_exe_size) {
+        cb_str("exe+"), cb_hex(a - (unsigned long long)g_base), cb_str(" ("), cb_hex(a - (unsigned long long)g_base + 0x140000000ull), cb_str(")");
+        return;
+    }
+    if (g_dll_base && a >= (unsigned long long)g_dll_base && a < (unsigned long long)g_dll_base + g_dll_size) {
+        cb_str("invasion.dll+"), cb_hex(a - (unsigned long long)g_dll_base);
+        return;
+    }
+    HMODULE m = NULL;
+    char name[MAX_PATH];
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)a, &m) && m &&
+        GetModuleFileNameA(m, name, sizeof name)) {
+        char *x = strrchr(name, '\\'), *y = strrchr(name, '/'), *base = x > y ? x : y;
+        cb_str(base ? base + 1 : name), cb_str("+"), cb_hex(a - (unsigned long long)m);
+        return;
+    }
+    cb_hex(a);
+}
+static int fatal_code(DWORD c) {
+    switch (c) {
+    case EXCEPTION_ACCESS_VIOLATION: case EXCEPTION_ILLEGAL_INSTRUCTION: case EXCEPTION_PRIV_INSTRUCTION:
+    case EXCEPTION_STACK_OVERFLOW: case EXCEPTION_INT_DIVIDE_BY_ZERO: case EXCEPTION_INT_OVERFLOW:
+    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED: case EXCEPTION_DATATYPE_MISALIGNMENT: case EXCEPTION_IN_PAGE_ERROR:
+    case EXCEPTION_NONCONTINUABLE_EXCEPTION: case EXCEPTION_INVALID_DISPOSITION: case 0xc0000409: /* stack buffer overrun */
+    case EXCEPTION_FLT_DIVIDE_BY_ZERO: case EXCEPTION_FLT_INVALID_OPERATION: case EXCEPTION_FLT_STACK_CHECK:
+        return 1;
+    }
+    return 0;
+}
+static void crash_write(EXCEPTION_POINTERS *ep) {
+    EXCEPTION_RECORD *r = ep->ExceptionRecord;
+    CONTEXT *c = ep->ContextRecord;
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    char hms[10] = {(char)('0' + t.wHour / 10), (char)('0' + t.wHour % 10), ':', (char)('0' + t.wMinute / 10), (char)('0' + t.wMinute % 10), ':',
+                    (char)('0' + t.wSecond / 10), (char)('0' + t.wSecond % 10), ' ', 0};
+    g_crash_at = 0;
+    cb_str(hms), cb_str("crash: exception "), cb_hex(r->ExceptionCode), cb_str(" at "), cb_addr((unsigned long long)r->ExceptionAddress);
+    cb_str(" thread "), cb_hex(GetCurrentThreadId());
+    if (r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r->NumberParameters >= 2) {
+        ULONG_PTR k = r->ExceptionInformation[0];
+        cb_str(k == 0 ? " | reading " : k == 1 ? " | writing " : k == 8 ? " | executing " : " | access "), cb_hex(r->ExceptionInformation[1]);
+    }
+    cb_str("\n");
+    static const char *const RN[16] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"};
+    DWORD64 rv[16] = {c->Rax, c->Rcx, c->Rdx, c->Rbx, c->Rsp, c->Rbp, c->Rsi, c->Rdi, c->R8, c->R9, c->R10, c->R11, c->R12, c->R13, c->R14, c->R15};
+    cb_str(hms), cb_str("crash: registers");
+    for (int i = 0; i < 16; i++) cb_str(" "), cb_str(RN[i]), cb_str("="), cb_hex(rv[i]);
+    cb_str(" rip="), cb_hex(c->Rip), cb_str("\n");
+    // return addresses on the stack that point into the game or our DLL, from rsp up to the stack's base
+    unsigned long long *sp = (unsigned long long *)c->Rsp, *top = (unsigned long long *)((NT_TIB *)NtCurrentTeb())->StackBase;
+    cb_str(hms), cb_str("crash: stack");
+    int found = 0;
+    for (int i = 0; sp + i < top && i < 4096 && found < 24; i++) {
+        unsigned long long v = sp[i];
+        int ours = (v >= (unsigned long long)g_base && v < (unsigned long long)g_base + g_exe_size) ||
+                   (g_dll_base && v >= (unsigned long long)g_dll_base && v < (unsigned long long)g_dll_base + g_dll_size);
+        if (ours) cb_str(" "), cb_addr(v), found++;
+    }
+    cb_str("\n");
+    HANDLE h = CreateFileA(log_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD w;
+        WriteFile(h, g_crash_buf, (DWORD)g_crash_at, &w, NULL);
+        FlushFileBuffers(h);
+        CloseHandle(h);
+    }
+}
+static volatile LONG g_crash_inside;
+static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
+    if (InterlockedExchange(&g_crash_inside, 1)) return EXCEPTION_CONTINUE_SEARCH;  // a filter behind us called us again
+    if (ep && ep->ExceptionRecord && fatal_code(ep->ExceptionRecord->ExceptionCode) && !InterlockedExchange(&g_crash_once, 1))
+        crash_write(ep);
+    LONG r = g_prev_filter && g_prev_filter != crash_filter ? g_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
+    g_crash_inside = 0;
+    return r;
+}
+static void crash_install(HINSTANCE self) {
+    g_dll_base = (char *)self, g_dll_size = image_size((char *)self), g_exe_size = image_size(g_base);
+    g_prev_filter = SetUnhandledExceptionFilter(crash_filter);
+}
+static void crash_watch(void) {  // our filter stays on top; one replacing it is chained behind ours
+    LPTOP_LEVEL_EXCEPTION_FILTER now = SetUnhandledExceptionFilter(crash_filter);
+    if (now != crash_filter) {
+        static int told;
+        g_prev_filter = now;
+        if (told++) return;
+        g_crash_at = 0, cb_str(""), cb_addr((unsigned long long)now);
+        g_crash_buf[g_crash_at] = 0;
+        logf("crash logger: another unhandled-exception filter (%s) was put in; ours is on top again and calls it", g_crash_buf);
+    }
+}
+
 // Test settings: test-settings.toml next to the DLL (the launcher writes it at every start from the
 // file next to the launcher; the dev build copies $W/test-settings.toml). Read once, at load.
 #include "settings.h"
@@ -4324,6 +4446,42 @@ static void summon_kill_reward(void) {
         }
     }
 }
+// Short-log markers for crash hunting ("crash watch: " is a key line): another member's slot state reaching 0x1f
+// (the game then creates its character, 0xc43900), and each new character of another player in the world, with
+// our own role. Run from the game thread (step hook) on every side.
+static void crash_watch_members(void) {
+    static DWORD next;
+    static int last_state[8], last_no[8];
+    static char *chr_seen[8];
+    if ((int)(GetTickCount() - next) < 0) return;
+    next = GetTickCount() + 100;
+    const char *role = g_join == 4 ? (g_as_ally ? "ally" : "invader") : g_host_test == 2 ? "host" : "no session role";
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR), *pd = *(char **)(g_base + 0x3c078d0);
+    char *b = sm ? *(char **)(sm + SM_PLAYERS_BEGIN) : NULL, *e = sm ? *(char **)(sm + SM_PLAYERS_BEGIN + 8) : NULL;
+    int i = 0;
+    for (char *m = b; b && m < e && i < 8 && !IsBadReadPtr(m, SM_PLAYER_SIZE); m += SM_PLAYER_SIZE, i++) {
+        int slot = *(int *)(m + 0xd0), no = *(int *)(m + 0xd4), st = -1;
+        if (!m[0xe1] && pd && slot >= 0 && slot < 8 && *(char **)(pd + 0x18) && !IsBadReadPtr(*(char **)(pd + 0x18) + slot, 1))
+            st = (unsigned char)(*(char **)(pd + 0x18))[slot];
+        if (st == 0x1f && (last_state[i] != 0x1f || last_no[i] != no))
+            logf("crash watch: member player %d (slot %d) state 1f: its character is made now (we are the %s)", no, slot, role);
+        last_state[i] = st, last_no[i] = no;
+    }
+    for (; i < 8; i++) last_state[i] = -1;
+    char *wcm = *(char **)(g_base + RVA_WORLD_CHR_MAN), *me = wcm ? *(char **)(wcm + WCM_LOCAL_PLAYER) : NULL;
+    void **set = wcm ? (void **)(wcm + 0x9a40) : NULL;
+    if (!set || IsBadReadPtr(set, 8) || IsBadReadPtr(*(void ***)set, 16)) return;
+    void **vt = *(void ***)set;
+    int count = ((int (*)(void *))vt[0])(set);
+    for (int k = 0; k < count && k < 8; k++) {
+        char *c = ((char *(*)(void *, unsigned long long))vt[1])(set, (unsigned long long)k);
+        if (c && c != me && c != chr_seen[k] && !IsBadReadPtr(c, 0x200))  // no game call on a character still being built
+            logf("crash watch: new character of another player in the world (entry %d, base team %u, we are the %s)", k,
+                 (unsigned char)c[CHR_BASE_TEAM], role);
+        chr_seen[k] = c;
+    }
+    for (int k = count; k < 8; k++) chr_seen[k] = NULL;
+}
 // Invasion notices on the host's and every ally's screen: an invader is a remote player character that carries
 // our team effect 90071610 (its own machine puts it on at arrival; the others get it through the effect sync, as
 // the host's logs of every invasion show: "base team 2 effective 16 our effect 1"). Once per character: the
@@ -5504,6 +5662,7 @@ static void step_hook(void *ctrl, void *time, int step) {
     no_sprint_frame();
     if (step == QM_STEP_INGAME || g_join_in_world()) invader_notice_frame();
     summon_kill_reward();
+    crash_watch_members();
     static int told_invader;
     if (g_join != 4) {
         if (told_invader) told_invader = 0, logf("role: no longer an invader; own expeditions host again");
@@ -5819,8 +5978,10 @@ static DWORD WINAPI run(LPVOID self) {
         hook_eac_begin();
         hook_acceptance();
     }
-    for (;;) {
+    logf("crash logger: unhandled-exception filter in place (fatal codes only, chained to the one before)");
+    for (int tick = 0;; tick++) {
         Sleep(250);
+        if (tick % 4 == 0) crash_watch();
         guard_intact();
         watch_network();
         watch_session();
@@ -5840,6 +6001,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved) {
         char *dot = strrchr(log_path, '.');
         if (dot) strcpy(dot, ".log");
         g_base = (char *)GetModuleHandleA(NULL);
+        crash_install(self);
         IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew);
         // The guard goes in first, here rather than in run(): this runs before me3 lets the game go
         // on, while run() starts only later, alongside the game's own start-up.
