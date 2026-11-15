@@ -3856,6 +3856,7 @@ static struct lag_peer {
     volatile LONG rx, rx_bytes, tx, tx_bytes;
     volatile double last_rx, max_gap;
     int rtt_n, rtt_min, rtt_max, rtt_sum, rtt_last, lost;
+    volatile int rtt_shown, rtt_last_ok;  // for the bars: the last answer, and 1 while answers keep coming
     unsigned sent;
 } g_lag[8];
 static double lag_ms(void) {
@@ -3936,7 +3937,7 @@ static DWORD WINAPI lag_thread(LPVOID unused) {
                 double rtt = (unsigned)((u64)(lag_ms() * 1000.0) - pk.t) / 1000.0;  // t: our clock in us, mod 2^32
                 if (p && rtt < 60000) {
                     int r = (int)(rtt + 0.5);
-                    p->rtt_last = r, p->rtt_sum += r, p->rtt_n++;
+                    p->rtt_last = r, p->rtt_sum += r, p->rtt_n++, p->rtt_shown = r, p->rtt_last_ok = 1, p->lost = 0;
                     if (r < p->rtt_min) p->rtt_min = r;
                     if (r > p->rtt_max) p->rtt_max = r;
                 }
@@ -3958,6 +3959,7 @@ static DWORD WINAPI lag_thread(LPVOID unused) {
                     if (!g_lag[k].id) memset(&g_lag[k], 0, sizeof g_lag[k]), g_lag[k].rtt_min = 1 << 30, g_lag[k].id = id, p = &g_lag[k];
                 if (!p) continue;
                 struct { unsigned magic, type, seq, t; } out = {LAG_MAGIC, 0, p->sent, (unsigned)(u64)(lag_ms() * 1000.0)};
+                if (++p->lost > 5) p->rtt_last_ok = 0;  // no answer for 5 s: the bar shows the name only
                 if (!g_lag_off) p->sent++, g_p2p_send(g_diag.net, id, &out, sizeof out, 0, LAG_CHANNEL);
             }
             for (int k = 0; k < 8; k++) {  // members who left
@@ -3971,6 +3973,37 @@ static DWORD WINAPI lag_thread(LPVOID unused) {
             next_log = now + LAG_LOG_MS, window_from = now;
         }
     }
+}
+
+// Ping at the party bars (show-ping, default on): the party panel's 7 slots (CSFeMan +0xcf28, 0x98 each) are filled
+// by 0x7da8b0; for each shown member it gets the name with 0x7aa960(out, chr, 0) at 0x7dab36 and copies the text
+// it returns (out[0], or out[2] when out[0] is 0) into the slot's string at +8. The rest of out (+8: the
+// DLAllocatedStr the caller destroys) is not touched: only out[0] is pointed at our copy, "name  N ms", while in
+// an expedition and once an echo from that member came back. The member: the character's player id (0x66c6f0)
+// = session member +0xd4, its Steam id +0x10 -> our lag figures. Bars we hide (the invader's on the host) are not
+// filled at all, so their ping stays in the log only.
+static int g_in_exped;  // step hook: in the field of an expedition (host InGame or joined in the host's world)
+static unsigned short g_name_buf[96];
+static void **name_hook(void **out, char *chr, unsigned char flag, void *a4) {  // a4: passed on as the site has it
+    void **r = ((void **(*)(void **, char *, unsigned char, void *))(g_base + 0x7aa960))(out, chr, flag, a4);
+    if (!r || !chr || !g_in_exped || !setting(S_SHOW_PING) || IsBadReadPtr(chr, 0x600)) return r;
+    int no = -1;
+    ((int *(*)(char *, int *))(g_base + 0x66c6f0))(chr, &no);
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
+    char *b = sm ? *(char **)(sm + SM_PLAYERS_BEGIN) : NULL, *e = sm ? *(char **)(sm + SM_PLAYERS_BEGIN + 8) : NULL;
+    struct lag_peer *p = NULL;
+    for (char *m = b; no != -1 && b && m < e && !IsBadReadPtr(m, SM_PLAYER_SIZE); m += SM_PLAYER_SIZE)
+        if (*(int *)(m + 0xd4) == no && !m[0xe1]) p = lag_find(*(u64 *)(m + 0x10));
+    if (!p || !p->rtt_last_ok) return r;
+    const unsigned short *name = r[0] ? (const unsigned short *)r[0] : (const unsigned short *)r[2];
+    int k = 0;
+    while (name && !IsBadReadPtr(name + k, 2) && name[k] && k < 64) g_name_buf[k] = name[k], k++;
+    char tail[24];
+    snprintf(tail, sizeof tail, "  %d ms", p->rtt_shown);
+    for (int i = 0; tail[i] && k < 95; i++) g_name_buf[k++] = (unsigned char)tail[i];
+    g_name_buf[k] = 0;
+    r[0] = g_name_buf;
+    return r;
 }
 static void lag_tick(void) {  // run thread; once Steam is ready: hooks and the echo thread
     static int done;
@@ -3987,6 +4020,7 @@ static void lag_tick(void) {  // run thread; once Steam is ready: hooks and the 
     VirtualProtect(vt, 3 * 8, old, &old);
     CreateThread(NULL, 0, lag_thread, NULL, 0, NULL);
     logf("lag: measuring (echo on P2P channel %d, game packets counted per member, a line every %d s)", LAG_CHANNEL, LAG_LOG_MS / 1000);
+    hook_call(0x7dab36, 0x7aa960, (void *)name_hook, "lag: party bar name (ping after it)");
 }
 // Remote session members other than the session host (the lobby owner): allies (want_allies 1) or invaders (0;
 // a member without a role is an invader). Recounted at most every 250 ms.
@@ -5918,6 +5952,7 @@ static void step_hook(void *ctrl, void *time, int step) {
         }
     }
     no_sprint_frame();
+    g_in_exped = step == QM_STEP_INGAME || g_join_in_world();
     if (step == QM_STEP_INGAME || g_join_in_world()) invader_notice_frame();
     summon_kill_reward();
     crash_watch_members();

@@ -14,3 +14,4 @@ no-sprint = true          # the fast run (sprint) is off; false turns it back on
 ult-pvp = 100             # test, invasions: ultimate damage against players of the other side in percent (100 = unchanged, 0..999)
 ally = false              # test, joining player only: "Invasion" joins the host's expedition as an ally (squad member) instead of an invader
 party = 0                 # test only: a number mixed into the squad matchmaking key, to keep test runs apart (0 = off)
+show-ping = true          # the round trip to each other player (ms) after its name on the party bars; false hides it
