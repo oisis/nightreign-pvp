@@ -655,11 +655,19 @@ static const fmg_entry *fmg_get(const fmg *f, u32 id) {
     return NULL;
 }
 
-// Insert or replace, keeping the table sorted by id. There is always room for the few lines we add.
+// Insert or replace, keeping the table sorted by id; the table grows when it is full. (Until 2026-11-15 the
+// parse left room for 8 additions and this function assumed there was always room: our 9th line (131167) wrote
+// one entry past the allocation, the 11th (131169) three, and the PC's build aborted in malloc.)
 static void fmg_set(fmg *f, u32 id, const u8 *text, size_t bytes) {
     size_t i = 0;
     while (i < f->n && f->e[i].id < id) i++;
     if (i == f->n || f->e[i].id != id) {
+        if (f->n == f->cap) {
+            size_t cap = f->cap * 2 + 8;
+            fmg_entry *e = xalloc(cap * sizeof *e);
+            if (f->n) memcpy(e, f->e, f->n * sizeof *e);
+            free(f->e), f->e = e, f->cap = cap;
+        }
         memmove(&f->e[i + 1], &f->e[i], (f->n - i) * sizeof *f->e);
         f->n++;
     }
@@ -1334,7 +1342,7 @@ static int arena_sites(buf p, u8 rows[][256]) {
     }
     char line[1400];
     int at = 0;
-    for (int k = 0; k < nd; k++) {
+    for (int k = 0; k < nd && at < (int)sizeof line - 64; k++) {  // stays inside line (snprintf returns the full length)
         const u8 *r = pac_row(dsite[k]);
         at += snprintf(line + at, sizeof line - (size_t)at, " day %d: %d (%02d_%02d) x%d;", dday[k] + 1, dsite[k], r ? r[5] : 0, r ? r[6] : 0, dcount[k]);
     }
@@ -2536,6 +2544,17 @@ int core_selftest(void) {
     fmg g = {0};
     if (!fmg_parse(w, &g) || g.n != 3 || g.e[0].id != 5 || g.e[0].bytes != 8 || g.e[1].id != 10 ||
         memcmp(g.e[1].text, a, 6) || g.e[2].text) { ok = 0; logf_("selftest: FMG failed"); }
+    {  // more additions than the parse's spare room (the bug of 2026-11-15): the table must grow, all lines kept in order
+        static u8 txt[2] = {'x', 0};
+        size_t want = g.n + OUR_TEXT_COUNT + 16;
+        for (u32 id = 1000; g.n < want; id += 3) fmg_set(&g, id, txt, 2);
+        buf w2 = fmg_write(&g);
+        fmg h = {0};
+        int good = fmg_parse(w2, &h) && h.n == want;
+        for (size_t i = 1; good && i < h.n; i++) good = h.e[i - 1].id < h.e[i].id;
+        if (!good) { ok = 0; logf_("selftest: FMG growth failed"); }
+        free(w2.p), free(h.e);
+    }
 
     // DCX writer: header fields and adler of a known string ("Wikipedia" -> 0x11E60398).
     buf raw = {(u8 *)"Wikipedia", 9}, d = dcx_write(raw);
