@@ -4415,12 +4415,17 @@ static int our_speffect_active(char *chr) {
     return effect_entry_of(chr, ref.row) != NULL;
 }
 // no-sprint (test setting): the player's behaviour script (c0000.hks, SpeedUpdate / SpeedUpdate2, read with
-// analysis/hks) caps the move speed at run (ChangeMoveSpeedIndex(2)) and skips ExecSprintStart while the
-// character has SpEffect 100220 (env 1116 = has SpEffect; the row is a bare marker: no fields, spCategory 20,
-// effectEndurance 0). So the local player gets 100220 through the game's own add (0x3c7fd0) whenever it is
-// not on. ponytail: re-added every frame because an endurance-0 effect's lifetime is not read; the log
-// says once a second whether it was on.
-#define NO_SPRINT_SPEFFECT 100220
+// analysis/hks) starts a sprint with ExecSprintStart only while the character has neither SpEffect 102610 nor
+// 102001 (env 1116 = has SpEffect); the walk / run choice comes after it (thresholds 1.1 -> index 2, 0.4 -> index
+// 1, else 0, on a value our disassembler leaves unnamed; MoveSpeedLevel is read at the top). So the local player gets 102610 through the game's own add (0x3c7fd0)
+// whenever it is not on: walk and run stay as in the plain game, only the sprint start is skipped. 102610 is a
+// bare marker (raw row = template 10101 except effectEndurance 0 and target flags; no spCategory); its only
+// other script use is ExecDashTurn's choice of turn animation, reached only with SpEffect 100170 on.
+// Until run 62 this was 100220: SpeedUpdate checks it before the stick and sets ChangeMoveSpeedIndex(2) (run) and
+// returns, so with it any movement was a run and walking was gone (owner's report). 102001 is the same marker
+// but also gates ExecAttack / ExecItem, so not that one. ponytail: re-added every frame because an endurance-0
+// effect's lifetime is not read; the log says once a second whether it was on.
+#define NO_SPRINT_SPEFFECT 102610
 static int speffect_on(char *chr, unsigned id) {
     struct { char *row; unsigned id; unsigned char flag; } ref = {0};
     ((void (*)(void *, unsigned))(g_base + RVA_SPEFFECT_ROW))(&ref, id);
@@ -4442,8 +4447,25 @@ static void no_sprint_frame(void) {
     // Run 44: on in 21 of 42 frames when added only while off: an added copy is still there at this point one frame
     // later and gone the next, so it lives through one effect update. Added every frame, a copy is always there
     // (at most two at once, each ends by itself). ponytail: the effect update's order against the script is not read.
-    ((void (*)(void *, int, unsigned char))(g_base + RVA_ADD_SPEFFECT))(chr, NO_SPRINT_SPEFFECT, 0), added++;
+    // Third argument 1: not synced. 0x3c7fd0 has the shape of Elden Ring's ChrIns apply_speffect (chr, id, dont_sync),
+    // 0x3e8dc0. Until run 63 we passed 0, so every add (once a frame) was meant for the other machines too and their
+    // copy of our character could carry the marker; owner's report (others always run) fits, the remote copy's
+    // walk / run choice is not read in code (the log below shows whether a marker arrives). Only our script needs it.
+    ((void (*)(void *, int, unsigned char))(g_base + RVA_ADD_SPEFFECT))(chr, NO_SPRINT_SPEFFECT, 1), added++;
     if (GetTickCount() - next < 0x80000000u) {
+        // Other players' characters here: does any carry an old or new marker (from a machine with an older DLL)?
+        char *wcm = *(char **)(g_base + 0x3c0f0a8);
+        void **set = wcm ? (void **)(wcm + 0x9a40) : NULL;
+        if (set && !IsBadReadPtr(set, 8) && !IsBadReadPtr(*(void ***)set, 16)) {
+            void **vt = *(void ***)set;
+            int n = ((int (*)(void *))vt[0])(set);
+            for (int k = 0; k < n && k < 8; k++) {
+                char *c = ((char *(*)(void *, unsigned long long))vt[1])(set, (unsigned long long)k);
+                if (c && c != chr && !IsBadReadPtr(c, 0x200))
+                    logf("no sprint: other player's character (entry %d): SpEffect 100220 %d, %d %d", k, speffect_on(c, 100220),
+                         NO_SPRINT_SPEFFECT, speffect_on(c, NO_SPRINT_SPEFFECT));
+            }
+        }
         logf("no sprint: SpEffect %d on in %d of %d frames (added %d times) in the last second", NO_SPRINT_SPEFFECT, seen_on, frames, added);
         next = GetTickCount() + (frames > 0 && seen_on == frames ? 30000 : 1000), seen_on = frames = added = 0;
     }
