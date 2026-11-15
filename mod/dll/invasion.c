@@ -846,6 +846,14 @@ static int g_join_in_world(void);
 // 0x14398d410). Each joiner writes its role into its Steam lobby member data (nrpvp_role); a member without one
 // counts as an invader, as before. Rules that were "someone is in my session" now ask for an invader in it.
 static int g_as_ally;                       // joiner: this join is as an ally
+// Party (test setting "party" = a code 1..999, both players the same): the menu's 2- / 3-player expedition is
+// gathered over our Steam lobby instead of FromSoftware's matchmaking. Phases below (party code).
+enum { PARTY_OFF, PARTY_PENDING, PARTY_HOST_CREATE, PARTY_HOST_WAIT, PARTY_HOST_STARTED, PARTY_GUEST };
+static int g_party, g_party_host, g_party_guest;
+static int g_in_expedition;
+static void party_host_over(void);
+#define LOBBY_PARTY_KEY "nrpvp_party"   // a gathering host's party code
+#define LOBBY_GO_KEY    "nrpvp_go"      // "1" once the host's expedition is generated (start block, generator results final)
 static int g_invader_in_world(void);        // joined as an invader and in the host's world
 static int side_count(int want_allies);     // remote session members that are allies / invaders (not the host)
 static int member_no_is_invader(int no);    // a remote session member with this player number is an invader
@@ -3657,7 +3665,7 @@ static void lobby_mark(void) {
                 expedition_log("host");
             }
         }
-        g_squad = members;
+        g_squad = g_party_host ? 1 : members;  // a party host's squad mates are allies (their member data says so)
         g_list_tick = GetTickCount();  // self-check one period after marking
     }
     // Squad: the session's members when the lobby was first marked (the expedition's own players are
@@ -3683,6 +3691,7 @@ static void lobby_mark(void) {
     g_marked_squad = key;
     unsigned squad = g_squad + allies, allowed = invaders_allowed(squad);
     unsigned free_slots = allowed > others ? allowed - others : 0, ally_free = SQUAD_MAX > squad ? SQUAD_MAX - squad : 0;
+    if (g_party_host && !g_in_expedition) free_slots = 0;  // no invaders while the party gathers in the Roundtable Hold
     char text[16];
     snprintf(text, sizeof text, "%u", squad);
     lobby_set(LOBBY_SQUAD_KEY, text);
@@ -3709,6 +3718,9 @@ static int lobby_search_frame(const char *who) {
         if (g_list_tick && now - g_list_tick < SEARCH_PERIOD_MS) return 0;
         g_steam.string_filter(g_steam.mm, LOBBY_MARK_KEY, "1", LOBBY_EQUAL);
         g_steam.string_filter(g_steam.mm, LOBBY_PROTO_KEY, LOBBY_PROTO, LOBBY_EQUAL);
+        char code[8];
+        snprintf(code, sizeof code, "%d", g_settings[S_PARTY]);
+        if (g_party) g_steam.string_filter(g_steam.mm, LOBBY_PARTY_KEY, code, LOBBY_EQUAL);
         g_steam.distance_filter(g_steam.mm, LOBBY_WORLDWIDE);
         g_list_call = g_steam.request_list(g_steam.mm);
         g_list_tick = now;
@@ -3916,6 +3928,7 @@ static void level_restore(void) {
 }
 static void join_over(const char *why) {
     level_restore();
+    if (g_party_guest) g_party = PARTY_OFF, g_party_guest = 0, logf("party: guest's part over (%s)", why);
     g_join = 3;
     g_invader_downs = 0;
     if (g_saved_pending_valid) {  // the pending map state we set at the forced step goes back
@@ -4281,7 +4294,7 @@ static void enter_watch(char *sm) {
     // (14), NonActiveBlockInfo (23) and others ask the host only when sync +0xe5 is set (0xdcd260 sets it
     // only for a role-8 rejoin, from gm+0xc96); the host answers every subtype for a member it flags
     // as rejoining (+0xea), which our joiner is. Set before the sync passes step 6.
-    if (g_move_test && setting(S_FULL_SYNC) && sync && now[0] == 6 && now[2] >= 0 && now[2] <= 6 && !sync[0xe5]) {
+    if (g_move_test && !g_party_guest && setting(S_FULL_SYNC) && sync && now[0] == 6 && now[2] >= 0 && now[2] <= 6 && !sync[0xe5]) {
         sync[0xe5] = 1;
         logf("move test: sync +0xe5 set (sync step %d): the client asks the host for the full world state", now[2]);
     }
@@ -4752,10 +4765,163 @@ static void lobby_position(void) {
 // with 0x23 (0xddf930); a session of one never receives any.
 #define QM_STEP_INGAME 23
 #define NET_READY_WAIT_MS 15000  // only for the log: say once if the network is slow to come up
-static int g_in_expedition;
 static DWORD g_expedition_tick, g_expedition_start_tick;
 static void host_test_create(void);
 static int host_test_leave(void);
+
+#define QM_STEP_MOVE_MAP_START 21
+#define RVA_SET_ONLINE_MODE   0x6b0530  // gm+0xb40 = arg
+// --- Party (test setting "party" = code) -------------------------------------------------------------
+// The game's own squad start (read, 2026-11-15): the menu's 2- / 3-player choice asks 0x6aeae0 = gm+0xb40
+// (online mode); CSQuickMatchingCtrl then pairs players through FromSoftware's matching jobs (steps 1-11:
+// Register / Search / RequestJoin / invite with the session's Steam lobby id / MultiGameID), the host makes
+// the expedition's session in step 6 and both sides reach MoveMapWait (13). MoveMapWait in mode 2 needs the
+// session's members == ctx +0x98 (else FailedStartMultiplay) and goes on to the squad's hero re-select (14);
+// MoveMapStart (0xb593a0) in mode 2 needs gm+0xb40 and the same count, and leaves the session only while its
+// sync object is not in step 0 / 1 / 10 (0xdf0a80 -> 0xdcd030); MoveMap (0xb590a0) in mode 2: the host waits
+// for every remote member's ready (player +0x86c, packet 0x21) on a timer and then sends "go" (0x23,
+// ctrl +0x10a); a client sends its ready once its map is loaded (ctrl +0x10b) and waits for "go".
+// Here none of the matching jobs runs (no server): steps 1-11 are set back to None while the party gathers,
+// and the roles come from our Steam lobby: the first player finds no lobby with this code and hosts (session
+// made in the Roundtable Hold, lobby marked with nrpvp_party = code), the second finds it and joins as an ally
+// (the join of the ally build). The host starts when the session has the menu's squad size: SingleStart in
+// mode 1 (the solo path: SingleStart -> MoveMapWait -> SingleSetup / generator -> cutscene; the squad's hero
+// re-select steps 14 / 15 are not read, so not entered), publishes its start block and generator results
+// and nrpvp_go = 1 at StartCutscene, and switches the context to mode 2 with the session's member count at
+// MoveMapStart, so MoveMap runs the squad's ready / go. The guest waits in None for nrpvp_go, then takes the
+// host's start block and generator results and is put into MoveMapStart in mode 2 (move_force).
+// Not established: what the server's answers would have put in the context (+0xc0, +0x17c.., +0x188 /
+// +0x18c are read by SingleStart, GuestReadyWait and HostMultiGameIdWait; they are logged, never written);
+// MoveMap's timer length on the host; the player count the expedition uses afterwards.
+static DWORD g_party_tick;
+static unsigned g_party_players;
+static int g_party_set_key, g_party_published, g_party_mode2, g_party_online;
+static char *party_ctx(char *ctrl) {
+    char *ctx = ctrl ? *(char **)(ctrl + QM_CTRL_CONTEXT) : NULL;
+    return ctx && !IsBadReadPtr(ctx, 0x190) && *(char **)ctx == g_base + RVA_QM_CONTEXT_VTABLE ? ctx : NULL;
+}
+static void party_ctx_log(char *ctrl, const char *why) {
+    char *c = party_ctx(ctrl);
+    if (!c) return;
+    logf("party: %s: context mode +9d %u players +98 %u +9c %u +c0 %u +128 %d +12c %u +130 %d +134 %d +138 %d +13c %u +140 %d "
+         "+145 %u +17c..181 %u %u %u %u %u %u +188 %08x +18c %08x", why, (unsigned char)c[0x9d], *(unsigned *)(c + 0x98),
+         (unsigned char)c[0x9c], (unsigned char)c[0xc0], *(int *)(c + 0x128), (unsigned char)c[0x12c], *(int *)(c + 0x130),
+         *(int *)(c + 0x134), *(int *)(c + 0x138), (unsigned char)c[0x13c], *(int *)(c + 0x140), (unsigned char)c[0x145],
+         (unsigned char)c[0x17c], (unsigned char)c[0x17d], (unsigned char)c[0x17e], (unsigned char)c[0x17f], (unsigned char)c[0x180],
+         (unsigned char)c[0x181], *(unsigned *)(c + 0x188), *(unsigned *)(c + 0x18c));
+}
+static int session_members(void) {
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
+    char *b = sm ? *(char **)(sm + SM_PLAYERS_BEGIN) : NULL, *e = sm ? *(char **)(sm + SM_PLAYERS_BEGIN + 8) : NULL;
+    return b && e >= b ? (int)((e - b) / SM_PLAYER_SIZE) : 0;
+}
+static void party_end(const char *why) {
+    logf("party: over (%s)", why);
+    if (g_party_host && !g_in_expedition) {
+        if (host_test_leave()) g_stop_pending = GetTickCount();
+        else if (g_network_on) set_network(0);
+        g_lobby = 0, g_host_test = 0;
+    }
+    if (g_party_online) ((void (*)(unsigned char))(g_base + RVA_SET_ONLINE_MODE))(0), g_party_online = 0;
+    g_party = PARTY_OFF, g_party_host = g_party_guest = 0;
+}
+static void party_host_over(void) {
+    if (g_party_online) ((void (*)(unsigned char))(g_base + RVA_SET_ONLINE_MODE))(0), g_party_online = 0;
+    logf("party: host's expedition over");
+    g_party = PARTY_OFF, g_party_host = 0;
+}
+static int party_go(void) {
+    const char *go = g_candidate ? g_steam.get_data(g_steam.mm, g_candidate, LOBBY_GO_KEY) : NULL;
+    return go && !strcmp(go, "1");
+}
+// Request seen (fill context): the menu's squad choice with a party code.
+static void party_request(char *self) {
+    char *ctx = *(char **)(self + 8);
+    if (g_party) party_end("a new start request");
+    g_party = PARTY_PENDING, g_party_tick = GetTickCount(), g_party_set_key = g_party_published = g_party_mode2 = 0;
+    g_party_players = ctx && *(char **)ctx == g_base + RVA_QM_CONTEXT_VTABLE ? *(unsigned *)(ctx + QM_CTX_PLAYERS) : 2;
+    g_as_ally = 1;
+    if (!g_network_on) set_network(1);
+    logf("party: start request with code %d for a squad of %u: network %s; searching our lobbies for a host with this code",
+         g_settings[S_PARTY], g_party_players, g_network_on ? "up" : "NOT up");
+}
+// Idle step (None) while the party gathers.
+static void party_frame(char *ctrl) {
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
+    if (g_party == PARTY_PENDING) {
+        void **impl = sm ? session_impl(sm) : NULL;
+        if (!g_network_on || !((unsigned char (*)(void))(g_base + RVA_NET_READY))() || !impl || !*(unsigned *)((char *)impl + 0x10)) {
+            if (GetTickCount() - g_party_tick > 30000) party_end("network not ready within 30 s");
+            return;
+        }
+        if (!lobby_search_frame("party search")) return;
+        if (g_candidate) {  // a host with our code: join it as an ally (the ally build's join)
+            u64 c = g_candidate;
+            join_test_start();
+            g_candidate = c, g_as_ally = 1, g_searching = 1;
+            g_party = PARTY_GUEST, g_party_guest = 1;
+            logf("party: host found (lobby %llu): joining as the squad's guest", c);
+        } else {
+            g_party = PARTY_HOST_CREATE, g_party_host = 1, g_host_test = 1;
+            logf("party: no host with code %d: hosting (session in the Roundtable Hold)", g_settings[S_PARTY]);
+        }
+        return;
+    }
+    if (g_party == PARTY_HOST_CREATE) {
+        host_test_create();
+        if (g_host_test == 3) party_end("a session already exists");
+        else if (g_host_test == 2 && sm && *(unsigned *)(sm + SM_LOBBY_STATE) == 3) g_party = PARTY_HOST_WAIT, g_party_tick = GetTickCount();
+        return;
+    }
+    if (g_party == PARTY_HOST_WAIT) {
+        lobby_mark();
+        if (g_lobby && !g_party_set_key) {
+            char code[8];
+            snprintf(code, sizeof code, "%d", g_settings[S_PARTY]);
+            lobby_set(LOBBY_PARTY_KEY, code), lobby_set(LOBBY_GO_KEY, "0"), g_party_set_key = 1;
+        }
+        int n = session_members();
+        static DWORD full_since;
+        if (n < (int)g_party_players || !g_host_switched) { full_since = 0; return; }
+        if (!full_since) { full_since = GetTickCount(); logf("party: the session has %d of %u members", n, g_party_players); return; }
+        if (GetTickCount() - full_since < 2000) return;
+        char *ctx = party_ctx(ctrl);
+        if (!ctx) { party_end("context not as expected"); return; }
+        ((void (*)(void *, unsigned char))(*(void ***)ctx)[0x48 / 8])(ctx, 1);  // the solo path up to MoveMapStart
+        party_ctx_log(ctrl, "host, before SingleStart (mode set to 1 until MoveMapStart)");
+        g_party = PARTY_HOST_STARTED, g_party_tick = GetTickCount();
+        ((void (*)(void *, int))(*(void ***)ctrl)[QM_CTRL_VT_SET_STEP])(ctrl, 12);
+        logf("party: squad complete (%d members): host starts the expedition (SingleStart)", n);
+    }
+}
+// Host, every step after the start.
+static void party_host_step(char *ctrl, int step) {
+    char *gm = *(char **)(g_base + RVA_GAME_MAN_PTR), *ctx = party_ctx(ctrl);
+    if (step == 24 || step == 25 || (step == QM_STEP_NONE && GetTickCount() - g_party_tick > 3000)) {
+        party_end(step == QM_STEP_NONE ? "host back to None" : "host's start failed");
+        return;
+    }
+    if (g_lobby && g_steam.mm && !g_in_expedition) lobby_mark();
+    if (step >= 19 && !g_party_published && gm) {
+        char text[40];
+        snprintf(text, sizeof text, "%08x", *(unsigned *)(gm + 0xa74));
+        lobby_set(LOBBY_START_KEY, text);
+        snprintf(text, sizeof text, "%x,%x,%x", *(unsigned *)(gm + 0xb48), *(unsigned *)(gm + 0xb54), *(unsigned *)(gm + 0xb5c));
+        lobby_set(LOBBY_GEN_KEY, text);
+        lobby_set(LOBBY_GO_KEY, "1");
+        g_party_published = 1;
+        logf("party: host's expedition generated (step %s): start block, generator results and go published", STEP_NAMES[step]);
+    }
+    if (step == QM_STEP_MOVE_MAP_START && !g_party_mode2 && ctx && gm) {
+        int n = session_members();
+        ((void (*)(void *, unsigned char))(*(void ***)ctx)[0x48 / 8])(ctx, 2);
+        ((void (*)(void *, int))(*(void ***)ctx)[0x28 / 8])(ctx, n);
+        if (!gm[0xb40]) ((void (*)(unsigned char))(g_base + RVA_SET_ONLINE_MODE))(1), g_party_online = 1;
+        g_party_mode2 = 1;
+        party_ctx_log(ctrl, "host at MoveMapStart (mode 2, players = session members, online flag)");
+    }
+}
+
 static void host_expedition(int step) {
     if (step == QM_STEP_INGAME) {
         int first_frame = !g_in_expedition;
@@ -4768,6 +4934,7 @@ static void host_expedition(int step) {
             g_self_check = 0;
             lobby_search_reset();
             host_test_start();
+            if (g_party_host) g_host_test = 2, logf("party: host's session (made in the Roundtable Hold) goes on into the expedition");
             logf("host: expedition reached its world%s", g_host_test ? ", opening a host session" : " (no host session: no-host is on)");
             if (g_host_test) {
                 if (g_stop_pending) finish_pending_stop(1);
@@ -4805,6 +4972,7 @@ static void host_expedition(int step) {
         lobby_search_reset();
         logf("host: expedition over (step %s)%s", STEP_NAMES[step], g_host_test == 2 ? ", leaving the session" : "");
         md_end("expedition over");
+        if (g_party_host) party_host_over();
         if (host_test_leave()) g_stop_pending = GetTickCount();  // network down once the leave is through
         else if (g_network_on && !g_searching) set_network(0);
         g_lobby = 0;
@@ -4857,8 +5025,6 @@ static void toggle_search(const char *where) {
 #define RVA_SET_PENDING_AAC   0x6b05f0  // gm+0xaac = arg
 #define RVA_SET_PENDING_TYPE  0x6b0410  // gm+0xdc0 = arg
 #define RVA_SET_PENDING_REASON 0x6b0520 // gm+0xdbc = arg
-#define QM_STEP_MOVE_MAP_START 21
-#define RVA_SET_ONLINE_MODE   0x6b0530  // gm+0xb40 = arg
 static void pending_log(const char *when) {
     char *gm = *(char **)(g_base + RVA_GAME_MAN_PTR);
     if (gm) logf("move test: %s: pending block %08x +aac %u type %u reason %d +dc1 %u", when, *(unsigned *)(gm + 0xa74),
@@ -4942,7 +5108,10 @@ static int move_force(char *ctrl) {
     // put in mode 1 (what "1 player" gives; the run of 5c775057 entered the host's world that way): no
     // count check and no online-flag wait in MoveMapStart, MoveMap lets go at once (+0x10a).
     g_ctx_old_mode = (unsigned char)ctx[0x9d] | 0x100;
-    if ((unsigned char)ctx[0x9d] != 1) {
+    if (g_party_guest) {  // party: the squad's own start (mode 2: count check, ready / go with the host in MoveMap)
+        if ((unsigned char)ctx[0x9d] != 2) ((void (*)(void *, unsigned char))(*(void ***)ctx)[0x48 / 8])(ctx, 2);
+        logf("party: guest context mode %u (2 = squad)", (unsigned char)ctx[0x9d]);
+    } else if ((unsigned char)ctx[0x9d] != 1) {
         unsigned char was = (unsigned char)ctx[0x9d];
         ((void (*)(void *, unsigned char))(*(void ***)ctx)[0x48 / 8])(ctx, 1);
         logf("move test: context mode %u -> %u (context setter vt+0x48)", was, (unsigned char)ctx[0x9d]);
@@ -4989,7 +5158,15 @@ static void step_hook(void *ctrl, void *time, int step) {
         if (step != QM_STEP_NONE) log_start(ctrl, step);
         else logf("step None");
         last = step;
+        if (g_party) party_ctx_log(ctrl, STEP_NAMES[step]);
     }
+    // party: the matching steps (FromSoftware's server) never run; the party gathers in None
+    if (g_party >= PARTY_PENDING && g_party <= PARTY_HOST_WAIT && step >= 1 && step <= 11) {
+        logf("party: matching step %s set back to None (gathered over our lobby)", STEP_NAMES[step]);
+        ((void (*)(void *, int))(*(void ***)ctrl)[QM_CTRL_VT_SET_STEP])(ctrl, QM_STEP_NONE);
+        return;
+    }
+    if (g_party == PARTY_HOST_STARTED) party_host_step(ctrl, step);
     if (g_network_on && g_guard_broken) {
         if (g_searching) toggle_search("network guard broken");
         else {
@@ -5061,13 +5238,17 @@ static void step_hook(void *ctrl, void *time, int step) {
             logf("invasion: search ended, an ordinary expedition is starting");
         }
     } else {  // the idle step runs every frame in the Roundtable Hold
+        if (g_party >= PARTY_PENDING && g_party <= PARTY_HOST_WAIT) party_frame(ctrl);
         if (g_invasion_pending && GetTickCount() - g_request_tick > 300) toggle_search("machine stayed idle");
         if (g_searching && notices_idle()) notice(0);
         // No lobby list requests while a join is under way: nothing to choose then, and one less
         // thing talking to Steam during the join.
         if (g_searching && !(g_join_test && (g_join == 1 || g_join == 2 || g_join == 4))) lobby_search_frame("search");
         if (g_searching && g_join_test) join_frame();
-        if (g_move == 1 && g_join == 4 && g_searching && move_force(ctrl)) return;
+        if (g_party_guest && g_move == 1 && g_join == 4 && !party_go()) {
+            static DWORD told;
+            if (GetTickCount() - told > 10000) told = GetTickCount(), logf("party: guest in the host's session, waiting for the host's go");
+        } else if (g_move == 1 && g_join == 4 && g_searching && move_force(ctrl)) return;
     }
     g_step_original[step](ctrl, time);
 }
@@ -5103,6 +5284,8 @@ static unsigned long long fill_context_hook(char *self, char *request) {
     }
     g_invasion_pending = invasion;
     g_request_tick = GetTickCount();
+    unsigned char choice = (unsigned char)request[REQ_PLAYERS_CHOICE];
+    if (g_settings[S_PARTY] > 0 && !invasion && (choice == 0 || choice == 1)) party_request(self);
     logf("start request: players choice %u, %u target rows, invasion %d", (unsigned char)request[REQ_PLAYERS_CHOICE],
          (unsigned)count, invasion);
     return result;
@@ -5124,6 +5307,7 @@ static unsigned char online_check_hook(char *request) {
     size_t count = begin && end >= begin ? (size_t)(end - begin) : 0;
     for (size_t i = 0; i < count && i < 64; i++)
         if (begin[i] == INVASION_ROW) return 1;
+    if (g_settings[S_PARTY] > 0 && request[REQ_PLAYERS_CHOICE] <= 1) return 1;  // party: gathered by us, not by the matching server
     return ((unsigned char (*)(void))(g_base + RVA_IS_ONLINE))();
 }
 
