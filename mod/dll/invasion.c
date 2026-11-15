@@ -94,7 +94,7 @@ static void next_to_dll(char *path, size_t cap, const char *name) {
 }
 static int g_settings_early;  // read in DllMain already
 static void settings_load(void) {
-    char path[MAX_PATH], text[4096], bad[300], old[200] = "";
+    char path[MAX_PATH], text[4096], bad[300], old[200] = "";  // path is never logged (it holds the OS user name)
     next_to_dll(path, sizeof path, "test-settings.toml");
     FILE *f = fopen(path, "rb");
     size_t n = f ? fread(text, 1, sizeof text, f) : 0;
@@ -106,7 +106,7 @@ static void settings_load(void) {
         char num[8];
         snprintf(num, sizeof num, "%d", v);
         logf("settings: %s = %s (%s)", SETTING_NAMES[i], setting_is_number(i) ? num : v ? "true" : "false",
-             !f ? "no test-settings.toml next to the DLL, default" : g_settings[i] < 0 ? "not in the file, default" : path);
+             !f ? "no test-settings.toml next to the DLL, default" : g_settings[i] < 0 ? "not in the file, default" : "test-settings.toml");
         g_settings[i] = (short)v;
     }
     for (int i = 0; i < SETTINGS_COUNT; i++)  // the empty marker files of earlier test builds
@@ -3999,6 +3999,7 @@ static void level_restore(void) {
 }
 static void join_over(const char *why) {
     level_restore();
+    memset(g_hud_invaders, 0, sizeof g_hud_invaders);  // the host clears it in host_member_sync; a joiner here
     if (g_party_guest) g_party = PARTY_OFF, g_party_guest = 0, logf("party: guest's part over (%s)", why);
     g_join = 3;
     g_invader_downs = 0;
@@ -4213,16 +4214,25 @@ static char *local_player(void) {
     char *wcm = *(char **)(g_base + RVA_WORLD_CHR_MAN);
     return wcm ? *(char **)(wcm + WCM_LOCAL_PLAYER) : NULL;
 }
+// The active entry of the effect row on chr, or NULL. Every pointer of the walk is checked first: these walks run
+// on other players' characters too (invasion notices, HUD, finish rules), which may be half built while a new
+// member's character is created (3-player sessions, 15.11: two joiners crashed around a newcomer's arrival).
+static char *effect_entry_of(char *chr, char *row) {
+    if (!chr || !row || IsBadReadPtr(chr + CHR_SPEFFECTS, 8)) return NULL;
+    char *module = *(char **)(chr + CHR_SPEFFECTS);
+    if (!module || IsBadReadPtr(module + 8, 8)) return NULL;
+    int n = 0;
+    for (char **e = *(char ***)(module + 8); e && n < 512; e = (char **)e[7], n++) {
+        if (IsBadReadPtr(e, 0x70)) return NULL;
+        if (e[0] == row && !(*(unsigned *)((char *)e + 0x68) & 0x800c0003)) return (char *)e;
+    }
+    return NULL;
+}
 static int our_speffect_active(char *chr) {
     struct { char *row; unsigned id; unsigned char flag; } ref = {0};
     ((void (*)(void *, unsigned))(g_base + RVA_SPEFFECT_ROW))(&ref, TEAM_TEST_SPEFFECT);
-    char *module = *(char **)(chr + CHR_SPEFFECTS);
     if (!ref.row) return -1;  // row not in regulation.bin
-    if (!module) return 0;
-    int n = 0;
-    for (char **e = *(char ***)(module + 8); e && n < 512; e = (char **)e[7], n++)
-        if (e[0] == ref.row && !(*(unsigned *)((char *)e + 0x68) & 0x800c0003)) return 1;
-    return 0;
+    return effect_entry_of(chr, ref.row) != NULL;
 }
 // no-sprint (test setting): the player's behaviour script (c0000.hks, SpeedUpdate / SpeedUpdate2, read with
 // analysis/hks) caps the move speed at run (ChangeMoveSpeedIndex(2)) and skips ExecSprintStart while the
@@ -4234,22 +4244,12 @@ static int our_speffect_active(char *chr) {
 static int speffect_on(char *chr, unsigned id) {
     struct { char *row; unsigned id; unsigned char flag; } ref = {0};
     ((void (*)(void *, unsigned))(g_base + RVA_SPEFFECT_ROW))(&ref, id);
-    char *module = *(char **)(chr + CHR_SPEFFECTS);
-    if (!ref.row || !module) return 0;
-    int n = 0;
-    for (char **e = *(char ***)(module + 8); e && n < 512; e = (char **)e[7], n++)
-        if (e[0] == ref.row && !(*(unsigned *)((char *)e + 0x68) & 0x800c0003)) return 1;
-    return 0;
+    return effect_entry_of(chr, ref.row) != NULL;
 }
 static char *speffect_entry(char *chr, unsigned id) {  // the active entry of SpEffect id on chr, or NULL
     struct { char *row; unsigned id; unsigned char flag; } ref = {0};
     ((void (*)(void *, unsigned))(g_base + RVA_SPEFFECT_ROW))(&ref, id);
-    char *module = *(char **)(chr + CHR_SPEFFECTS);
-    if (!ref.row || !module) return NULL;
-    int n = 0;
-    for (char **e = *(char ***)(module + 8); e && n < 512; e = (char **)e[7], n++)
-        if (e[0] == ref.row && !(*(unsigned *)((char *)e + 0x68) & 0x800c0003)) return (char *)e;
-    return NULL;
+    return effect_entry_of(chr, ref.row);
 }
 static void no_sprint_frame(void) {
     if (!setting(S_NO_SPRINT)) return;
