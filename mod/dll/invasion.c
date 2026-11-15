@@ -1887,18 +1887,27 @@ static int md_map_count(char *head) {
 // player's active effect entries (ChrIns +0x190 module, list from +8, next at entry +0x38): each row pointer as
 // (row - row of 90071610) / 0x400, i.e. its index offset in SpEffectParam (rows 0x400 apart, in id order); the
 // ids follow offline from the regulation's row order.
+static int md_player_effects_text(char *line, size_t cap, const char *when);
 static void md_player_effects(const char *when) {
+    char line[1900];
+    md_player_effects_text(line, sizeof line, when);
+    mdf("%s\n", line);
+}
+// The same as text (returns its length); also the character's play-area effect id ChrIns +0x780, which the circle
+// sets on every character from the phase table (+0x190 entries, +0x18) when outside and -1 inside (0x66dcf0 called
+// at 0x697566, 0x698f90, 0x69919c: removes the old effect, applies the new one).
+static int md_player_effects_text(char *line, size_t cap, const char *when) {
     char *chr = local_player();
     struct { char *row; unsigned id; unsigned char flag; } ref = {0};
     ((void (*)(void *, unsigned))(g_base + 0xea17e0))(&ref, 90071610);
-    char *module = chr && !IsBadReadPtr(chr, 0x200) ? *(char **)(chr + 0x190) : NULL;
-    if (!module || !ref.row || IsBadReadPtr(module, 0x10)) { mdf("player effects (%s): none readable\n", when); return; }
-    char line[1800];
-    int at = snprintf(line, sizeof line, "player effects (%s), offsets from row 90071610:", when), n = 0;
-    for (char **e = *(char ***)(module + 8); e && n < 64 && !IsBadReadPtr(e, 0x70); e = (char **)e[7], n++)
-        at += snprintf(line + at, sizeof line - (size_t)at, " %lld%s", (long long)(e[0] - ref.row) / 0x400,
+    char *module = chr && !IsBadReadPtr(chr, 0x790) ? *(char **)(chr + 0x190) : NULL;
+    if (!module || !ref.row || IsBadReadPtr(module, 0x10)) return snprintf(line, cap, "player effects (%s): none readable", when);
+    int at = snprintf(line, cap, "player effects (%s), play-area effect %d, offsets from row 90071610:", when,
+                      *(int *)(chr + 0x780)), n = 0;
+    for (char **e = *(char ***)(module + 8); e && n < 64 && !IsBadReadPtr(e, 0x70) && at < (int)cap - 24; e = (char **)e[7], n++)
+        at += snprintf(line + at, cap - (size_t)at, " %lld%s", (long long)(e[0] - ref.row) / 0x400,
                        (*(unsigned *)((char *)e + 0x68) & 0x800c0003) ? "(off)" : "");
-    mdf("%s\n", line);
+    return at;
 }
 // Circle asset log (map-dump, measurement): the play-area code's asset state calls, first time per (site, instance,
 // value) and every change: giant assets (0x653be0: 0x7019e0 at 0x653ef4 / 0x654194, level 1 or 4 by the phase
@@ -1926,26 +1935,43 @@ static void asset_level_hook(void *inst, unsigned long long level) {
     md_asset_note((unsigned)((char *)__builtin_return_address(0) - g_base) - 5, inst, (unsigned)(level & 0xff));
     ((void (*)(void *, unsigned long long))(g_base + 0x7019e0))(inst, level);
 }
+static void norain_first(int k, const char *what);
 static void asset_enable_hook(void *inst, unsigned long long on) {
-    md_asset_note((unsigned)((char *)__builtin_return_address(0) - g_base) - 5, inst, (unsigned)(on & 0xff));
+    unsigned site = (unsigned)((char *)__builtin_return_address(0) - g_base) - 5;
+    // No rain (fixed): the circle's far asset AEG599_960_8900 (m60_00_00_99, the distant-view map) is enabled at
+    // 0x693ae8 / 0x693dc3 (0x693930), then faded in and placed at the circle centre, scaled to the radius. It is kept
+    // disabled (0), as the game disables the cloud asset in 0x694050.
+    if (site == 0x693ae8 || site == 0x693dc3) on = 0, norain_first(10, "circle far asset kept disabled");
+    md_asset_note(site, inst, (unsigned)(on & 0xff));
     ((void (*)(void *, unsigned long long))(g_base + 0x704cd0))(inst, on);
 }
 static void md_circle_tick(void) {
     static DWORD next;
-    static char last[96];
+    static char last[160];
     char *pa = *(char **)(g_base + 0x3c13158);
     if (!pa || IsBadReadPtr(pa, 0x480)) return;
-    char line[96];
-    snprintf(line, sizeof line, "c553 %d phase %d mode %u out430 %u out473 %u id %d handle %llx edge %d",
+    char line[160];
+    snprintf(line, sizeof line, "c553 %d phase %d mode %u out430 %u out473 %u id %d handle %llx edge %d far %d/%u/%.1f",
              g_c553_pre, (signed char)pa[0x154], (unsigned char)pa[0x160], (unsigned char)pa[0x430], (unsigned char)pa[0x473],
-             *(int *)(pa + 0x424), *(unsigned long long *)(pa + 0x428), md_map_count(*(char **)(pa + 0x410)));
+             *(int *)(pa + 0x424), *(unsigned long long *)(pa + 0x428), md_map_count(*(char **)(pa + 0x410)),
+             *(int *)(pa + 0x30c), (unsigned char)pa[0x310], *(float *)(pa + 0x314));
     DWORD now = GetTickCount();
     int changed = strcmp(line, last) != 0;
+    // effects one second before and one second after each crossing of +0x430 (both directions)
     static int last430 = -1;
+    static char snap[1900];
+    static DWORD snap_at, after_at;
+    DWORD t = GetTickCount();
     if (pa[0x430] != last430) {
+        if (last430 >= 0 && snap[0]) mdf("%s (taken %.1f s before the change)\n", snap, (t - snap_at) / 1000.0);
         last430 = pa[0x430];
-        md_player_effects(last430 ? "player beyond the circle" : "player inside the circle");
+        md_player_effects(last430 ? "player beyond the circle, now" : "player inside the circle, now");
+        after_at = t + 1000;
+    } else if (after_at && (int)(t - after_at) >= 0) {
+        after_at = 0;
+        md_player_effects(last430 ? "player beyond the circle, 1 s after" : "player inside the circle, 1 s after");
     }
+    if ((int)(t - snap_at) >= 1000) snap_at = t, md_player_effects_text(snap, sizeof snap, "1 s before the change");
     if (!pa[0x159] && !changed) return;
     if (!changed && (int)(now - next) < 0) return;
     next = now + 1000;
@@ -2105,8 +2131,9 @@ static unsigned char tile_flag_space_hook(unsigned *id, int a) {
 // The circle's edge sound "CircleBorderSe" (sounds 600010000/10/20 at the edge point nearest the player) is
 // started only by 0x6953b0 (called only at 0x68e229): that call is skipped.
 static DWORD g_expedition_start_tick;  // defined with g_expedition_tick below
-static DWORD g_norain_seen[9];
+static DWORD g_norain_seen[13];
 static void norain_first(int k, const char *what) {
+    if (k < 0 || k >= (int)(sizeof g_norain_seen / sizeof *g_norain_seen)) return;
     if (g_debug_log && g_norain_seen[k] != g_expedition_start_tick) {
         g_norain_seen[k] = g_expedition_start_tick;
         logf("no rain: %s (first time this expedition)", what);
@@ -2171,6 +2198,40 @@ static void norain_border_hook(char *mgr, float dt) {
 static void hud_circle_notice_hook(void *hud, unsigned long long phase) {
     (void)hud, (void)phase;
     norain_first(7, "circle notice 0x7c52f0 skipped");
+}
+// Weather side of the circle: 0x68b5c0 (play area +0x471: the player is inside the circle) has four callers, all
+// weather or sound: 0x65feb0 (weather effect +0x108), 0x6631a0 (rain ground splash 1004010 outside), 0x6640f0 (weather
+// effects +0x118 / +0x128 and one attached to each character), 0xef54e0 (sound state). Answered 1: they keep the
+// state they have inside the circle (and without one).
+static unsigned long long weather_inside_hook(char *mgr) {
+    (void)mgr;
+    norain_first(9, "weather side answered inside the circle");
+    return 1;
+}
+// Outside the circle: the character update 0x3e2580 stores 0x68c500 (position beyond the radius) in bit 3 of
+// chr+0x1f9 (call 0x3e2a16, its only caller); the SpEffect check 0x50f740 (0x50fa6a) lets a row with +0x353 bit 1
+// act only while that bit is set (14 rows: the Night's Tide damage / increased damage / instant death of both
+// shrinkings, 98220 / 98221, 99880 / 99881, 4710, 296400). Answered 0: no character is ever outside.
+static unsigned long long outside_circle_hook(char *mgr, float *pos) {
+    (void)mgr, (void)pos;
+    norain_first(11, "no character marked outside the circle");
+    return 0;
+}
+// Map pins: 0x6af290(map type T, &map id) decides whether a WorldMapPointParam row gets a pin (pin
+// loop 0x910fb3, call 0x911081; second row loop 0xa5bba1). The map id is built by 0x6772b0 from the row's +0x1c..+0x1f:
+// byte 3 area, byte 2 gridX, byte 1 gridZ, byte 0 = variant << 4 | ones digit. The game shows a row on a field map
+// tile of region T's own terrain iff its variant is T, elsewhere iff its variant is 0. Our maps are the Mountaintop
+// (type 1) with the Rotted Woods on 44-45 x 36-37: on those tiles a row is shown iff its variant is 3, as on a real
+// Rotted Woods map; everything else goes to the game. Not for the one-region measurement setting.
+#define RVA_PIN_ROW_SHOWN 0x6af290
+static unsigned long long pin_row_shown_hook(unsigned long long type, unsigned *id) {
+    unsigned v = *id, area = v >> 24, x = (v >> 16) & 0xff, z = (v >> 8) & 0xff;
+    if (g_settings[S_ONE_REGION] < 1 && area >= 0x3c && area <= 0x58 && (v & 0xf) == 0 && (x == 44 || x == 45) &&
+        (z == 36 || z == 37)) {
+        norain_first(12, "map pins: a woods-tile row decided by the Rotted Woods rule");
+        return ((v >> 4) & 0xf) == 3;
+    }
+    return ((unsigned long long (*)(unsigned long long, unsigned *))(g_base + RVA_PIN_ROW_SHOWN))(type, id);
 }
 static unsigned long long hud_circle_state_hook(char *mgr, unsigned long long chr) {
     (void)mgr, (void)chr;
@@ -2323,17 +2384,31 @@ static void hook_acceptance(void) {
     hook_call(0x7cbf86, 0x68c5f0, (void *)hud_circle_state_hook, "no rain: health bar circle state (1)");
     hook_call(0x7cee41, 0x68c5f0, (void *)hud_circle_state_hook, "no rain: health bar circle state (2)");
     hook_call(0x69722c, 0x7c52f0, (void *)hud_circle_notice_hook, "no rain: circle notice skipped");
+    hook_call(0x65ff39, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (1)");
+    hook_call(0x6639c3, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (2)");
+    hook_call(0x664170, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (3)");
+    hook_call(0xef5cdd, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (4)");
+    hook_call(0x693ae8, 0x704cd0, (void *)asset_enable_hook, "no rain: circle far asset disabled (1)");
+    hook_call(0x693dc3, 0x704cd0, (void *)asset_enable_hook, "no rain: circle far asset disabled (2)");
+    hook_call(0x3e2a16, 0x68c500, (void *)outside_circle_hook, "no rain: no character outside the circle");
+    hook_call(0x911081, RVA_PIN_ROW_SHOWN, (void *)pin_row_shown_hook, "map pins: woods tiles by the Rotted Woods rule (pin loop)");
+    hook_call(0xa5bba1, RVA_PIN_ROW_SHOWN, (void *)pin_row_shown_hook, "map pins: woods tiles by the Rotted Woods rule (second row loop)");
     {
-        static const unsigned site[9] = {0x68e1d2, 0x68e1ea, 0x68e229, 0x68e208, 0x68e213, 0x68e21e, 0x7cbf86, 0x7cee41, 0x69722c},
-                              orig[9] = {0x696170, 0x698c90, 0x6953b0, 0x695f80, 0x692350, 0x694580, 0x68c5f0, 0x68c5f0, 0x7c52f0};
-        int n = 0;
-        for (int i = 0; i < 9; i++) {
+        static const unsigned site[18] = {0x68e1d2, 0x68e1ea, 0x68e229, 0x68e208, 0x68e213, 0x68e21e, 0x7cbf86, 0x7cee41, 0x69722c,
+                                         0x65ff39, 0x6639c3, 0x664170, 0xef5cdd, 0x693ae8, 0x693dc3, 0x3e2a16, 0x911081, 0xa5bba1},
+                              orig[18] = {0x696170, 0x698c90, 0x6953b0, 0x695f80, 0x692350, 0x694580, 0x68c5f0, 0x68c5f0, 0x7c52f0,
+                                          0x68b5c0, 0x68b5c0, 0x68b5c0, 0x68b5c0, 0x704cd0, 0x704cd0, 0x68c500, RVA_PIN_ROW_SHOWN, RVA_PIN_ROW_SHOWN};
+        int n = 0, pins = 0;
+        for (int i = 0; i < 18; i++) {
             unsigned char *c = (unsigned char *)g_base + site[i];
             int rel = (int)(orig[i] - (site[i] + 5));
-            n += c[0] == 0xE8 && memcmp(c + 1, &rel, 4) != 0;
+            int hooked = c[0] == 0xE8 && memcmp(c + 1, &rel, 4) != 0;
+            if (i < 16) n += hooked; else pins += hooked;
         }
-        logf("no rain: %s (%d of 9 hooks: play-area effect off after both circle updates; edge sound, rain around the player, rain along the edge, border effects and circle notice skipped; health bar circle state 0)",
-             n == 9 ? "in place" : "NOT complete", n);
+        logf("no rain: %s (%d of 16 hooks: play-area effect off after both circle updates; edge sound, rain around the player, rain along the edge, border effects and circle notice skipped; health bar circle state 0; weather side inside the circle (4); far asset disabled (2); no character outside the circle)",
+             n == 16 ? "in place" : "NOT complete", n);
+        logf("map pins: %s (%d of 2 hooks: woods tiles 44-45 x 36-37 show the Rotted Woods rows%s)", pins == 2 ? "in place" : "NOT complete", pins,
+             g_settings[S_ONE_REGION] >= 1 ? "; off for one-region" : "");
     }
     hook_call(0x5c92f0, 0xb8fc70, (void *)pickup_action_hook, "pickup: map item action (session byte)");
     InitializeCriticalSection(&g_flog_lock);
@@ -2341,8 +2416,8 @@ static void hook_acceptance(void) {
         for (unsigned i = 0; i < sizeof SFX_SITES / sizeof *SFX_SITES; i++) hook_call(SFX_SITES[i], 0xedce20, (void *)sfx_create_hook, "map-dump: effect creation log");
         hook_call(0x653ef4, 0x7019e0, (void *)asset_level_hook, "map-dump: circle giant asset log (1)");
         hook_call(0x654194, 0x7019e0, (void *)asset_level_hook, "map-dump: circle giant asset log (2)");
-        static const unsigned EN[] = {0x693ae8, 0x693dc3, 0x6942db, 0x69451e};
-        for (unsigned i = 0; i < 4; i++) hook_call(EN[i], 0x704cd0, (void *)asset_enable_hook, "map-dump: circle asset enable log");
+        static const unsigned EN[] = {0x6942db, 0x69451e};  // 0x693ae8 / 0x693dc3: hooked always (far asset)
+        for (unsigned i = 0; i < 2; i++) hook_call(EN[i], 0x704cd0, (void *)asset_enable_hook, "map-dump: circle asset enable log");
     }
     if (setting(S_FLAG_LOG) || setting(S_MAP_DUMP)) {
         hook_call(0x5e789d, 0x60d330, (void *)flag_store_hook, "flags: storage write (0x5e7740)");

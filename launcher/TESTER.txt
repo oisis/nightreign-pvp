@@ -23,10 +23,12 @@ Every expedition map has two Shifting Earth regions: the Mountaintop and the Rot
 screen shows both), and more HP flask charges at the start (at least 7 with every church).
 
 The closing circle has no rain: no falling rain, no rain damage, no rain sound, no notice when it
-starts to move, and no glowing border near you; the health bar keeps its colour outside it. The
-circle still closes as usual and the night boss comes as in the game. Known: the border may still
-show from far away, and your character turns purple outside the circle. The Rotted Woods' tree
-marker (from the treasure map) does not show on the map screen yet.
+starts to move and no border, near or far; your character and the health bar keep their colours
+outside it, and sites of grace outside it stay usable. The circle still closes as usual (the map
+screen shows it) and the night boss comes as in the game.
+
+The map screen shows the Rotted Woods' own markers on its part of the map: the place of the
+treasure map and, once you have picked it up, the tree with the reward.
 
 An invasion may end on a stuck loading screen or a crash; quit the game if it hangs.
 

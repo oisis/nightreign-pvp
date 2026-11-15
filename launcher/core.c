@@ -38,7 +38,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 16
+#define BUILD_FORMAT 17
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
                               "porbr", "rusru", "spaar", "spaes", "thath", "zhocn", "zhotw"};
@@ -866,105 +866,6 @@ static int no_rain(buf p) {
     return 1;
 }
 
-// Map pins on the woods tiles of the two-region map (measurements p20-203130 real Mountaintop, p34-201237 real Rotted
-// Woods, p22 / p8 merged; 08 §19-22). Which WorldMapPointParam rows get a map pin depends only on the map type, and
-// the selector (protected code) reads the row's content but not its flag fields, its icon (+0x14) or bit 1 of +0x3c
-// (run 40). Our maps are type 1, so on the four woods tiles the base-terrain rows get pins (the cave 64443601 ...).
-// Run 41 (p10-212330, measurement): a base row that takes a woods row's position (+0x20 / +0x24 / +0x28), flag fields
-// and icon keeps its pin (35 of 35), one that takes the woods content at its own position loses it (34 of 34); the
-// tree marker 64443630 shown that way (slot 64443601) opened and showed after the treasure map (1056304580) and closed
-// when the tree was used (9192), as in the game. So: for the woods rows without an attach point (+0x10 < 0; the three
-// trees among them) a base row of the same tile, also without one, takes those fields (PIN_MOVE). The other base rows
-// are made never visible through fields that leave the selector alone: every flag field 0 except +0xc = 7500 (on
-// from the day's start for the whole expedition, common ev 1100), bit 1 of +0x3c cleared (UpdateVisible 0x909450
-// needs it), icon 0. Woods rows with an attach point get no pin yet (UnlockMapPoint keys them by +0x10, which would
-// stay the base row's). The tables are our own data (row ids measured in those dumps).
-static const int PIN_MOVE[][2] = {  // {base row (keeps its pin), woods row whose position, flags and icon it takes}
-    {30101, 1591}, {61443600, 61443630}, {62443601, 61443695}, {63443600, 62443621},
-    {64443601, 64443630}, {64453651, 64900011}, {61443700, 61443730}, {61443703, 64443730},
-    {61443790, 64900010}, {60207, 64453620}, {61453690, 64453631}, {62453601, 64900014},
-    {1590, 1592}, {60206, 61453730}, {61453701, 61453795}, {61453790, 64453730},
-    {64423650, 64900012}, {64453710, 64900013},
-};
-static const int PIN_BASE_ROWS[] = {  // pinned on a Mountaintop map (p20-203130), not on a Rotted Woods map (p34-201237)
-    108, 109, 113, 114, 125, 126, 128, 307, 308, 312,
-    357, 358, 362, 507, 512, 513, 526, 529, 530, 546,
-    549, 550, 566, 569, 570, 586, 589, 590, 605, 639,
-    640, 641, 642, 643, 644, 651, 652, 653, 654, 655,
-    656, 704, 705, 706, 714, 715, 716, 762, 763, 806,
-    809, 810, 1586, 1589, 2108, 2109, 2113, 2114, 2125, 2126,
-    2128, 2307, 2308, 2312, 2357, 2358, 2362, 2507, 2512, 2513,
-    2526, 2529, 2530, 2546, 2549, 2550, 2566, 2569, 2570, 2586,
-    2589, 2590, 2605, 2639, 2640, 2641, 2642, 2643, 2644, 2651,
-    2652, 2653, 2654, 2655, 2656, 2704, 2705, 2706, 2714, 2715,
-    2716, 2762, 2763, 2806, 2809, 2810, 60200, 60208, 80104, 64443710,
-    64443711, 64453610, 64453611, 65443670, 65443770, 163000526, 163000529, 163000530, 163001526, 163001529,
-    163001530,
-};
-static u8 *wmp_row(buf p, int id, u64 *size) {
-    u32 count = rd16(p.p + 0x0A);
-    if (count < 2) return NULL;
-    *size = rd64(p.p + 0x40 + 24 + 8) - rd64(p.p + 0x40 + 8);
-    for (u32 i = 0; i < count; i++)
-        if ((int)rd32(p.p + 0x40 + i * 24) == id) return p.p + rd64(p.p + 0x40 + i * 24 + 8);
-    return NULL;
-}
-static int pin_hide_base_rows(buf p) {
-    static const unsigned short FLAGS[] = {4, 8, 0xc, 0x44, 0x48, 0x4c, 0x60, 0x64, 0x6c, 0x70};
-    u64 size = 0;
-    int nn = (int)(sizeof PIN_BASE_ROWS / sizeof *PIN_BASE_ROWS), nm = (int)(sizeof PIN_MOVE / sizeof *PIN_MOVE), trees = 0;
-    int ok = wmp_row(p, PIN_BASE_ROWS[0], &size) && size >= 0x74 && size <= 0x200;
-    if (!ok) return 0;
-    buf before = {xalloc(p.n), p.n};
-    memcpy(before.p, p.p, p.n);
-    for (int i = 0; ok && i < nm; i++) {
-        u8 *slot = wmp_row(p, PIN_MOVE[i][0], &size), *src = wmp_row(before, PIN_MOVE[i][1], &size);
-        ok = slot && src && slot[0x1c] == 60 && src[0x1c] == 60 && slot[0x1d] == src[0x1d] && slot[0x1e] == src[0x1e] &&
-             slot[0x1d] >= 44 && slot[0x1d] <= 45 && slot[0x1e] >= 36 && slot[0x1e] <= 37 && (int)rd32(slot + 0x10) < 0 &&
-             (int)rd32(src + 0x10) < 0;
-        for (int j = 0; ok && j < nm; j++)
-            if (j != i && (PIN_MOVE[j][0] == PIN_MOVE[i][0] || PIN_MOVE[j][1] == PIN_MOVE[i][1])) ok = 0;
-        for (int j = 0; ok && j < nn; j++)
-            if (PIN_BASE_ROWS[j] == PIN_MOVE[i][0] || PIN_BASE_ROWS[j] == PIN_MOVE[i][1]) ok = 0;
-        if (!ok) break;
-        trees += PIN_MOVE[i][1] == 64443630 || PIN_MOVE[i][1] == 64443730 || PIN_MOVE[i][1] == 64453730;
-        memcpy(slot + 0x20, src + 0x20, 12);
-        for (size_t k = 0; k < sizeof FLAGS / sizeof *FLAGS; k++) memcpy(slot + FLAGS[k], src + FLAGS[k], 4);
-        memcpy(slot + 0x14, src + 0x14, 4);
-    }
-    for (int i = 0; ok && i < nn; i++) {
-        u8 *r = wmp_row(p, PIN_BASE_ROWS[i], &size);
-        ok = r && r[0x1c] == 60 && r[0x1d] >= 44 && r[0x1d] <= 45 && r[0x1e] >= 36 && r[0x1e] <= 37 && (!i || PIN_BASE_ROWS[i] > PIN_BASE_ROWS[i - 1]);
-        if (!ok) break;
-        for (size_t k = 0; k < sizeof FLAGS / sizeof *FLAGS; k++) wr32(r + FLAGS[k], 0);
-        wr32(r + 0xc, 7500);
-        r[0x3c] &= (u8)~2;
-        wr32(r + 0x14, 0);
-    }
-    // only the listed rows changed, and only in the fields named above (position only in the PIN_MOVE base rows)
-    u32 count = rd16(p.p + 0x0A);
-    for (size_t at = 0; ok && at < p.n; at++) {
-        if (p.p[at] == before.p[at]) continue;
-        int listed = 0;
-        for (u32 i = 0; !listed && i < count; i++) {
-            u64 d = rd64(p.p + 0x40 + i * 24 + 8);
-            if (at < d || at >= d + size) continue;
-            int id = (int)rd32(p.p + 0x40 + i * 24), moved = 0, hidden = 0;
-            for (int j = 0; j < nm; j++) moved |= PIN_MOVE[j][0] == id;
-            for (int j = 0; j < nn; j++) hidden |= PIN_BASE_ROWS[j] == id;
-            u64 o = at - d;
-            int field = (o >= 0x14 && o < 0x18) || (hidden && o == 0x3c) || (moved && o >= 0x20 && o < 0x2c);
-            for (size_t k = 0; k < sizeof FLAGS / sizeof *FLAGS; k++) field |= o >= FLAGS[k] && o < FLAGS[k] + 4u;
-            listed = (moved || hidden) && field;
-        }
-        ok = listed;
-    }
-    free(before.p);
-    ok = ok && trees == 3;
-    if (ok) logf_("two-regions: map pins: %d woods rows shown through base rows of their tile (the three tree markers among them), %d base-terrain rows of the woods tiles never shown", nm, nn);
-    return ok;
-}
-
 // Slow clock (test sessions only): an empty file "slow-time" in work/native/ makes the profile set
 // the game's debug property Game.IngameTime.TimeScale to 7.29, a tenth of the expedition clock's
 // rate (GameSystemCommonParam +0x1bc = 72.9; the game reads the property in 0x140f884b0 and lets it
@@ -1490,6 +1391,32 @@ static buf map_test_table(buf src, int table, buf flags, buf points, int two) {
     if (!ok) { free(p.p); return none; }
     return p;
 }
+// Check only (build log): buried-treasure chest groups whose site lies on a woods tile. common_func 90015100 called
+// from common.emevd with (group flag, site flag, ...) turns every site of a group on when the group flag (a pattern
+// record flag) is set; the site's base-terrain map row (WorldMapPointParam, eventFlagId1 = site) gives its tile. Of the
+// groups 8000..8011, these have one site on 44-45 x 36-37 (our own table, from those scripts and rows): the group
+// keeps its other sites on a merged map, so it is kept; the line only counts the slots that carry such a group.
+static const int CHEST_WOODS[][3] = {{8000, 9111, 4436}, {8001, 9110, 4537}, {8004, 9110, 4537},
+                                     {8005, 9111, 4436}, {8010, 9110, 4537}, {8011, 9111, 4436}};
+static void chest_group_report(buf flags) {
+    int per[6] = {0}, slots = 0;
+    u32 count = rd16(flags.p + 0x0A);
+    static unsigned char seen[TWO_PATTERNS];
+    memset(seen, 0, sizeof seen);
+    for (u32 i = 0; i < count; i++) {
+        const u8 *row = flags.p + rd64(flags.p + 0x40 + i * 24 + 8);
+        int pat = (int)rd32(row + 4), flag = (int)rd32(row + 0x10);
+        if (!merged_slot(pat)) continue;
+        for (int g = 0; g < 6; g++)
+            if (flag == CHEST_WOODS[g][0]) per[g]++, slots += !seen[pat], seen[pat] = 1;
+    }
+    char line[400];
+    int at = snprintf(line, sizeof line, "two-regions: check: chest groups with a site on a woods tile (kept, the other sites stay): %d merged slots;", slots);
+    for (int g = 0; g < 6; g++)
+        at += snprintf(line + at, sizeof line - (size_t)at, " %d (site %d on %d_%d) x%d", CHEST_WOODS[g][0], CHEST_WOODS[g][1],
+                       CHEST_WOODS[g][2] / 100, CHEST_WOODS[g][2] % 100, per[g]);
+    logf_("%s", line);
+}
 // The map-test tables, changed (maps[t].p stays empty for a table left alone); 0 if one fails.
 static int map_tables(buf bundle, int index[4], buf maps[4]) {
     static const char *const NAMES[4] = {"\\LotResultMapPatternFlag.param", "\\LotResultPlayAreaParam.param",
@@ -1504,6 +1431,7 @@ static int map_tables(buf bundle, int index[4], buf maps[4]) {
         if (!(maps[t] = map_test_table(bnd4_file(bundle, index[t]), t, bnd4_file(bundle, index[0]), bnd4_file(bundle, ap), two)).p) return 0;
     }
     if (two) {
+        chest_group_report(maps[0]);
         int d = bnd4_find(bundle, "\\SmallBaseAndSpotDefine.param");
         if (d < 0 || !write_churches(bnd4_file(bundle, d), maps[2])) return 0;
     }
@@ -1528,7 +1456,7 @@ static int build_regulation(const char *game_dir) {
         return free(enc.p), logf_("regulation.bin is not in the expected format"), 0;
     buf bundle = {xalloc((size_t)usize + (1 << 17)), usize};
     buf patched = {0}, body = {0}, param = {0}, speffect = {0}, step = {0}, maps[4] = {{0}}, cur = {0};
-    int ok = 0, index, sp_index, npc_index, area_index, wmp_index, map_index[4] = {-1, -1, -1, -1};
+    int ok = 0, index, sp_index, npc_index, area_index, map_index[4] = {-1, -1, -1, -1};
     u8 *team_row = NULL;
     if (nr_zstd_decompress(dcx + 0x4C, csize, bundle.p, (size_t)usize + (1 << 17)) != usize) {
         logf_("regulation.bin could not be unpacked");
@@ -1543,9 +1471,6 @@ static int build_regulation(const char *game_dir) {
         logf_("The game's NpcParam looks different than expected. The game may have been updated; the mod needs an update too.");
     } else if ((area_index = bnd4_find(bundle, PLAY_AREA_PARAM)) < 0 || !no_rain(bnd4_file(bundle, area_index))) {
         logf_("The game's PlayAreaCreateCommonParam looks different than expected. The game may have been updated; the mod needs an update too.");
-    } else if (two_regions_wanted() && ((wmp_index = bnd4_find(bundle, "\\WorldMapPointParam.param")) < 0 ||
-                                         !pin_hide_base_rows(bnd4_file(bundle, wmp_index)))) {
-        logf_("The game's WorldMapPointParam looks different than expected; the map pins of the two-region map cannot be set. The game may have been updated; the mod needs an update too.");
     } else if (!map_tables(bundle, map_index, maps)) {
         logf_("The game's map pattern tables look different than expected; the two-region maps cannot be built. The game may have been updated; the mod needs an update too.");
     } else {
