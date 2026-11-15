@@ -841,6 +841,14 @@ static int our_speffect_active(char *chr);
 // invasion (in the host's world), and the host hides every character that has once carried our effect
 // in this session.
 static int g_join_in_world(void);
+// Allies (setting "ally" on the joiner): the same join, without our team effect, so the joiner keeps the base
+// team 2 both machines give a remote player (0x3d77d0) and the game's relation 2 <-> 2 is Friend (table
+// 0x14398d410). Each joiner writes its role into its Steam lobby member data (nrpvp_role); a member without one
+// counts as an invader, as before. Rules that were "someone is in my session" now ask for an invader in it.
+static int g_as_ally;                       // joiner: this join is as an ally
+static int g_invader_in_world(void);        // joined as an invader and in the host's world
+static int side_count(int want_allies);     // remote session members that are allies / invaders (not the host)
+static int member_no_is_invader(int no);    // a remote session member with this player number is an invader
 #define FINISH_GUARD_MS 10000  // ponytail: a guess at death animation + fade; the bleed-out death was never timed
 // decision 23: the invader's reward for a won invasion. Provisional amount (the user sets the real one).
 #define REWARD_MURK 5000
@@ -908,7 +916,7 @@ static char *hud_lookup_hook(void *wcm, unsigned long long *id) {
     // 0x7ceca0 (lookup 0x7ced59) draws the party panel from the seven slots 0x7da8b0 fills (CSFeMan
     // +0xcf28, 0x98 each): a slot is drawn while its +0 (shown) or +0x90 (kept) flag is set, so hiding
     // the lookup in 0x7da8b0 alone left a kept slot on screen. On the invader both flags go to 0.
-    if (site == 0x7ced59 && (g_join_in_world() || (me && !IsBadReadPtr(me, 0x200) && our_speffect_active(me) == 1))) {
+    if (site == 0x7ced59 && (g_invader_in_world() || (me && !IsBadReadPtr(me, 0x200) && our_speffect_active(me) == 1))) {
         char *fe = *(char **)(g_base + 0x3c14a70);
         if (fe && !IsBadReadPtr(fe + 0xcf28, 7 * 0x98))
             for (int i = 0; i < 7; i++) fe[0xcf28 + i * 0x98] = 0, fe[0xcf28 + i * 0x98 + 0x90] = 0;
@@ -944,7 +952,7 @@ static char *hud_lookup_hook(void *wcm, unsigned long long *id) {
                 ((unsigned char *(*)(void *, unsigned char *))(g_base + 0x3d1b30))(c, &tm);
                 logf("name test: tag %lld: byte +0x35 now %02x (team %u, state %d)", idx, b35, tm, !IsBadReadPtr(c, 0x740) ? (unsigned char)c[0x710] : -1);
             }
-            if (g_join_in_world()) {
+            if (g_invader_in_world()) {
                 char num[8];
                 int pn = *(int *)((char *(*)(void *, void *))(g_base + 0x66c6f0))(c, num);
                 if (pn == (g_host_player_no >= 0 ? g_host_player_no : 1) && b35) {
@@ -961,7 +969,7 @@ static char *hud_lookup_hook(void *wcm, unsigned long long *id) {
     // (run 15: an empty lookup here drops the whole tag, the HP bar with it: 0x7c8a90 fills a tag's HP,
     // name and render only for a found character. Not filtered any more; the over-head name comes back.)
     if (c && c != me && party) {
-        int invading = g_join_in_world() || (me && !IsBadReadPtr(me, 0x200) && our_speffect_active(me) == 1);
+        int invading = g_invader_in_world() || (me && !IsBadReadPtr(me, 0x200) && our_speffect_active(me) == 1);
         if (invading) out = NULL;
         else if (site == 0x7daaa4 || site == 0x7ced59) {
             for (int i = 0; i < 4; i++)
@@ -1203,7 +1211,7 @@ static float gscp_u16(unsigned off) {
     return p && *p ? (float)*(unsigned short *)(*p + off) : 0;
 }
 static int finish_side_ok(char *chr) {  // a down of this local character counts as by the other side
-    return chr && chr == local_player() && (our_speffect_active(chr) == 1 || g_host_switched);
+    return chr && chr == local_player() && (our_speffect_active(chr) == 1 || side_count(0) > 0);
 }
 static void finish_down_hook(char *chr, char state, float t) {
     ((void (*)(char *, char, float))(g_base + 0x66f3b0))(chr, state, t);
@@ -1255,7 +1263,7 @@ static void finish_hit_hook(char *chr, char *attacker, char *hit) {
     if (setting(S_REVIVE_HITS) && chr && chr == local_player() && !IsBadReadPtr(chr, 0x740) && chr[0x710] == 1 && before > 0 &&
         *(float *)(chr + 0x714) < before && attacker && attacker != chr && !IsBadReadPtr(attacker, 0x200)) {
         int victim_invader = our_speffect_active(chr) == 1, attacker_invader = our_speffect_active(attacker) == 1;
-        if (victim_invader || g_host_switched) {
+        if (victim_invader || side_count(0) > 0) {
             int other = victim_invader ? !attacker_invader : attacker_invader;
             unsigned count = (unsigned char)chr[0x730];
             float cap = gscp_float(count <= 1 ? 0x380 : count == 2 ? 0x384 : 0x388), left = before - cap * (other ? 0.55f : 0.2f);
@@ -1283,7 +1291,7 @@ static void finish_hit_hook(char *chr, char *attacker, char *hit) {
     if (!chr || chr != local_player() || IsBadReadPtr(chr, 0x740) || chr[0x710] != 1 || *(float *)(chr + 0x714) > 0) return;
     int ok_attacker = attacker && attacker != chr && !IsBadReadPtr(attacker, 0x200);
     int by_other = our_speffect_active(chr) == 1 ? ok_attacker && our_speffect_active(attacker) != 1
-                                                 : g_host_switched && ok_attacker && our_speffect_active(attacker) == 1;
+                                                 : side_count(0) > 0 && ok_attacker && our_speffect_active(attacker) == 1;
     if (!by_other) {
         logf("finish test: gauge emptied by a team-mate: left to the game (stand-up)");
         return;
@@ -1487,10 +1495,8 @@ static void map_list_draw(const char *where, char *ctl, char *list, int selected
         for (int i = 0; b && b + i < e && i < 8; i++) {
             char *pin = b[i];
             if (!pin || IsBadReadPtr(pin, 0x20) || !pin[0xc]) continue;
-            int hide = g_join_in_world();
-            if (!hide)
-                for (char *x = mb; mb && x < me && !IsBadReadPtr(x, SM_PLAYER_SIZE); x += SM_PLAYER_SIZE)
-                    if (!x[0xe1] && *(int *)(x + 0xd4) == *(int *)(pin + 0x1c)) hide = 1;
+            int hide = g_invader_in_world() || member_no_is_invader(*(int *)(pin + 0x1c));
+            (void)mb, (void)me;
             if (!hide) continue;
             pins[n] = pin, saved[n++] = pin[0xc];
             pin[0xc] = 0;
@@ -1500,7 +1506,7 @@ static void map_list_draw(const char *where, char *ctl, char *list, int selected
         if (n && (int)(GetTickCount() - next[w]) >= 0) {
             next[w] = GetTickCount() + 5000;
             logf("marker test: map screen (call at %s): %d other-player pin(s) left out of the list draw (%s)", where, n,
-                 g_join_in_world() ? "invader: all" : "host: the invader");
+                 g_invader_in_world() ? "invader: all" : "host / ally: the invaders");
         }
     }
     ((void (*)(char *, char *, int, float, float, unsigned long long))(g_base + 0xace8e0))(ctl, list, selected, f3, f5, b6);
@@ -1568,8 +1574,8 @@ static void marker_clear(void) {
     marker_apply(0);
 }
 static void marker_apply(int map_rule) {
-    int invader = g_join_in_world();
-    if (!invader && !g_host_switched) return;
+    int invader = g_invader_in_world();
+    if (!invader && !g_host_switched && !g_join_in_world()) return;
     char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
     char *mb = sm ? *(char **)(sm + SM_PLAYERS_BEGIN) : NULL, *me = sm ? *(char **)(sm + SM_PLAYERS_BEGIN + 8) : NULL;
     if (invader) host_player_no_update(mb, me);
@@ -1590,9 +1596,7 @@ static void marker_apply(int map_rule) {
                 }
                 hide = map_rule || no != host_no;
             }
-            else
-                for (char *x = mb; mb && x < me && !IsBadReadPtr(x, SM_PLAYER_SIZE); x += SM_PLAYER_SIZE)
-                    if (!x[0xe1] && *(int *)(x + 0xd4) == no) hide = 1;
+            else hide = member_no_is_invader(no);
             if (!hide) continue;
             static DWORD next[3];
             if ((int)(GetTickCount() - next[k]) >= 0) {
@@ -3160,6 +3164,9 @@ static DWORD g_request_tick;  // when the last start request arrived
 #define LOBBY_POS_KEY    "nrpvp_pos"     // host's position "x,y,z" from the game's getter 0x3d0fd0
 #define LOBBY_GEN_KEY    "nrpvp_gen"     // host's generator results gm +0xb48,+0xb54,+0xb5c (hex)
 #define LOBBY_START_KEY  "nrpvp_start"   // host's expedition start block (game manager +0xa74), 8 hex digits
+#define LOBBY_ALLY_FREE_KEY "nrpvp_ally_free"  // free places in the host's squad for allies (squad of three)
+#define LOBBY_ROLE_KEY   "nrpvp_role"    // a joiner's own lobby member data: "ally" or "invader"
+#define SQUAD_MAX        3               // the game's squad
 #define LOBBY_EQUAL      0               // ELobbyComparison
 #define LOBBY_WORLDWIDE  3               // ELobbyDistanceFilter
 #define LOBBY_MATCH_LIST 510             // LobbyMatchList_t::k_iCallback (500 + 10; LobbyCreated_t is 513)
@@ -3186,6 +3193,8 @@ static struct {  // optional, for steam_watch
     u64 (*owner)(void *, u64);
     u64 (*member)(void *, u64, int);
     unsigned char (*p2p)(void *, u64, void *);
+    void (*set_member)(void *, u64, const char *, const char *);        // SetLobbyMemberData (own data)
+    const char *(*get_member)(void *, u64, u64, const char *);         // GetLobbyMemberData
 } g_diag;
 static int steam_ready(void) {
     static int state;  // 0 not tried, 1 ready, -1 failed
@@ -3228,6 +3237,9 @@ static int steam_ready(void) {
         g_diag.owner = (void *)GetProcAddress(m, "SteamAPI_ISteamMatchmaking_GetLobbyOwner");
         g_diag.member = (void *)GetProcAddress(m, "SteamAPI_ISteamMatchmaking_GetLobbyMemberByIndex");
         g_diag.p2p = (void *)GetProcAddress(m, "SteamAPI_ISteamNetworking_GetP2PSessionState");
+        g_diag.set_member = (void *)GetProcAddress(m, "SteamAPI_ISteamMatchmaking_SetLobbyMemberData");
+        g_diag.get_member = (void *)GetProcAddress(m, "SteamAPI_ISteamMatchmaking_GetLobbyMemberData");
+        if (!g_diag.set_member || !g_diag.get_member) logf("steam: lobby member data not exported: every joiner counts as an invader");
         if (!g_diag.user || !g_diag.net || !g_diag.logged_on || !g_diag.self || !g_diag.owner || !g_diag.member || !g_diag.p2p)
             logf("steam: connection log incomplete (an export is missing)");
     }
@@ -3381,7 +3393,7 @@ static void other_down_watch(const char *side) {
         int st = (unsigned char)c[0x710];
         if (chr_[i] != c) chr_[i] = c, last_[i] = st;
         else if (st != last_[i]) {
-            if (last_[i] == 1 && st == 0 && g_join_in_world() && our_speffect_active(c) != 1) g_host_killed = 1;
+            if (last_[i] == 1 && st == 0 && g_invader_in_world() && our_speffect_active(c) != 1) g_host_killed = 1;
             logf("finish test (%s): other player %d (%s): downed state %d -> %d%s", side, i,
                  our_speffect_active(c) == 1 ? "the invader" : "not ours", last_[i], st, last_[i] == 1 && st == 0 ? " (died)" : "");
             last_[i] = st;
@@ -3393,7 +3405,8 @@ static void host_death_watch(void) {
     static int last = -1;
     char *chr = local_player();
     int now = chr && !IsBadReadPtr(chr, 0x740) ? (unsigned char)chr[0x710] : -1;
-    if (1 && g_host_switched && last == 1 && now == 0) {
+    // with an ally in the session the squad lives on: left to the game (its own rule for a dead squad member)
+    if (1 && g_host_switched && side_count(0) > 0 && side_count(1) == 0 && last == 1 && now == 0) {
         ((void (*)(void))(g_base + 0x6af8f0))();
         char *gm = *(char **)(g_base + 0x3c13258);
         logf("finish test: local player died with an invader admitted: expedition end requested (gm+0xaf1 = %u)",
@@ -3568,6 +3581,37 @@ static void host_player_no_update(char *mb, char *me) {  // the member whose Ste
     for (char *x = mb; owner && mb && x < me && !IsBadReadPtr(x, SM_PLAYER_SIZE); x += SM_PLAYER_SIZE)
         if (!x[0xe1] && *(u64 *)(x + 0x10) == owner) g_host_player_no = *(int *)(x + 0xd4);
 }
+// The lobby this machine is in: its own (host) or the one it joined.
+static u64 our_lobby(void) { return g_lobby ? g_lobby : g_candidate; }
+static int member_ally(u64 lobby, u64 id) {
+    const char *r = g_diag.get_member && g_steam.mm && lobby ? g_diag.get_member(g_steam.mm, lobby, id, LOBBY_ROLE_KEY) : NULL;
+    return r && !strcmp(r, "ally");
+}
+// Remote session members other than the session host (the lobby owner): allies (want_allies 1) or invaders (0;
+// a member without a role is an invader). Recounted at most every 250 ms.
+static int side_count(int want_allies) {
+    static DWORD at;
+    static int n[2];
+    if (GetTickCount() - at < 250) return n[want_allies != 0];
+    at = GetTickCount(), n[0] = n[1] = 0;
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
+    u64 lobby = our_lobby(), owner = lobby && g_diag.owner && g_steam.mm ? g_diag.owner(g_steam.mm, lobby) : 0;
+    char *b = sm ? *(char **)(sm + SM_PLAYERS_BEGIN) : NULL, *e = sm ? *(char **)(sm + SM_PLAYERS_BEGIN + 8) : NULL;
+    for (char *x = b; b && x < e && !IsBadReadPtr(x, SM_PLAYER_SIZE); x += SM_PLAYER_SIZE) {
+        u64 id = *(u64 *)(x + 0x10);
+        if (x[0xe1] || (owner && id == owner)) continue;
+        n[member_ally(lobby, id)]++;
+    }
+    return n[want_allies != 0];
+}
+static int member_no_is_invader(int no) {
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
+    u64 lobby = our_lobby(), owner = lobby && g_diag.owner && g_steam.mm ? g_diag.owner(g_steam.mm, lobby) : 0;
+    char *b = sm ? *(char **)(sm + SM_PLAYERS_BEGIN) : NULL, *e = sm ? *(char **)(sm + SM_PLAYERS_BEGIN + 8) : NULL;
+    for (char *x = b; b && x < e && !IsBadReadPtr(x, SM_PLAYER_SIZE); x += SM_PLAYER_SIZE)
+        if (!x[0xe1] && *(int *)(x + 0xd4) == no) return !(owner && *(u64 *)(x + 0x10) == owner) && !member_ally(lobby, *(u64 *)(x + 0x10));
+    return 0;
+}
 static int g_join_test;    // invader: join-test setting, taken when the search started
 static unsigned g_squad;   // host: the expedition's squad size, fixed when the lobby is first marked
 
@@ -3625,19 +3669,30 @@ static void lobby_mark(void) {
     host_member_sync(sm);
     int in_lobby = g_steam.members(g_steam.mm, g_lobby);
     g_someone_joining = in_lobby > (int)members;
-    unsigned key = members | (unsigned)(in_lobby & 0xff) << 8;
+    // Allies and invaders by their lobby member data (members still joining included; no role = invader).
+    unsigned allies = 0, others = 0;
+    u64 self = g_diag.self && g_diag.user ? g_diag.self(g_diag.user) : 0;
+    for (int i = 0; g_diag.member && i < in_lobby && i < 16; i++) {
+        u64 id = g_diag.member(g_steam.mm, g_lobby, i);
+        if (!id || id == self) continue;
+        if (member_ally(g_lobby, id)) allies++;
+        else others++;
+    }
+    unsigned key = members | (unsigned)(in_lobby & 0xff) << 8 | allies << 16;
     if (key == g_marked_squad) return;
     g_marked_squad = key;
-    unsigned invaders = members > g_squad ? members - g_squad : 0;
-    unsigned joining = in_lobby > (int)members ? (unsigned)in_lobby - members : 0, allowed = invaders_allowed(g_squad);
-    unsigned free_slots = allowed > invaders + joining ? allowed - invaders - joining : 0;
+    unsigned squad = g_squad + allies, allowed = invaders_allowed(squad);
+    unsigned free_slots = allowed > others ? allowed - others : 0, ally_free = SQUAD_MAX > squad ? SQUAD_MAX - squad : 0;
     char text[16];
-    snprintf(text, sizeof text, "%u", g_squad);
+    snprintf(text, sizeof text, "%u", squad);
     lobby_set(LOBBY_SQUAD_KEY, text);
     snprintf(text, sizeof text, "%u", free_slots);
     lobby_set(LOBBY_FREE_KEY, text);
-    logf("host: lobby members %d of %d; session members %u = squad %u + invaders %u, joining %u, free invader slots %u",
-         in_lobby, g_steam.limit(g_steam.mm, g_lobby), members, g_squad, invaders, joining, free_slots);
+    snprintf(text, sizeof text, "%u", ally_free);
+    lobby_set(LOBBY_ALLY_FREE_KEY, text);
+    logf("host: lobby members %d of %d; session members %u; squad %u (%u + allies %u), invaders and joiners without a role %u; "
+         "free invader slots %u, free ally places %u", in_lobby, g_steam.limit(g_steam.mm, g_lobby), members, squad, g_squad, allies,
+         others, free_slots, ally_free);
 }
 
 // One lobby list request at a time, every SEARCH_PERIOD_MS: the invader every idle frame while
@@ -3683,12 +3738,13 @@ static int lobby_search_frame(const char *who) {
         const char *free = g_steam.get_data(g_steam.mm, id, LOBBY_FREE_KEY), *proto = g_steam.get_data(g_steam.mm, id, LOBBY_PROTO_KEY);
         const char *block = g_steam.get_data(g_steam.mm, id, LOBBY_BLOCK_KEY), *pos = g_steam.get_data(g_steam.mm, id, LOBBY_POS_KEY);
         logf("%s:   lobby %llu: host block '%s' pos '%s'", who, id, block ? block : "?", pos ? pos : "?");
-        int own = id == g_lobby && g_lobby, slots = free ? atoi(free) : 0;
+        const char *afree = g_steam.get_data(g_steam.mm, id, LOBBY_ALLY_FREE_KEY);
+        int own = id == g_lobby && g_lobby, slots = g_as_ally ? (afree ? atoi(afree) : 0) : free ? atoi(free) : 0;
         int fits = !own && slots > 0 && game && !strcmp(game, LOBBY_GAME);
         // GetLobbyData gives "" for a key that is not set.
         logf("%s:   lobby %llu: proto '%s' game '%s' squad '%s' free '%s', members %d of %d -> %s", who, id, proto ? proto : "?",
              game ? game : "?", squad ? squad : "?", free ? free : "?", g_steam.members(g_steam.mm, id),
-             g_steam.limit(g_steam.mm, id), own ? "our own lobby" : fits ? "has a free invader slot" : "no slot for us");
+             g_steam.limit(g_steam.mm, id), own ? "our own lobby" : fits ? (g_as_ally ? "has a free ally place" : "has a free invader slot") : "no slot for us");
         if (fits && !chosen) chosen = id;  // Steam sorts by distance: the first that fits
     }
     if (chosen) logf("%s: %s lobby %llu", who, g_join_test ? "candidate" : "would join (join-test is off)", chosen);
@@ -3739,7 +3795,8 @@ static void join_test_start(void) {
     g_join = 0;
     g_candidate = 0;
     g_join_test = g_enter_test = g_move_test = 1;  // "Invasion" always joins (no switches since 14c271a)
-    logf("join: search started, the first candidate is joined; controller +0x10d %d",
+    g_as_ally = setting(S_ALLY) != 0;
+    logf("join: search started as %s, the first candidate is joined; controller +0x10d %d", g_as_ally ? "an ALLY (setting ally)" : "an invader",
          g_qm_ctrl ? (unsigned char)g_qm_ctrl[QM_CTRL_REFUSED] : -1);
 }
 // Every frame while joining: one line per change of the session's state, with ms since the call.
@@ -3916,8 +3973,9 @@ static void join_over(const char *why) {
             int host_left = strstr(why, "host migration") || strstr(why, "no longer a client");
             const char *kind = died ? "lost: the invader died" : g_host_killed ? "won: the host was killed"
                              : host_left ? "won: the host left the expedition" : "neither: the session broke off";
-            g_reward_pending = !died && (g_host_killed || host_left) ? 1 : 2;
-            logf("reward test: invasion %s (%s): reward at the expedition's end: %d murk", kind, why,
+            g_reward_pending = g_as_ally ? 0 : !died && (g_host_killed || host_left) ? 1 : 2;
+            if (g_as_ally) logf("reward test: ally: the expedition's own result (%s)", why);
+            if (!g_as_ally) logf("reward test: invasion %s (%s): reward at the expedition's end: %d murk", kind, why,
                  g_reward_pending == 1 ? REWARD_MURK : REWARD_MURK_LOST);
         }
         {
@@ -3994,6 +4052,10 @@ static void join_frame(void) {
         if (state == 6) {
             g_join = 2;
             g_join_tick = GetTickCount();
+            if (g_diag.set_member && g_steam.mm) {
+                g_diag.set_member(g_steam.mm, g_candidate, LOBBY_ROLE_KEY, g_as_ally ? "ally" : "invader");
+                logf("join: lobby member data %s=%s set", LOBBY_ROLE_KEY, g_as_ally ? "ally" : "invader");
+            }
             if (g_enter_test) {
                 g_join = 4;
                 g_enter_tick = GetTickCount();
@@ -4192,6 +4254,7 @@ static int g_invasion_ended;  // the invasion itself ended (not just a search): 
 #define MOVE_LOAD_WAIT_MS  60000
 #define MOVE_SCENE_WAIT_MS 90000
 static int g_join_in_world(void) { return g_join == 4 && g_enter_world; }
+static int g_invader_in_world(void) { return g_join_in_world() && !g_as_ally; }
 static void enter_watch(char *sm) {
     static int last[14] = {-9, -9, -9, -9, -9, -9, -9, -9, -9, -9, -9, -9, -9, -9};
     char *sync = *(char **)(sm + SM_INIT_SYNC), *gm = *(char **)(g_base + RVA_GAME_MAN_PTR), *chr = local_player();
@@ -4300,7 +4363,11 @@ static void enter_watch(char *sm) {
     // only after that does its loss count as the invader's death.
     static int reapplied;
     if (!g_enter_world) reapplied = 0;
-    if (g_enter_effect && chr && !reapplied && nowt - applied < 5000 && nowt - applied > 300 && our_speffect_active(chr) == 0) {
+    if (g_as_ally && g_enter_world && !g_enter_effect) {
+        g_enter_effect = -1;  // allies: no team effect (base team 2, Friend to the host's 2); death is the game's own
+        team_log("enter test, ally: no team effect");
+    }
+    if (g_enter_effect > 0 && chr && !reapplied && nowt - applied < 5000 && nowt - applied > 300 && our_speffect_active(chr) == 0) {
         reapplied = 1;
         ((void (*)(void *, int, unsigned char))(g_base + RVA_ADD_SPEFFECT))(chr, TEAM_TEST_SPEFFECT, 0);
         applied = nowt;
@@ -4336,7 +4403,7 @@ static void enter_watch(char *sm) {
     if (1) name_watch(sm, "invader", g_enter_world != 0), slot_hp_watch("invader"), other_downed_watch("invader");
     // finish-test guard: the stand-up was refused and the timer set to 0, but the character is still
     // down 10 s later (the behaviour did not take its death): the invader counts as dead.
-    if (g_enter_effect && chr && chr == g_finish_chr && g_finish_invader && g_finish_tick && chr[0x710] == 1 &&
+    if (g_enter_effect > 0 && chr && chr == g_finish_chr && g_finish_invader && g_finish_tick && chr[0x710] == 1 &&
         nowt - g_finish_tick > FINISH_GUARD_MS) {
         logf("finish test: still down %u s after the refused stand-up: the invader counts as dead", FINISH_GUARD_MS / 1000);
         g_finish_tick = 0, g_finish_chr = NULL;
@@ -4344,7 +4411,7 @@ static void enter_watch(char *sm) {
         join_over("invader died (finished while down)");
         return;
     }
-    if (g_enter_effect && chr && nowt - applied > 5000 && our_speffect_active(chr) == 0) {
+    if (g_enter_effect > 0 && chr && nowt - applied > 5000 && our_speffect_active(chr) == 0) {
         team_log("enter test, team effect gone");
         g_invasion_ended = 1;
         join_over("invader died (team effect removed)");

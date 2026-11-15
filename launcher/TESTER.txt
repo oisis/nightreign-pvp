@@ -18,6 +18,10 @@ Optional test settings are in test-settings.toml next to the launcher (all false
                checking item pickup; back to false afterwards.
   test-level   Test. A number (0 = off, up to 15): your own expedition sets your level to it 5 s
                after the start, for faster boss tests. Not while invading.
+  ally         Test, the joining player only. true: "Invasion" in the Roundtable Hold joins the
+               host's running expedition as an ally (a squad member: no red colour, the host's
+               team, no invasion reward) instead of as an invader. The host needs no setting; up
+               to two allies per host (squad of three), and invaders can still come on top.
 
 Every expedition map has two Shifting Earth regions: the Mountaintop and the Rotted Woods (the map
 screen shows both), and more HP flask charges at the start (at least 7 with every church).

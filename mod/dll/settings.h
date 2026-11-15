@@ -6,10 +6,10 @@
 #include <stddef.h>
 #include <string.h>
 
-enum { S_TEAM_TEST, S_SLOW_TIME, S_FULL_SYNC, S_LOOT_TEST, S_DEBUG_LOG, S_NO_HOST, S_TEST_LEVEL, S_FLAG_LOG, S_MAP_DUMP, S_MAP_GROUP, S_ONE_REGION, S_BOSS_FLOW, S_REVIVE_HITS, S_NO_SPRINT, S_ULT_PVP, S_PAIR, SETTINGS_COUNT };
+enum { S_TEAM_TEST, S_SLOW_TIME, S_FULL_SYNC, S_LOOT_TEST, S_DEBUG_LOG, S_NO_HOST, S_TEST_LEVEL, S_FLAG_LOG, S_MAP_DUMP, S_MAP_GROUP, S_ONE_REGION, S_BOSS_FLOW, S_REVIVE_HITS, S_NO_SPRINT, S_ULT_PVP, S_PAIR, S_ALLY, SETTINGS_COUNT };
 static const char *const SETTING_NAMES[SETTINGS_COUNT] = {"team-test", "slow-time", "full-sync", "loot-test",
                                                           "debug-log", "no-host", "test-level", "flag-log",
-                                                          "map-dump", "map-group", "one-region", "boss-flow", "revive-hits", "no-sprint", "ult-pvp", "pair"};
+                                                          "map-dump", "map-group", "one-region", "boss-flow", "revive-hits", "no-sprint", "ult-pvp", "pair", "ally"};
 // Keys of settings that became fixed behaviour or were dropped; old files may still have them: skipped silently.
 // (no-rain: decision 27, the rain outside the circle never does damage. two-regions, map-test-control, map-region,
 // map-pair-a / -b: every map is a Mountaintop + Rotted Woods map now (decision 35). no-circle: to be redone.)
