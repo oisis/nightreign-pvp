@@ -4718,6 +4718,50 @@ static char *speffect_entry(char *chr, unsigned id) {  // the active entry of Sp
     ((void (*)(void *, unsigned))(g_base + RVA_SPEFFECT_ROW))(&ref, id);
     return effect_entry_of(chr, ref.row);
 }
+
+// No sprint, second half: the script also puts our character into the sprint without ExecSprintStart, by
+// SetVariable('MoveSpeedIndex', 3) in Departure_FallEnd_onActivate / onUpdate and BirdAct_FallEnd_onUpdate (after a
+// hawk landing), Sprint180_onActivate and SpeedUpdate pc 446 / 463; while the index is 3 the sprint lasts as long as
+// the character moves (Update pc 454-611 keeps it). The script's SetVariable is act(148, name, value). HKS `act`
+// (0x141624140) calls the pointer at 0x14467afe8 (set to 0x140d40310 by 0x140d400b0): it takes the owner from
+// 0x1415c93c0(L), the id with 0x140d405d0(L, 1) and passes ((*owner)+0x28) to the handler. We wrap that pointer:
+// for act 148 "MoveSpeedIndex" = 3 on our own character (owner's +0x28 is the local player; checked, not assumed:
+// counted in the log) the value on the HKS stack becomes 2 (run) before the game's handler reads it. Stack layout
+// from 0x14167dc40 (push number) and 0x141676f10: slots of 16 bytes from L+0x50, type at +0 (3 = number), float
+// at +8. Name from 0x14167bc80(L, 2, 0) (the hkbSetVariable binding reads its name the same way).
+static int (*g_act_real)(void *);
+static volatile LONG g_act_seen, g_act_ours, g_act_cut;
+static int act_wrap(void *L) {
+    if (setting(S_NO_SPRINT) && L && !IsBadReadPtr((char *)L + 0x48, 16)) {
+        char *base = *(char **)((char *)L + 0x50), *top = *(char **)((char *)L + 0x48);
+        if (base && top >= base + 3 * 16 && *(unsigned *)base == 3 && *(float *)(base + 8) == 148.0f && *(unsigned *)(base + 32) == 3 &&
+            *(float *)(base + 40) == 3.0f) {
+            const char *nm = ((const char *(*)(void *, int, void *))(g_base + 0x167bc80))(L, 2, NULL);
+            if (nm && !strcmp(nm, "MoveSpeedIndex")) {
+                InterlockedIncrement(&g_act_seen);
+                void **x = ((void **(*)(void *))(g_base + 0x15c93c0))(L);
+                char *o = x && !IsBadReadPtr(x, 8) && *x && !IsBadReadPtr((char *)*x + 0x28, 8) ? *(char **)((char *)*x + 0x28) : NULL;
+                char *me = local_player();
+                if (o && o == me) InterlockedIncrement(&g_act_ours), InterlockedIncrement(&g_act_cut), *(float *)(base + 40) = 2.0f;
+            }
+        }
+    }
+    return g_act_real(L);
+}
+static void act_wrap_tick(void) {  // run thread: put the wrapper in (again, if the game set the pointer anew)
+    void **slot = (void **)(g_base + 0x467afe8);
+    if (*slot == (void *)(g_base + 0xd40310)) {
+        g_act_real = (int (*)(void *))*slot;
+        *slot = (void *)act_wrap;
+        logf("no sprint: HKS act wrapped (MoveSpeedIndex 3 -> 2 on our character)");
+    }
+    static DWORD next;
+    if (g_act_seen && (int)(GetTickCount() - next) >= 0) {
+        next = GetTickCount() + 30000;
+        logf("no sprint: SetVariable MoveSpeedIndex = 3 seen %ld times, %ld on our character (set to 2)", g_act_seen, g_act_ours);
+        g_act_seen = g_act_ours = 0;
+    }
+}
 static double sqrt_approx(double x) {  // no math.h here (its logf clashes with ours)
     if (x <= 0) return 0;
     double r = x > 1 ? x : 1;
@@ -6419,6 +6463,7 @@ static DWORD WINAPI run(LPVOID self) {
         code_patch_check();
         level_watch();
         lag_tick();
+        if (setting(S_NO_SPRINT)) act_wrap_tick();
         if (1) marker_tick();
         if (1) finish_tick();
     }
