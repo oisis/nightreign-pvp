@@ -62,7 +62,7 @@ static const char *const KEY_LINES[] = {
     "host: session up", "host: expedition reached", "host: expedition over", "host: member admitted", "role: ",
     "host: no member left", "leave done", "join: search started", "joining lobby", "join -> ", "stopping (",
     "in the host's world", "world sync at step", "invasion won", "invasion lost", "invasion neither", "level: ", "map test", "two-regions", "expedition: result", "reward test: won", "reward test: lost",
-    "expedition end requested", "flags: ", "lag: ", "map test",  "still down", "watchdog", "no map load", "went back", "code patch", "crash"};
+    "expedition end requested", "flags: ", "lag: ", "move check: ", "map test",  "still down", "watchdog", "no map load", "went back", "code patch", "crash"};
 static void logf(const char *fmt, ...) {
     char line[1024];
     va_list ap;
@@ -4718,6 +4718,12 @@ static char *speffect_entry(char *chr, unsigned id) {  // the active entry of Sp
     ((void (*)(void *, unsigned))(g_base + RVA_SPEFFECT_ROW))(&ref, id);
     return effect_entry_of(chr, ref.row);
 }
+static double sqrt_approx(double x) {  // no math.h here (its logf clashes with ours)
+    if (x <= 0) return 0;
+    double r = x > 1 ? x : 1;
+    for (int i = 0; i < 40; i++) r = 0.5 * (r + x / r);
+    return r;
+}
 static void no_sprint_frame(void) {
     if (!setting(S_NO_SPRINT)) return;
     char *chr = local_player();
@@ -4726,6 +4732,37 @@ static void no_sprint_frame(void) {
     static int seen_on, frames, added;
     int on = speffect_on(chr, NO_SPRINT_SPEFFECT);
     frames++, seen_on += on;
+    // Movement check for "running all the time": the local character's ground speed each frame (position from
+    // 0x3d0e60, x/z), counted in bands for 15 s, with how often the marker was on. Walk, run and sprint speeds
+    // come from animation root motion, not from code: the bands are to be read against a plain-game test (walk,
+    // full-tilt run, button sprint) on the same machine. Frames above 30 m/s (warps, block changes) are skipped.
+    {
+        static float last[4];
+        static double last_t, next_move;
+        static int band[6], moving, marker_frames, sampled;
+        static float top;
+        float pos[4];
+        double t = lag_ms();
+        ((float *(*)(char *, float *))(g_base + 0x3d0e60))(chr, pos);
+        if (last_t > 0 && t > last_t) {
+            float dx = pos[0] - last[0], dz = pos[2] - last[2];
+            double v = sqrt_approx(dx * dx + dz * dz) / ((t - last_t) / 1000.0);
+            if (v < 30) {
+                int k = v < 0.5 ? 0 : v < 2 ? 1 : v < 4 ? 2 : v < 6 ? 3 : v < 8 ? 4 : 5;
+                band[k]++, sampled++, marker_frames += on;
+                if (k) moving++;
+                if (v > top) top = (float)v;
+            }
+        }
+        memcpy(last, pos, sizeof last), last_t = t;
+        if (!next_move) next_move = t + 15000;
+        if (t >= next_move) {
+            if (moving)
+                logf("move check: %d frames, marker %d %d of them; ground speed m/s: still %d, 0.5-2 %d, 2-4 %d, 4-6 %d, 6-8 %d, 8+ %d, top %.1f",
+                     sampled, NO_SPRINT_SPEFFECT, marker_frames, band[0], band[1], band[2], band[3], band[4], band[5], top);
+            memset(band, 0, sizeof band), moving = marker_frames = sampled = 0, top = 0, next_move = t + 15000;
+        }
+    }
     // Run 44: on in 21 of 42 frames when added only while off: an added copy is still there at this point one frame
     // later and gone the next, so it lives through one effect update. Added every frame, a copy is always there
     // (at most two at once, each ends by itself). ponytail: the effect update's order against the script is not read.
