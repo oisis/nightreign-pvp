@@ -92,6 +92,7 @@ static void logf(const char *fmt, ...) {
 // a static buffer and a one-shot guard. No paths and no ids: modules by base name only.
 static LPTOP_LEVEL_EXCEPTION_FILTER g_prev_filter;
 static volatile LONG g_crash_once;
+static int g_ff_hooked;  // bit 0 import slot, bit 1 the pointer at 0x142bc21f0
 static char g_crash_buf[8192];
 static size_t g_crash_at;
 static char *g_dll_base;
@@ -140,6 +141,44 @@ static int fatal_code(DWORD c) {
     }
     return 0;
 }
+static volatile DWORD g_last_frame;  // GetTickCount() at the last step hook (game thread), 0 before the first
+static void cb_stack(unsigned long long *sp, unsigned long long *top) {  // return addresses into the game or our DLL
+    int found = 0;
+    for (int i = 0; sp + i < top && i < 4096 && found < 24; i++) {
+        unsigned long long v = sp[i];
+        int ours = (v >= (unsigned long long)g_base && v < (unsigned long long)g_base + g_exe_size) ||
+                   (g_dll_base && v >= (unsigned long long)g_dll_base && v < (unsigned long long)g_dll_base + g_dll_size);
+        if (ours) cb_str(" "), cb_addr(v), found++;
+    }
+    cb_str("\n");
+}
+static void cb_dec(unsigned v) {
+    char d[12];
+    int n = 0;
+    do d[n++] = (char)('0' + v % 10), v /= 10; while (v && n < 11);
+    while (n) { char c[2] = {d[--n], 0}; cb_str(c); }
+}
+static void cb_frame(const char *hms) {  // how long ago the game's last frame tick was
+    cb_str(hms), cb_str("crash: last frame tick ");
+    if (g_last_frame) cb_dec(GetTickCount() - g_last_frame), cb_str(" ms ago\n");
+    else cb_str("none yet\n");
+}
+static void cb_flush(void) {
+    HANDLE h = CreateFileA(log_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD w;
+        WriteFile(h, g_crash_buf, (DWORD)g_crash_at, &w, NULL);
+        FlushFileBuffers(h);
+        CloseHandle(h);
+    }
+}
+static void cb_hms(char hms[10]) {
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    hms[0] = (char)('0' + t.wHour / 10), hms[1] = (char)('0' + t.wHour % 10), hms[2] = ':', hms[3] = (char)('0' + t.wMinute / 10);
+    hms[4] = (char)('0' + t.wMinute % 10), hms[5] = ':', hms[6] = (char)('0' + t.wSecond / 10), hms[7] = (char)('0' + t.wSecond % 10);
+    hms[8] = ' ', hms[9] = 0;
+}
 static void crash_write(EXCEPTION_POINTERS *ep) {
     EXCEPTION_RECORD *r = ep->ExceptionRecord;
     CONTEXT *c = ep->ContextRecord;
@@ -163,21 +202,9 @@ static void crash_write(EXCEPTION_POINTERS *ep) {
     // return addresses on the stack that point into the game or our DLL, from rsp up to the stack's base
     unsigned long long *sp = (unsigned long long *)c->Rsp, *top = (unsigned long long *)((NT_TIB *)NtCurrentTeb())->StackBase;
     cb_str(hms), cb_str("crash: stack");
-    int found = 0;
-    for (int i = 0; sp + i < top && i < 4096 && found < 24; i++) {
-        unsigned long long v = sp[i];
-        int ours = (v >= (unsigned long long)g_base && v < (unsigned long long)g_base + g_exe_size) ||
-                   (g_dll_base && v >= (unsigned long long)g_dll_base && v < (unsigned long long)g_dll_base + g_dll_size);
-        if (ours) cb_str(" "), cb_addr(v), found++;
-    }
-    cb_str("\n");
-    HANDLE h = CreateFileA(log_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h != INVALID_HANDLE_VALUE) {
-        DWORD w;
-        WriteFile(h, g_crash_buf, (DWORD)g_crash_at, &w, NULL);
-        FlushFileBuffers(h);
-        CloseHandle(h);
-    }
+    cb_stack(sp, top);
+    cb_frame(hms);
+    cb_flush();
 }
 static volatile LONG g_crash_inside;
 static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
@@ -202,6 +229,67 @@ static void crash_watch(void) {  // our filter stays on top; one replacing it is
         g_crash_buf[g_crash_at] = 0;
         logf("crash logger: another unhandled-exception filter (%s) was put in; ours is on top again and calls it", g_crash_buf);
     }
+}
+
+// Fast fail: on real Windows the CRT ends the process with int 0x29 (__fastfail), which reaches no exception
+// filter or handler, so it left no record. Every fast-fail path of the game's CRT asks IsProcessorFeaturePresent(23)
+// (PF_FASTFAIL_AVAILABLE) right before int 0x29: __report_gsfailure 0x142691050 (code 2, stack cookie), the
+// __fastfail wrapper 0x142691138, 0x142691a80, abort 0x1426cb855 (code 7), invalid parameter 0x14269ccc0 (code 5);
+// without fast fail they set the filter to NULL, call UnhandledExceptionFilter and TerminateProcess(0xc0000409)
+// (0x14269101a / 0x1472d664b), again past ours. So the import slot (and the pointer 0x142bc21f0 the last two call
+// through, when it holds the same function) goes through pf_hook: feature 23 writes one record, then the real call.
+static BOOL (WINAPI *g_pf_real)(DWORD);
+static volatile DWORD g_ff_tick;  // when pf_hook wrote its record (the run thread checks the process went on)
+static BOOL WINAPI pf_hook(DWORD feature) {
+    if (feature == 23 && !InterlockedExchange(&g_crash_once, 1)) {
+        char hms[10];
+        cb_hms(hms);
+        g_crash_at = 0;
+        cb_str(hms), cb_str("crash: fast fail next (the game's CRT asked for PF_FASTFAIL_AVAILABLE; int 0x29 or TerminateProcess follows), called from ");
+        cb_addr((unsigned long long)__builtin_return_address(0)), cb_str(" thread "), cb_hex(GetCurrentThreadId()), cb_str("\n");
+        cb_str(hms), cb_str("crash: stack");
+        cb_stack((unsigned long long *)__builtin_frame_address(0), (unsigned long long *)((NT_TIB *)NtCurrentTeb())->StackBase);
+        cb_frame(hms);
+        cb_flush();
+        g_ff_tick = GetTickCount() | 1;
+    }
+    return g_pf_real(feature);
+}
+static void fastfail_install(void) {  // DllMain: import slot and the second pointer, same function only
+    HMODULE k = GetModuleHandleA("kernel32.dll");
+    void *real = k ? (void *)GetProcAddress(k, "IsProcessorFeaturePresent") : NULL;
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew);
+    IMAGE_DATA_DIRECTORY dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    void **slots[2] = {NULL, (void **)(g_base + 0x2bc21f0)};
+    for (IMAGE_IMPORT_DESCRIPTOR *d = (IMAGE_IMPORT_DESCRIPTOR *)(g_base + dir.VirtualAddress); dir.VirtualAddress && d->Name && !slots[0]; d++) {
+        IMAGE_THUNK_DATA64 *names = (IMAGE_THUNK_DATA64 *)(g_base + d->OriginalFirstThunk);
+        for (size_t i = 0; d->OriginalFirstThunk && names[i].u1.Ordinal && !slots[0]; i++)
+            if (!IMAGE_SNAP_BY_ORDINAL64(names[i].u1.Ordinal) &&
+                !strcmp(((IMAGE_IMPORT_BY_NAME *)(g_base + names[i].u1.Ordinal))->Name, "IsProcessorFeaturePresent"))
+                slots[0] = (void **)(g_base + d->FirstThunk) + i;
+    }
+    for (int i = 0; i < 2; i++) {
+        DWORD old;
+        if (!slots[i] || IsBadReadPtr(slots[i], 8)) continue;
+        void *cur = *slots[i];
+        if (cur == (void *)pf_hook) { g_ff_hooked |= 1 << i; continue; }
+        if (i == 1 && cur != real && cur != (void *)g_pf_real) continue;  // only when it is the same function
+        if (!VirtualProtect(slots[i], 8, PAGE_READWRITE, &old)) continue;
+        if (!g_pf_real) g_pf_real = (BOOL(WINAPI *)(DWORD))cur;
+        *slots[i] = (void *)pf_hook;
+        VirtualProtect(slots[i], 8, old, &old);
+        g_ff_hooked |= 1 << i;
+    }
+}
+// Exit line (DLL_PROCESS_DETACH, written the same allocation-free way): process exit or unload. No line and no
+// crash record = the process was ended from outside (TerminateProcess, killed) or died where we cannot see.
+static void exit_line(int process_exit) {
+    char hms[10];
+    cb_hms(hms);
+    g_crash_at = 0;
+    cb_str(hms), cb_str(process_exit ? "exit: the game process is ending normally (DLL detach at process exit)\n" : "exit: our DLL is unloaded (FreeLibrary)\n");
+    cb_frame(hms);
+    cb_flush();
 }
 
 // Test settings: test-settings.toml next to the DLL (the launcher writes it at every start from the
@@ -5893,6 +5981,7 @@ static int cursor_on_invasion(char *dialog);
 static char *g_dialog;
 static DWORD g_request_tick;
 static void step_hook(void *ctrl, void *time, int step) {
+    g_last_frame = GetTickCount();
     if (1) marker_clear();
     static int last_seen_start = -1;
     if (step == QM_STEP_NONE) last_seen_start = -1;
@@ -6271,10 +6360,22 @@ static DWORD WINAPI run(LPVOID self) {
         hook_eac_begin();
         hook_acceptance();
     }
-    logf("crash logger: unhandled-exception filter in place (fatal codes only, chained to the one before)");
+    fastfail_install();  // again: the second pointer may be filled only after DllMain
+    logf("crash logger: unhandled-exception filter in place (fatal codes only, chained to the one before); fast-fail record %s "
+         "(import slot %d, CRT pointer %d); exit line at DLL detach", g_ff_hooked ? "on" : "NOT on", g_ff_hooked & 1, g_ff_hooked >> 1 & 1);
     for (int tick = 0;; tick++) {
         Sleep(250);
         if (tick % 4 == 0) crash_watch();
+        if (g_ff_tick && GetTickCount() - g_ff_tick > 2000) {  // the record above was not followed by an end
+            g_ff_tick = 0, g_crash_once = 0;
+            logf("crash watch: the fast-fail check of the record above was not followed by an end; record armed again");
+        }
+        {  // one line per stall: no frame tick for more than 10 s while the game had been ticking
+            static int stalled;
+            DWORD last = g_last_frame, gap = last ? GetTickCount() - last : 0;
+            if (gap > 10000 && !stalled) stalled = 1, logf("crash watch: no frame tick for %lu s (a loading screen can do this too)", gap / 1000);
+            if (gap < 1000) stalled = 0;
+        }
         guard_intact();
         watch_network();
         watch_session();
@@ -6287,7 +6388,6 @@ static DWORD WINAPI run(LPVOID self) {
 }
 
 BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved) {
-    (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(self);
         // Log next to the DLL, so it is easy to find from outside the game.
@@ -6296,6 +6396,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved) {
         if (dot) strcpy(dot, ".log");
         g_base = (char *)GetModuleHandleA(NULL);
         crash_install(self);
+        if (((IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew))->FileHeader.TimeDateStamp == GAME_TIMESTAMP) fastfail_install();
         IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew);
         // The guard goes in first, here rather than in run(): this runs before me3 lets the game go
         // on, while run() starts only later, alongside the game's own start-up.
@@ -6310,6 +6411,8 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved) {
             if (1) finish_relation_patch();
         }
         CreateThread(NULL, 0, run, self, 0, NULL);
+    } else if (reason == DLL_PROCESS_DETACH) {
+        exit_line(reserved != NULL);
     }
     return TRUE;
 }
