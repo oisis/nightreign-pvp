@@ -4724,25 +4724,33 @@ static char *speffect_entry(char *chr, unsigned id) {  // the active entry of Sp
 // hawk landing), Sprint180_onActivate and SpeedUpdate pc 446 / 463; while the index is 3 the sprint lasts as long as
 // the character moves (Update pc 454-611 keeps it). The script's SetVariable is act(148, name, value). HKS `act`
 // (0x141624140) calls the pointer at 0x14467afe8 (set to 0x140d40310 by 0x140d400b0): it takes the owner from
-// 0x1415c93c0(L), the id with 0x140d405d0(L, 1) and passes ((*owner)+0x28) to the handler. We wrap that pointer:
-// for act 148 "MoveSpeedIndex" = 3 on our own character (owner's +0x28 is the local player; checked, not assumed:
-// counted in the log) the value on the HKS stack becomes 2 (run) before the game's handler reads it. Stack layout
-// from 0x14167dc40 (push number) and 0x141676f10: slots of 16 bytes from L+0x50, type at +0 (3 = number), float
-// at +8. Name from 0x14167bc80(L, 2, 0) (the hkbSetVariable binding reads its name the same way).
+// 0x1415c93c0(L), the id with 0x140d405d0(L, 1) and calls the handler 0x140407ff0 (registered by 0x140d7df96 through
+// 0x140d585b0). We wrap that pointer: for act 148 "MoveSpeedIndex" = 3 on our own character (see act_wrap for the
+// chain to the ChrIns) the value on the HKS stack becomes 2 (run) before the game reads it. Stack layout from
+// 0x14167dc40 (push number) and 0x141676f10: slots of 16 bytes from L+0x50, type at +0 (3 = number), float at +8.
+// Name from 0x140d40640(L, 2), as act 148 in the dispatcher 0x1403f5870 reads it.
 static int (*g_act_real)(void *);
-static volatile LONG g_act_seen, g_act_ours, g_act_cut;
+static volatile LONG g_act_seen, g_act_ours;
 static int act_wrap(void *L) {
     if (setting(S_NO_SPRINT) && L && !IsBadReadPtr((char *)L + 0x48, 16)) {
         char *base = *(char **)((char *)L + 0x50), *top = *(char **)((char *)L + 0x48);
         if (base && top >= base + 3 * 16 && *(unsigned *)base == 3 && *(float *)(base + 8) == 148.0f && *(unsigned *)(base + 32) == 3 &&
             *(float *)(base + 40) == 3.0f) {
-            const char *nm = ((const char *(*)(void *, int, void *))(g_base + 0x167bc80))(L, 2, NULL);
+            const char *nm = ((const char *(*)(void *, int))(g_base + 0xd40640))(L, 2);  // as act 148 reads it
             if (nm && !strcmp(nm, "MoveSpeedIndex")) {
                 InterlockedIncrement(&g_act_seen);
+                // The character the act works on, by the game's own chain: 0x140d40310 passes r8 = *(owner+0) +0x28
+                // (owner = 0x1415c93c0(L)); the handler 0x140407ff0 takes obj = [[r8+0x1b8]+0x10]+0x10 and calls
+                // the dispatcher 0x1403f5870(obj, id, L), whose act 2002 adds a SpEffect with 0x1403c7fd0(*obj, ..)
+                // and act 148 (CSBehaviorScriptAct::_SetVariable) writes into (*obj)+0x1b8 -> +0x28: *obj is the
+                // ChrIns. We compare that same *obj with the local player.
                 void **x = ((void **(*)(void *))(g_base + 0x15c93c0))(L);
-                char *o = x && !IsBadReadPtr(x, 8) && *x && !IsBadReadPtr((char *)*x + 0x28, 8) ? *(char **)((char *)*x + 0x28) : NULL;
-                char *me = local_player();
-                if (o && o == me) InterlockedIncrement(&g_act_ours), InterlockedIncrement(&g_act_cut), *(float *)(base + 40) = 2.0f;
+                char *r8 = x && !IsBadReadPtr(x, 8) && *x && !IsBadReadPtr((char *)*x + 0x28, 8) ? *(char **)((char *)*x + 0x28) : NULL;
+                char *m = r8 && !IsBadReadPtr(r8 + 0x1b8, 8) ? *(char **)(r8 + 0x1b8) : NULL;
+                char *m2 = m && !IsBadReadPtr(m + 0x10, 8) ? *(char **)(m + 0x10) : NULL;
+                char **obj = m2 && !IsBadReadPtr(m2 + 0x10, 8) ? *(char ***)(m2 + 0x10) : NULL;
+                char *chr = obj && !IsBadReadPtr(obj, 8) ? *obj : NULL;
+                if (chr && chr == local_player()) InterlockedIncrement(&g_act_ours), *(float *)(base + 40) = 2.0f;
             }
         }
     }
