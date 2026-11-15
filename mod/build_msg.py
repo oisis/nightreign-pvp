@@ -25,6 +25,7 @@ OUR_TEXT = {
         # (the DLL puts them in place of "Begin expedition (n players)").
         131164: ("Cancel invasion", "Anuluj najazd"),
         131166: ("Begin invasion", "Rozpocznij najazd"),
+        131167: ("Waiting for the squad's host...", "Oczekiwanie na hosta drużyny..."),  # party: the host is not in the field yet
     },
 }
 

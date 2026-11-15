@@ -57,6 +57,7 @@ static const struct { u32 id; const char *english, *polish; } OUR_TEXT[] = {
     {131163, "Invasion search cancelled", "Anulowano szukanie najazdu"},
     {131164, "Cancel invasion", "Anuluj najazd"},
     {131166, "Begin invasion", "Rozpocznij najazd"},
+    {131167, "Waiting for the squad's host...", "Oczekiwanie na hosta dru\xc5\xbcyny..."},
 };
 #define OUR_TEXT_COUNT (sizeof OUR_TEXT / sizeof *OUR_TEXT)
 
