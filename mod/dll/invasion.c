@@ -4460,7 +4460,7 @@ static int lobby_search_frame(const char *who) {
         if (nfit > 1 && chosen) logf("%s: %d hosts with a free place: lobby %llu taken (host level %ld)", who, nfit, chosen, best_lvl);
     }
     version_result(chosen != 0);
-    if (counts_in_hub() && setting(S_SHOW_COUNTS)) counts_from_list(result.matching);
+    if (counts_in_hub()) counts_from_list(result.matching);
     if (chosen) logf("%s: %s lobby %llu", who, g_join_test ? "candidate" : "would join (join-test is off)", chosen);
     else logf("%s: no lobby to join", who);
     g_candidate = chosen;
@@ -6193,18 +6193,6 @@ static void host_expedition(int step) {
 // In the hub (the local player's map block 0x0a......, m10 the Roundtable Hold) at most every 30 s through its own
 // list request while no search is running; a running search's result is counted instead (counts_from_list).
 static DWORD g_count_tick;
-static int g_ov_mode;  // what the overlay bitmap holds: 0 nothing, 1 the hub counts, 2 the expedition ping
-static unsigned short g_counts_line[3][128];  // the last counts, drawn again when the hub comes back
-static int g_counts_have;
-static int menu_wtext(int id, unsigned short *out, int cap) {  // a CL_MenuText line as UTF-16 (its game string is not freed)
-    static _Alignas(16) char text[0x100];
-    char *t = ((char *(*)(void *, int))(g_base + RVA_MENU_TEXT_CTOR))(text, id);
-    const unsigned short *w = t && *(unsigned short **)t ? *(unsigned short **)t : t ? *(unsigned short **)(t + 0x10) : NULL;
-    int m = 0;
-    for (; w && !IsBadReadPtr(w + m, 2) && w[m] && m < cap - 1; m++) out[m] = w[m];
-    out[m] = 0;
-    return m;
-}
 static void counts_from_list(unsigned n) {
     int in_game = 0, looking = 0, waiting = 0;
     for (unsigned i = 0; i < n && i < 50; i++) {
@@ -6220,16 +6208,17 @@ static void counts_from_list(unsigned n) {
     static int last[3] = {-1, -1, -1};
     if (in_game == last[0] && looking == last[1] && waiting == last[2]) return;
     last[0] = in_game, last[1] = looking, last[2] = waiting;
-    unsigned short (*line)[128] = g_counts_line;
+    static _Alignas(16) char text[3][0x100];
+    static unsigned short line[3][128];
     const unsigned short *lines[3];
     int value[3] = {in_game, looking, waiting};
     for (int k = 0; k < 3; k++) {
-        unsigned short tpl[128];
-        menu_wtext(131172 + k, tpl, 128);
+        char *t = ((char *(*)(void *, int))(g_base + RVA_MENU_TEXT_CTOR))(text[k], 131172 + k);
+        const unsigned short *tpl = t && *(unsigned short **)t ? *(unsigned short **)t : t ? *(unsigned short **)(t + 0x10) : NULL;
         char num[12];
         snprintf(num, sizeof num, "%d", value[k]);
         int m = 0;
-        for (int i = 0; tpl[i] && i < 100 && m < 120; i++) {
+        for (int i = 0; tpl && !IsBadReadPtr(tpl + i, 2) && tpl[i] && i < 100 && m < 120; i++) {
             if (tpl[i] == '%' && tpl[i + 1] == 'd') {
                 for (const char *a = num; *a && m < 120; a++) line[k][m++] = (unsigned char)*a;
                 i++;
@@ -6239,85 +6228,20 @@ static void counts_from_list(unsigned n) {
         lines[k] = line[k];
     }
     logf("counts: squads in an expedition %d, looking for a player %d, hosts waiting in the hub %d", in_game, looking, waiting);
-    g_counts_have = 1;
-    if (counts_in_hub()) ov_set_lines(lines, 3), g_ov_mode = 1;
-}
-// Ping to the other side in an expedition (show-ping): on the host's side one line per invader, on an invader one
-// for the host and one per ally ("Najeźdźca: 34 ms", numbered when there are two). Our echo per member (lag_thread):
-// the last answer, "— ms" when none came for 5 s. Side by lobby member data (owner and "ally" = host's side). Once a
-// second, redrawn only on change; nothing shown with no member of the other side.
-static void ping_overlay_tick(int force) {
-    static DWORD next;
-    static unsigned short last[3][64];
-    static int last_n = -1;
-    if (!force && (int)(GetTickCount() - next) < 0) return;
-    next = GetTickCount() + 1000;
-    u64 lobby = our_lobby(), owner = lobby && g_steam.mm && g_diag.owner ? g_diag.owner(g_steam.mm, lobby) : 0;
-    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
-    char *b = sm && owner ? *(char **)(sm + SM_PLAYERS_BEGIN) : NULL, *e = b ? *(char **)(sm + SM_PLAYERS_BEGIN + 8) : NULL;
-    int we_invader = g_join == 4 && !g_as_ally, kind[3], rtt[3], n = 0, of_kind[3] = {0};
-    for (int pass = 0; pass < 3; pass++)  // 0 host, 1 allies, 2 invaders: the host first on an invader's screen
-        for (char *m = b; b && m < e && n < 3 && !IsBadReadPtr(m, SM_PLAYER_SIZE); m += SM_PLAYER_SIZE) {
-            u64 id = *(u64 *)(m + 0x10);
-            if (m[0xe1] || !id) continue;
-            int k = id == owner ? 0 : member_ally(lobby, id) ? 1 : 2;
-            if (k != pass || (k == 2) == we_invader) continue;  // the other side only
-            struct lag_peer *p = lag_find(id);
-            kind[n] = k, rtt[n] = p && p->rtt_last_ok ? p->rtt_shown : -1, of_kind[k]++, n++;
-        }
-    static unsigned short label[3][40];  // the three labels, read once (each read builds a game string)
-    static int labels;
-    if (n && !labels) labels = 1, menu_wtext(131175, label[0], 40), menu_wtext(131176, label[1], 40), menu_wtext(131177, label[2], 40);
-    unsigned short line[3][64];
-    const unsigned short *lines[3];
-    int seen[3] = {0};
-    for (int i = 0; i < n; i++) {
-        int m = 0;
-        while (label[kind[i]][m]) line[i][m] = label[kind[i]][m], m++;
-        char tail[24];
-        seen[kind[i]]++;
-        if (of_kind[kind[i]] > 1) snprintf(tail, sizeof tail, " %d: ", seen[kind[i]]);
-        else snprintf(tail, sizeof tail, ": ");
-        for (int c = 0; tail[c] && m < 56; c++) line[i][m++] = (unsigned char)tail[c];
-        if (rtt[i] < 0) line[i][m++] = 0x2014;  // em dash: no answer
-        else {
-            snprintf(tail, sizeof tail, "%d", rtt[i]);
-            for (int c = 0; tail[c] && m < 58; c++) line[i][m++] = (unsigned char)tail[c];
-        }
-        line[i][m++] = ' ', line[i][m++] = 'm', line[i][m++] = 's', line[i][m] = 0;
-        lines[i] = line[i];
-    }
-    int same = n == last_n && g_ov_mode == (n ? 2 : 0);
-    for (int i = 0; same && i < n; i++) same = !memcmp(last[i], line[i], sizeof line[i]);
-    if (same && !force) return;
-    last_n = n;
-    memcpy(last, line, sizeof line);
-    if (n) ov_set_lines(lines, n), g_ov_mode = 2;
-    else ov_hide(), g_ov_mode = 0;
+    ov_set_lines(lines, 3);
 }
 static int counts_in_hub(void) {
     char *me = local_player();
     unsigned blk = me && !IsBadReadPtr(me + CHR_BLOCK_ID, 4) ? *(unsigned *)(me + CHR_BLOCK_ID) : 0;
     return me && (blk >> 24) == 0x0a && !g_in_expedition && g_join != 4;
 }
-static void counts_tick(void) {  // game thread (step hook): hub counts, expedition ping, else nothing
-    if (g_ov_off) return;
+static void counts_tick(void) {  // game thread (step hook)
+    if (!setting(S_SHOW_COUNTS) || g_ov_off) return;
     if (!counts_in_hub()) {
-        if (g_in_exped && setting(S_SHOW_PING)) ping_overlay_tick(g_ov_mode == 1);
-        else if (g_ov_mode) ov_hide(), g_ov_mode = 0;
+        ov_hide();
         return;
     }
-    if (!setting(S_SHOW_COUNTS)) {
-        if (g_ov_mode) ov_hide(), g_ov_mode = 0;
-        return;
-    }
-    if (g_ov_mode != 1) {  // back in the hub: the last counts again
-        if (g_counts_have) {
-            const unsigned short *lines[3] = {g_counts_line[0], g_counts_line[1], g_counts_line[2]};
-            ov_set_lines(lines, 3);
-        } else ov_hide();
-        g_ov_mode = 1;
-    }
+    if (!g_ov.shown && g_ov.has_text) g_ov.shown = 1;  // back in the hub: the last counts again
     if (!steam_ready()) return;
     DWORD now = GetTickCount();
     if (!g_count_call) {

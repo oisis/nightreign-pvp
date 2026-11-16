@@ -58,9 +58,6 @@ static const struct { u32 id; const char *english, *polish; } OUR_TEXT[] = {
     {131172, "Squads in an expedition: %d", "Dru\xc5\xbcyny w wyprawie: %d"},  // counts overlay (%d: the DLL)
     {131173, "Squads looking for a player: %d", "Dru\xc5\xbcyny szukaj\xc4\x85" "ce gracza: %d"},
     {131174, "Hosts waiting in the hub: %d", "Hosty czekaj\xc4\x85" "ce w Twierdzy: %d"},
-    {131175, "Host", "Host"},  // expedition ping overlay labels (the DLL adds ": N ms")
-    {131176, "Ally", "Sojusznik"},
-    {131177, "Invader", "Naje\xc5\xba" "d\xc5\xba" "ca"},
     {131160, "Invasion", "Najazd"},
     {131161, "Enter another squad's expedition as an invader.\nDefeat its host to win.",
              "Wejd\xc5\xba do wyprawy innej dru\xc5\xbcyny jako naje\xc5\xba" "d\xc5\xba" "ca.\n"
