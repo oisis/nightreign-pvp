@@ -62,7 +62,7 @@ static const char *const KEY_LINES[] = {
     "host: session up", "host: expedition reached", "host: expedition over", "host: member admitted", "role: ",
     "host: no member left", "leave done", "join: search started", "joining lobby", "join -> ", "stopping (",
     "in the host's world", "world sync at step", "invasion won", "invasion lost", "invasion neither", "level: ", "map test", "two-regions", "expedition: result", "reward test: won", "reward test: lost",
-    "expedition end requested", "flags: ", "lag: ", "move check: ", "map pin: ", "name tag: ", "map test",  "still down", "watchdog", "no map load", "went back", "code patch", "crash"};
+    "expedition end requested", "flags: ", "lag: ", "move check: ", "map pin: ", "name tag: ", "scaling: ", "map test",  "still down", "watchdog", "no map load", "went back", "code patch", "crash"};
 static void logf(const char *fmt, ...) {
     char line[1024];
     va_list ap;
@@ -1083,6 +1083,8 @@ static char *g_hud_invaders[4];
 static unsigned long long pin_read_73(void *a, unsigned long long *sender, void *buf);
 static unsigned long long pin_read_74(void *a, unsigned long long *sender, void *buf);
 static void remote_tags_hook(void *a, void *b, void *c, void *d);
+static int squad_count_hook(void);
+static void squad_count_tick(void);
 static int g_host_switched, g_host_old_dc;
 // Who ends a session: every readable call of the session leave (0xdf1180, 44 call sites) and of the
 // client's role-1 timeout leave (0xdf5840) is logged with its call site (the return address) and
@@ -2919,6 +2921,9 @@ static void hook_acceptance(void) {
         hook_call(0xba11e6, 0xddb900, (void *)pin_read_74, "map pin: pin reaction read (1)");
         hook_call(0xba130c, 0xddb900, (void *)pin_read_74, "map pin: pin reaction read (2)");
         hook_call(0xc3bb92, 0x7d9f80, (void *)remote_tags_hook, "name tag: over-head names");
+        hook_call(0x3db2b9, 0x519660, (void *)squad_count_hook, "scaling: player count (apply)");
+        hook_call(0x3c7ee8, 0x519660, (void *)squad_count_hook, "scaling: player count (re-apply check)");
+        hook_call(0x3d2d3d, 0x519660, (void *)squad_count_hook, "scaling: player count (creation)");
     }
     hook_call(0xc27a41, 0x6b06f0, (void *)map_request_hook, "two-regions: map request");
     hook_call(0x5e7ff6, 0x6ab300, (void *)tile_flag_space_hook, "two-regions: tile flag space");
@@ -4845,6 +4850,47 @@ static void remote_tags_hook(void *a, void *b, void *c, void *d) {
         }
     }
 }
+
+// Stage 1 (team play): invaders do not count toward enemy scaling. The game's count 0x140519660 = DAT_143c0f320 if > 0
+// (debug), else max(1, members of the session, gm+0xdf6); 0x1403db250 applies MultiPlayCorrectionParam client1/2
+// (n = 2 / 3) or removes the correction (n = 1, or 4+ where client3 is -1 in every row). Its only callers:
+// 0x1403db2b9 (apply), 0x1403c7ee8 (0x1403c7e50: re-apply check against chr+0x238), 0x1403d2d3d (0x1403d27b0). The
+// frame code 0x140521ff0 (0x140522180-0x14052229c) recomputes the same count inline and, when it differs from
+// WCM+0x17558, re-applies to every character (ChrFinder -> 0x1405186a0 -> 0x1403c7e50) and stores it there.
+// Our count: the session members on the host's side (the lobby owner and members with role "ally"), the same on
+// every machine (the member list and the lobby data are the same everywhere); the debug value is kept. When it
+// changes we set WCM+0x17558 to -1 (written only by 0x140515058 at creation and 0x140522295), so the game's own
+// frame code re-applies with it.
+static int g_squad_n;  // 0 = not computed (no lobby): the game's own count
+static void squad_count_tick(void) {  // game thread (step hook), every 500 ms
+    static DWORD next;
+    if ((int)(GetTickCount() - next) < 0) return;
+    next = GetTickCount() + 500;
+    u64 lobby = our_lobby();
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
+    int n = 0;
+    if (lobby && sm && g_diag.owner && g_steam.mm) {
+        u64 owner = g_diag.owner(g_steam.mm, lobby);
+        char *b = *(char **)(sm + SM_PLAYERS_BEGIN), *e = *(char **)(sm + SM_PLAYERS_BEGIN + 8);
+        for (char *m = b; b && m < e && !IsBadReadPtr(m, SM_PLAYER_SIZE); m += SM_PLAYER_SIZE) {
+            u64 id = *(u64 *)(m + 0x10);
+            int invader = m[0xe1] ? (g_join == 4 && !g_as_ally) : (id != owner && !member_ally(lobby, id));
+            if (!invader) n++;
+        }
+        if (n < 1) n = 1;
+    }
+    if (n != g_squad_n) {
+        int real = ((int (*)(void))(g_base + 0x519660))();
+        logf("scaling: squad of %d for enemy scaling (game's count with invaders %d)", n ? n : real, real);
+        g_squad_n = n;
+        char *wcm = *(char **)(g_base + 0x3c0f0a8);
+        if (wcm && !IsBadReadPtr(wcm + 0x17558, 4)) *(int *)(wcm + 0x17558) = -1;  // the game re-applies next frame
+    }
+}
+static int squad_count_hook(void) {
+    if (*(int *)(g_base + 0x3c0f320) > 0 || !g_squad_n) return ((int (*)(void))(g_base + 0x519660))();
+    return g_squad_n;
+}
 static void act_wrap_tick(void) {  // run thread: put the wrapper in (again, if the game set the pointer anew)
     void **slot = (void **)(g_base + 0x467afe8), **eslot = (void **)(g_base + 0x467afe0);
     if (*slot == (void *)(g_base + 0xd40310)) {
@@ -6197,6 +6243,7 @@ static void step_hook(void *ctrl, void *time, int step) {
     if (step == QM_STEP_INGAME || g_join_in_world()) invader_notice_frame();
     summon_kill_reward();
     crash_watch_members();
+    squad_count_tick();
     static int told_invader;
     if (g_join != 4) {
         if (told_invader) told_invader = 0, logf("role: no longer an invader; own expeditions host again");
