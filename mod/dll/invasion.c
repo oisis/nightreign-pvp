@@ -27,6 +27,7 @@
 #ifndef MOD_VERSION
 #define MOD_VERSION "dev"
 #endif
+static int g_cap_remote = 2;  // remote player slots in effect (4 once the capacity patch is in, capacity.h)
 #define GAME_TIMESTAMP 0x69e0dc2a  // nightreign.exe 1.3.3, Steam build 22818764
 
 // Session manager (same first fields as Elden Ring's CSSessionManager).
@@ -67,7 +68,7 @@ static const char *const KEY_LINES[] = {
     "host: session up", "host: expedition reached", "host: expedition over", "host: member admitted", "role: ",
     "host: no member left", "leave done", "join: search started", "joining lobby", "join -> ", "stopping (",
     "in the host's world", "world sync at step", "invasion won", "invasion lost", "invasion neither", "level: ", "map test", "two-regions", "expedition: result", "reward test: won", "reward test: lost",
-    "expedition end requested", "flags: ", "lag: ", "move check: ", "map pin: ", "name tag: ", "scaling: ", "version: ", "counts overlay: ", "map test",  "still down", "watchdog", "no map load", "went back", "code patch", "crash"};
+    "expedition end requested", "flags: ", "lag: ", "move check: ", "map pin: ", "name tag: ", "scaling: ", "version: ", "counts overlay: ", "capacity: ", "slot: ", "map test",  "still down", "watchdog", "no map load", "went back", "code patch", "crash"};
 static void logf(const char *fmt, ...) {
     char line[1024];
     va_list ap;
@@ -539,10 +540,12 @@ static void **session_impl(char *sm) {
 // Team play: the game has 2 remote player-data slots (0x1401fe4c0 returns 2; 0x1401fe530, 0x1401fe150 stop at 2),
 // so a session holds 3 players. Line-ups within that: solo host + 1 invader, squad of 2 + 1 invader; a squad of 3
 // takes no invader (3:1, 2:2, 3:2 need more slots).
-#define SESSION_PLAYERS_MAX 3
+// With the capacity patch (4 remote slots, 5 players): solo host 1 invader, squad of 2 or 3 up to 2; squad <= 3.
+#define SESSION_PLAYERS_MAX ((unsigned)g_cap_remote + 1)
 static unsigned invaders_allowed(unsigned squad) {
-    static const unsigned table[] = {0, 1, 1, 0};
-    return squad < sizeof table / sizeof *table ? table[squad] : 0;
+    static const unsigned table3[] = {0, 1, 1, 0}, table5[] = {0, 1, 2, 2};
+    const unsigned *t = g_cap_remote == 4 ? table5 : table3;
+    return squad < 4 ? t[squad] : 0;
 }
 
 // Log the session manager's state whenever it changes.
@@ -6140,6 +6143,7 @@ static void host_expedition(int step) {
 
 
 #include "overlay.h"
+#include "capacity.h"
 // Counts for the overlay (counts only: no names, no ids): our lobbies of our version, by the phase the host publishes.
 // In the hub (the local player's map block 0x0a......, m10 the Roundtable Hold) at most every 30 s through its own
 // list request while no search is running; a running search's result is counted instead (counts_from_list).
@@ -6798,7 +6802,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved) {
         if (dot) strcpy(dot, ".log");
         g_base = (char *)GetModuleHandleA(NULL);
         crash_install(self);
-        if (((IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew))->FileHeader.TimeDateStamp == GAME_TIMESTAMP) fastfail_install(), ov_install();
+        if (((IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew))->FileHeader.TimeDateStamp == GAME_TIMESTAMP) fastfail_install(), ov_install(), capacity_install();
         IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew);
         // The guard goes in first, here rather than in run(): this runs before me3 lets the game go
         // on, while run() starts only later, alongside the game's own start-up.

@@ -15,3 +15,4 @@ ult-pvp = 100             # test, invasions: ultimate damage against players of 
 party = 0                 # test only: a number mixed into the squad matchmaking key, to keep test runs apart (0 = off)
 show-ping = true          # the round trip to each other player (ms) after its name on the party bars; false hides it
 show-counts = true        # in the Roundtable Hold: how many mod squads are in an expedition / looking for a player, top right; false hides it
+slot-test = false         # test: new session members take the highest free player slot first (3 machines reach slots 3 and 2)
