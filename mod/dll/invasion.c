@@ -3380,6 +3380,59 @@ static void hook_players_option(void) {
     else logf("players option: cannot patch the constructor");
 }
 
+// --- "No. of Password Players": the row is left out ------------------------------------------------
+//
+// MatchingDialog's constructor 0x1409f1960 adds its rows one after another (0x1409f0470 and others): a row's place
+// and widget come from its index (the grid at dialog +0xde8, 0x140781b00). In the usual layout (0x140f8be90 false):
+// 0 Number of Players, 1 team session, 2 (0x14092ae10), 3 password, 4 No. of Password Players (add at 0x1409f35ab),
+// 5..9 group passwords (icon "Item_%d_0/Widgets/TextInput/Icon" at index i+5, 0x1409f387a), 10 the optional +0x4a
+// row (only when [+0x3df8]+0x1d1). We skip the add at 0x1409f35ab and the icon index becomes i+4. The dialog's own
+// code reads the cursor (grid +0xd4, 0x140781a50) at the sites below and compares it with fixed old indices (2, 3,
+// 4, 5..9 with -5 for the group-password slots, 10); there the cursor is given back in the old numbering (>= 4 ->
+// +1). Every other user of the grid (input, drawing, rows by index) sees the real rows. The other layout (add at
+// 0x1409f2562) is left as the game builds it. request +0x48 keeps the value the game holds; our team ignores it.
+static const unsigned MD_CURSOR_SITES[] = {0x9f7995, 0x9f79a6, 0x9f79b7, 0x9f7af0, 0x9f7b46, 0x9f7f91, 0x9f8251,
+                                           0x9f899c, 0x9f8bad, 0x9f8bbe, 0x9f99b0, 0x9facbc, 0x9fae27, 0x9faf18};
+static char *g_md_without_row;  // the dialog built without the row
+static int md_cursor_old(char *grid) {
+    int i = *(int *)(grid + 0xd4);
+    return grid == g_md_without_row + 0xde8 && i >= 4 ? i + 1 : i;
+}
+static void *md_skip_row(char *dialog) {  // in place of 0x1409f0470 for the No. of Password Players row
+    g_md_without_row = dialog;
+    logf("menu: \"No. of Password Players\" row left out");
+    return dialog;
+}
+static void *md_other_layout_row(char *dialog, void *a, void *b, void *c, void *d, void *e, void *f, unsigned long long g) {
+    if (g_md_without_row == dialog) g_md_without_row = NULL;
+    return ((void *(*)(char *, void *, void *, void *, void *, void *, void *, unsigned long long))(g_base + 0x9f0470))(dialog, a, b, c, d, e, f, g);
+}
+static void hook_password_players_row(void) {
+    unsigned char *icon = (unsigned char *)g_base + 0x9f387a;
+    int ok = !memcmp(icon, "\x44\x8d\x4b\x05", 4);
+    unsigned sites[2] = {0x9f35ab, 0x9f2562};
+    for (int i = 0; i < 2; i++) {
+        int rel = (int)(0x9f0470 - (sites[i] + 5));
+        ok = ok && g_base[sites[i]] == (char)0xE8 && !memcmp(g_base + sites[i] + 1, &rel, 4);
+    }
+    for (unsigned i = 0; i < sizeof MD_CURSOR_SITES / sizeof *MD_CURSOR_SITES; i++) {
+        int rel = (int)(0x781a50 - (MD_CURSOR_SITES[i] + 5));
+        ok = ok && g_base[MD_CURSOR_SITES[i]] == (char)0xE8 && !memcmp(g_base + MD_CURSOR_SITES[i] + 1, &rel, 4);
+    }
+    DWORD old;
+    if (!ok || !VirtualProtect(icon, 4, PAGE_EXECUTE_READWRITE, &old)) {
+        logf("menu: password players row: code not as expected, row kept");
+        return;
+    }
+    icon[3] = 4;
+    VirtualProtect(icon, 4, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), icon, 4);
+    for (unsigned i = 0; i < sizeof MD_CURSOR_SITES / sizeof *MD_CURSOR_SITES; i++)
+        hook_call(MD_CURSOR_SITES[i], 0x781a50, (void *)md_cursor_old, "menu: dialog cursor (old row numbers)");
+    hook_call(0x9f2562, 0x9f0470, (void *)md_other_layout_row, "menu: password players row (other layout, kept)");
+    hook_call(0x9f35ab, 0x9f0470, (void *)md_skip_row, "menu: password players row (left out)");
+}
+
 // --- entry -----------------------------------------------------------------------------------------
 
 // --- Expedition start ---------------------------------------------------------------------------
@@ -6741,6 +6794,7 @@ static DWORD WINAPI run(LPVOID self) {
         hook_target_list();
         hook_map_load();
         hook_players_option();
+        hook_password_players_row();
         hook_expedition_start();
         hook_offline_check();
         hook_network_flow();
