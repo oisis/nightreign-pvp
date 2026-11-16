@@ -2102,7 +2102,15 @@ static int g_flog_back_n, g_flog_back_logged;
 static double flog_t(void) { return (GetTickCount() - g_flog_layout_tick) / 1000.0; }
 static void flag_note(char *man, unsigned id, int on, int before) {
     (void)man;
-    if (!setting(S_FLAG_LOG) || before == (on != 0)) return;
+    if (!setting(S_FLAG_LOG)) {
+        // always (boss-grace check): a boss-death flag (the scripts' nnn 800..899 of a map or small-map block, which
+        // common 9005810 / 90015006 wait for before they enable the site of grace) turned on, or dropped for want
+        // of a block
+        if (on && before != 1 && id >= 10000000u && id % 1000 >= 800 && id % 1000 < 900)
+            logf("flags: boss-family flag %u -> 1%s", id, before < 0 ? " DROPPED, no block" : "");
+        return;
+    }
+    if (before == (on != 0)) return;
     EnterCriticalSection(&g_flog_lock);
     unsigned h = (id * 2654435761u) % FLOG_SLOTS;
     for (int k = 0; k < 64 && g_flog[h].id && g_flog[h].id != id; k++) h = (h + 1) % FLOG_SLOTS;
@@ -2610,11 +2618,16 @@ static unsigned *variant_hook(unsigned *out, unsigned *id, unsigned long long mo
 // started only by 0x6953b0 (called only at 0x68e229): that call is skipped.
 static DWORD g_expedition_start_tick;  // defined with g_expedition_tick below
 static DWORD g_norain_seen[13];
+static DWORD g_enter_tick, g_enter_world;  // joiner: join time, in the host's world (defined with the join code)
+static int g_join;
 static void norain_first(int k, const char *what) {
     if (k < 0 || k >= (int)(sizeof g_norain_seen / sizeof *g_norain_seen)) return;
-    if (g_debug_log && g_norain_seen[k] != g_expedition_start_tick) {
-        g_norain_seen[k] = g_expedition_start_tick;
-        logf("no rain: %s (first time this expedition)", what);
+    // the host's own expedition, or a joiner's stay in the host's world (until 17.11 joiners never logged: the
+    // key was the host-only expedition start, 0 on a joiner)
+    DWORD key = g_join == 4 && g_enter_world ? g_enter_tick | 1 : g_expedition_start_tick;
+    if (g_debug_log && key && g_norain_seen[k] != key) {
+        g_norain_seen[k] = key;
+        logf("no rain: %s (first time this expedition%s)", what, key == g_expedition_start_tick ? "" : ", joined");
     }
 }
 static char *stage_rend(void) {
@@ -2985,7 +2998,7 @@ static void hook_acceptance(void) {
         static const unsigned EN[] = {0x6942db, 0x69451e};  // 0x693ae8 / 0x693dc3: hooked always (far asset)
         for (unsigned i = 0; i < 2; i++) hook_call(EN[i], 0x704cd0, (void *)asset_enable_hook, "map-dump: circle asset enable log");
     }
-    if (setting(S_FLAG_LOG) || setting(S_MAP_DUMP)) {
+    {  // always: flag-log / map-dump log every write; otherwise only boss-death flags (flag_note)
         hook_call(0x5e789d, 0x60d330, (void *)flag_store_hook, "flags: storage write (0x5e7740)");
         hook_call(0x5e7ac0, 0x60d330, (void *)flag_store_hook, "flags: storage write (0x5e79f0)");
     }
