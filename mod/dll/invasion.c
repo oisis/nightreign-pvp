@@ -67,7 +67,7 @@ static const char *const KEY_LINES[] = {
     "host: session up", "host: expedition reached", "host: expedition over", "host: member admitted", "role: ",
     "host: no member left", "leave done", "join: search started", "joining lobby", "join -> ", "stopping (",
     "in the host's world", "world sync at step", "invasion won", "invasion lost", "invasion neither", "level: ", "map test", "two-regions", "expedition: result", "reward test: won", "reward test: lost",
-    "expedition end requested", "flags: ", "lag: ", "move check: ", "map pin: ", "name tag: ", "scaling: ", "version: ", "map test",  "still down", "watchdog", "no map load", "went back", "code patch", "crash"};
+    "expedition end requested", "flags: ", "lag: ", "move check: ", "map pin: ", "name tag: ", "scaling: ", "version: ", "counts overlay: ", "map test",  "still down", "watchdog", "no map load", "went back", "code patch", "crash"};
 static void logf(const char *fmt, ...) {
     char line[1024];
     va_list ap;
@@ -4333,6 +4333,9 @@ static void version_result(int found_same) {
     }
     g_ver_newest[0] = g_ver_team[0] = 0;
 }
+static int counts_in_hub(void);
+static void counts_from_list(unsigned n);
+static u64 g_count_call;
 static void lobby_search_reset(void) {
     if (g_list_call) logf("search: request %u abandoned", g_list_count);
     g_list_call = 0;
@@ -4343,6 +4346,7 @@ static int lobby_search_frame(const char *who) {
     DWORD now = GetTickCount();
     if (!g_list_call) {
         if (g_list_tick && now - g_list_tick < SEARCH_PERIOD_MS) return 0;
+        if (g_count_call) return 0;  // the counts' own request first (one list at a time)
         g_steam.string_filter(g_steam.mm, LOBBY_MARK_KEY, "1", LOBBY_EQUAL);
         // no proto / version filter: lobbies of other versions are listed too, so an older client learns of a
         // newer release (one request per period as before). ponytail: Steam returns at most 50 lobbies; with many
@@ -4409,6 +4413,7 @@ static int lobby_search_frame(const char *who) {
         if (nfit > 1 && chosen) logf("%s: %d hosts with a free place: lobby %llu taken (host level %ld)", who, nfit, chosen, best_lvl);
     }
     version_result(chosen != 0);
+    if (counts_in_hub()) counts_from_list(result.matching);
     if (chosen) logf("%s: %s lobby %llu", who, g_join_test ? "candidate" : "would join (join-test is off)", chosen);
     else logf("%s: no lobby to join", who);
     g_candidate = chosen;
@@ -6133,6 +6138,81 @@ static void host_expedition(int step) {
     }
 }
 
+
+#include "overlay.h"
+// Counts for the overlay (counts only: no names, no ids): our lobbies of our version, by the phase the host publishes.
+// In the hub (the local player's map block 0x0a......, m10 the Roundtable Hold) at most every 30 s through its own
+// list request while no search is running; a running search's result is counted instead (counts_from_list).
+static DWORD g_count_tick;
+static void counts_from_list(unsigned n) {
+    int in_game = 0, looking = 0, waiting = 0;
+    for (unsigned i = 0; i < n && i < 50; i++) {
+        u64 id = g_steam.by_index(g_steam.mm, (int)i);
+        const char *proto = g_steam.get_data(g_steam.mm, id, LOBBY_PROTO_KEY), *ver = g_steam.get_data(g_steam.mm, id, LOBBY_VER_KEY);
+        if (!proto || strcmp(proto, LOBBY_PROTO) || !ver || strcmp(ver, MOD_VERSION) || (id == g_lobby && g_lobby)) continue;
+        const char *ph = g_steam.get_data(g_steam.mm, id, LOBBY_PHASE_KEY), *af = g_steam.get_data(g_steam.mm, id, LOBBY_ALLY_FREE_KEY);
+        int hub = ph && !strcmp(ph, "hub"), late = ph && (!strcmp(ph, "boss") || !strcmp(ph, "late"));
+        if (hub) waiting++;
+        else in_game++;
+        if (!late && af && atoi(af) > 0) looking++;
+    }
+    static int last[3] = {-1, -1, -1};
+    if (in_game == last[0] && looking == last[1] && waiting == last[2]) return;
+    last[0] = in_game, last[1] = looking, last[2] = waiting;
+    static _Alignas(16) char text[3][0x100];
+    static unsigned short line[3][128];
+    const unsigned short *lines[3];
+    int value[3] = {in_game, looking, waiting};
+    for (int k = 0; k < 3; k++) {
+        char *t = ((char *(*)(void *, int))(g_base + RVA_MENU_TEXT_CTOR))(text[k], 131172 + k);
+        const unsigned short *tpl = t && *(unsigned short **)t ? *(unsigned short **)t : t ? *(unsigned short **)(t + 0x10) : NULL;
+        char num[12];
+        snprintf(num, sizeof num, "%d", value[k]);
+        int m = 0;
+        for (int i = 0; tpl && !IsBadReadPtr(tpl + i, 2) && tpl[i] && i < 100 && m < 120; i++) {
+            if (tpl[i] == '%' && tpl[i + 1] == 'd') {
+                for (const char *a = num; *a && m < 120; a++) line[k][m++] = (unsigned char)*a;
+                i++;
+            } else line[k][m++] = tpl[i];
+        }
+        line[k][m] = 0;
+        lines[k] = line[k];
+    }
+    logf("counts: squads in an expedition %d, looking for a player %d, hosts waiting in the hub %d", in_game, looking, waiting);
+    ov_set_lines(lines, 3);
+}
+static int counts_in_hub(void) {
+    char *me = local_player();
+    unsigned blk = me && !IsBadReadPtr(me + CHR_BLOCK_ID, 4) ? *(unsigned *)(me + CHR_BLOCK_ID) : 0;
+    return me && (blk >> 24) == 0x0a && !g_in_expedition && g_join != 4;
+}
+static void counts_tick(void) {  // game thread (step hook)
+    if (!setting(S_SHOW_COUNTS) || g_ov_off) return;
+    if (!counts_in_hub()) {
+        ov_hide();
+        return;
+    }
+    if (!g_ov.shown && g_ov.has_text) g_ov.shown = 1;  // back in the hub: the last counts again
+    if (!steam_ready()) return;
+    DWORD now = GetTickCount();
+    if (!g_count_call) {
+        if (g_list_call || g_searching || g_party || (g_count_tick && now - g_count_tick < 30000)) return;  // a search counts instead
+        g_steam.string_filter(g_steam.mm, LOBBY_MARK_KEY, "1", LOBBY_EQUAL);
+        g_steam.distance_filter(g_steam.mm, LOBBY_WORLDWIDE);
+        g_count_call = g_steam.request_list(g_steam.mm);
+        g_count_tick = now;
+        return;
+    }
+    unsigned char failed = 0;
+    if (!g_steam.completed(g_steam.utils, g_count_call, &failed)) {
+        if (now - g_count_tick > SEARCH_TIMEOUT_MS) g_count_call = 0;
+        return;
+    }
+    struct { unsigned matching; } result = {0};
+    unsigned char got = g_steam.result(g_steam.utils, g_count_call, &result, sizeof result, LOBBY_MATCH_LIST, &failed);
+    g_count_call = 0;
+    if (got && !failed) counts_from_list(result.matching);
+}
 static void toggle_search(const char *where) {
     g_invasion_pending = 0;
     g_searching = !g_searching;
@@ -6365,6 +6445,7 @@ static void step_hook(void *ctrl, void *time, int step) {
     summon_kill_reward();
     crash_watch_members();
     squad_count_tick();
+    counts_tick();
     static int told_invader;
     if (g_join != 4) {
         if (told_invader) told_invader = 0, logf("role: no longer an invader; own expeditions host again");
@@ -6717,7 +6798,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved) {
         if (dot) strcpy(dot, ".log");
         g_base = (char *)GetModuleHandleA(NULL);
         crash_install(self);
-        if (((IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew))->FileHeader.TimeDateStamp == GAME_TIMESTAMP) fastfail_install();
+        if (((IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew))->FileHeader.TimeDateStamp == GAME_TIMESTAMP) fastfail_install(), ov_install();
         IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew);
         // The guard goes in first, here rather than in run(): this runs before me3 lets the game go
         // on, while run() starts only later, alongside the game's own start-up.

@@ -55,6 +55,9 @@ static const struct { u32 id; const char *english, *polish; } OUR_TEXT[] = {
              "Dost\xc4\x99pna jest nowsza wersja moda (%s). Zaktualizuj, \xc5\xbc" "eby gra\xc4\x87 z innymi."},
     {131171, "Your team (same password) plays mod version %s. Everyone needs the same version.",
              "Twoja dru\xc5\xbcyna (to samo has\xc5\x82o) gra na wersji moda %s. Wszyscy potrzebuj\xc4\x85 tej samej wersji."},
+    {131172, "Squads in an expedition: %d", "Dru\xc5\xbcyny w wyprawie: %d"},  // counts overlay (%d: the DLL)
+    {131173, "Squads looking for a player: %d", "Dru\xc5\xbcyny szukaj\xc4\x85" "ce gracza: %d"},
+    {131174, "Hosts waiting in the hub: %d", "Hosty czekaj\xc4\x85" "ce w Twierdzy: %d"},
     {130460, "4 players", "4 graczy"},
     {131160, "Invasion", "Najazd"},
     {131161, "Enter another squad's expedition as an invader.\nDefeat its host to win.",
@@ -2598,7 +2601,7 @@ int core_selftest(void) {
                                 "nope = true\r\nloot-test = yes\r\n\r\ndebug-log = false\r\ntest-level = 15\r\nmap-group = 3\r\nult-pvp = 250\r\none-region = 1000";
         short v[SETTINGS_COUNT];
         char bad[64];
-        static const short want[SETTINGS_COUNT] = {1, 1, -1, -1, 0, -1, 15, -1, -1, 3, -1, -1, -1, -1, 250, -1, -1, -1};
+        static const short want[SETTINGS_COUNT] = {1, 1, -1, -1, 0, -1, 15, -1, -1, 3, -1, -1, -1, -1, 250, -1, -1, -1, -1};
         int good = settings_parse(t, sizeof t - 1, v, bad, sizeof bad) == 3 && !memcmp(v, want, sizeof v) &&
                    !strcmp(bad, "nope = true, loot-test = yes, one-region = 1000");
         good = good && !load_settings("/nonexistent/test-settings.toml", v);

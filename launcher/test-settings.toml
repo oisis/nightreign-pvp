@@ -14,3 +14,4 @@ no-sprint = true          # the fast run (sprint) is off; false turns it back on
 ult-pvp = 100             # test, invasions: ultimate damage against players of the other side in percent (100 = unchanged, 0..999)
 party = 0                 # test only: a number mixed into the squad matchmaking key, to keep test runs apart (0 = off)
 show-ping = true          # the round trip to each other player (ms) after its name on the party bars; false hides it
+show-counts = true        # in the Roundtable Hold: how many mod squads are in an expedition / looking for a player, top right; false hides it

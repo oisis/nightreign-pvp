@@ -21,6 +21,9 @@ OUR_TEXT = {
                  "Dostępna jest nowsza wersja moda (%s). Zaktualizuj, żeby grać z innymi."),  # %s: filled in by the DLL
         131171: ("Your team (same password) plays mod version %s. Everyone needs the same version.",
                  "Twoja drużyna (to samo hasło) gra na wersji moda %s. Wszyscy potrzebują tej samej wersji."),
+        131172: ("Squads in an expedition: %d", "Drużyny w wyprawie: %d"),  # counts overlay, %d filled in by the DLL
+        131173: ("Squads looking for a player: %d", "Drużyny szukające gracza: %d"),
+        131174: ("Hosts waiting in the hub: %d", "Hosty czekające w Twierdzy: %d"),
         130460: ("4 players", "4 graczy"),  # fourth "Number of Players" option, added by the DLL
         131160: ("Invasion", "Najazd"),
         131161: ("Enter another squad's expedition as an invader.\nDefeat its host to win.",
