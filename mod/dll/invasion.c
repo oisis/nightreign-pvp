@@ -5050,7 +5050,9 @@ static void squad_count_tick(void) {  // game thread (step hook), every 500 ms
         if (n < 1) n = 1;
     }
     if (n != g_squad_n) {
-        int real = ((int (*)(void))(g_base + 0x519660))();
+        // 0x140519660 ends in the game's fatal-error path (write to 0) when its manager 0x143c0f338 is not there
+        // yet / any more (crash of a Windows invader, exe+0x214e298 from here): read the count only when it is.
+        int real = *(void **)(g_base + 0x3c0f338) ? ((int (*)(void))(g_base + 0x519660))() : -1;
         logf("scaling: squad of %d for enemy scaling (game's count with invaders %d)", n ? n : real, real);
         g_squad_n = n;
         char *wcm = *(char **)(g_base + 0x3c0f0a8);
