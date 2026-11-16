@@ -15,7 +15,7 @@ enum { T_TITLE, T_GAME_FOLDER, T_BROWSE, T_PLAY, T_BACKUP, T_HELP, T_UNINSTALL, 
 
 static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
     [L_EN] = {
-        "Nightreign Invasions",
+        "Nightreign Invasions " MOD_VERSION,
         "Game folder (the one with nightreign.exe):",
         "Browse...",
         "Play with the mod",
@@ -49,7 +49,7 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "Debug log"
     },
     [L_PL] = {
-        "Nightreign Invasions",
+        "Nightreign Invasions " MOD_VERSION,
         "Folder gry (ten z plikiem nightreign.exe):",
         "Wybierz...",
         "Graj z modem",
@@ -83,7 +83,7 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "Szczegółowy log"
     },
     [L_DE] = {
-        "Nightreign Invasions",
+        "Nightreign Invasions " MOD_VERSION,
         "Spielordner (der mit nightreign.exe):",
         "Durchsuchen...",
         "Mit dem Mod spielen",
@@ -120,7 +120,7 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "Ausführliches Protokoll"
     },
     [L_FR] = {
-        "Nightreign Invasions",
+        "Nightreign Invasions " MOD_VERSION,
         "Dossier du jeu (celui qui contient nightreign.exe) :",
         "Parcourir...",
         "Jouer avec le mod",
@@ -158,7 +158,7 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "Journal détaillé"
     },
     [L_ES] = {
-        "Nightreign Invasions",
+        "Nightreign Invasions " MOD_VERSION,
         "Carpeta del juego (la que contiene nightreign.exe):",
         "Examinar...",
         "Jugar con el mod",

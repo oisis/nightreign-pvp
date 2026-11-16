@@ -51,6 +51,10 @@ static const struct { u32 id; const char *english, *polish; } OUR_TEXT[] = {
     {130305, "Commence Team Expedition", "Rozpocznij wypraw\xc4\x99 dru\xc5\xbcyny"},
     {130408, "Team", "Dru\xc5\xbcyna"},  // the game's "three players": a team too (the list cannot lose an entry)
     {130417, "Team", "Dru\xc5\xbcyna"},  // the game's "two players": team (the DLL joins or hosts a session)
+    {131170, "A newer mod version (%s) is available. Update to play with others.",  // %s: the DLL puts the number in
+             "Dost\xc4\x99pna jest nowsza wersja moda (%s). Zaktualizuj, \xc5\xbc" "eby gra\xc4\x87 z innymi."},
+    {131171, "Your team (same password) plays mod version %s. Everyone needs the same version.",
+             "Twoja dru\xc5\xbcyna (to samo has\xc5\x82o) gra na wersji moda %s. Wszyscy potrzebuj\xc4\x85 tej samej wersji."},
     {130460, "4 players", "4 graczy"},
     {131160, "Invasion", "Najazd"},
     {131161, "Enter another squad's expedition as an invader.\nDefeat its host to win.",
@@ -2356,6 +2360,7 @@ int core_build(const char *game_dir) {
     if (!read_settings()) return 0;
     snprintf(bhd_path, sizeof bhd_path, "%s" SEP "data0.bhd", game_dir);
     snprintf(bdt_path, sizeof bdt_path, "%s" SEP "data0.bdt", game_dir);
+    logf_("Nightreign Invasions " MOD_VERSION);
     logf_("Reading the game archive...");
     rsa_init();
     aes_init();

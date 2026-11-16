@@ -22,6 +22,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+// The mod's version: the release workflow passes the final VERSION (-DMOD_VERSION="\"0.1.37\""); local builds say "dev".
+// Only the same version pairs up (lobby key nrpvp_ver); "dev" is never a release, so it is never "newer" than one.
+#ifndef MOD_VERSION
+#define MOD_VERSION "dev"
+#endif
 #define GAME_TIMESTAMP 0x69e0dc2a  // nightreign.exe 1.3.3, Steam build 22818764
 
 // Session manager (same first fields as Elden Ring's CSSessionManager).
@@ -62,7 +67,7 @@ static const char *const KEY_LINES[] = {
     "host: session up", "host: expedition reached", "host: expedition over", "host: member admitted", "role: ",
     "host: no member left", "leave done", "join: search started", "joining lobby", "join -> ", "stopping (",
     "in the host's world", "world sync at step", "invasion won", "invasion lost", "invasion neither", "level: ", "map test", "two-regions", "expedition: result", "reward test: won", "reward test: lost",
-    "expedition end requested", "flags: ", "lag: ", "move check: ", "map pin: ", "name tag: ", "scaling: ", "map test",  "still down", "watchdog", "no map load", "went back", "code patch", "crash"};
+    "expedition end requested", "flags: ", "lag: ", "move check: ", "map pin: ", "name tag: ", "scaling: ", "version: ", "map test",  "still down", "watchdog", "no map load", "went back", "code patch", "crash"};
 static void logf(const char *fmt, ...) {
     char line[1024];
     va_list ap;
@@ -3501,7 +3506,7 @@ static DWORD g_request_tick;  // when the last start request arrived
 // invader with one more string filter in lobby_search_frame; lobbies without it stay open to all.
 #define LOBBY_MARK_KEY   "nrpvp"         // "1" on every mod host lobby
 #define LOBBY_PROTO_KEY  "nrpvp_proto"
-#define LOBBY_PROTO      "1"             // bump when what a joiner expects changes
+#define LOBBY_PROTO      "2"             // 2: with nrpvp_ver (proto-1 clients filter on "1" and never see these lobbies)
 #define LOBBY_GAME_KEY   "nrpvp_game"
 #define LOBBY_GAME       "1.3.3"         // GAME_TIMESTAMP's build
 #define LOBBY_SQUAD_KEY  "nrpvp_squad"
@@ -3512,6 +3517,7 @@ static DWORD g_request_tick;  // when the last start request arrived
 #define LOBBY_START_KEY  "nrpvp_start"   // host's expedition start block (game manager +0xa74), 8 hex digits
 #define LOBBY_ALLY_FREE_KEY "nrpvp_ally_free"  // free places in the host's squad for allies (squad of three)
 #define LOBBY_ROLE_KEY   "nrpvp_role"    // a joiner's own lobby member data: "ally" or "invader"
+#define LOBBY_VER_KEY    "nrpvp_ver"     // the mod version (MOD_VERSION); only the same version pairs up
 #define LOBBY_LEVEL_KEY  "nrpvp_lvl"     // host's level (player data +0x68)
 #define LOBBY_PHASE_KEY  "nrpvp_phase"   // host's expedition phase: "hub", "field", "boss" (a night boss fight), "late" (day-2 boss beaten)
 #define LOBBY_BORN_KEY   "nrpvp_born"    // when the lobby was marked: seconds since 2026-01-01 UTC (its age for the pick order)
@@ -4186,6 +4192,7 @@ static void lobby_mark(void) {
         lobby_set(LOBBY_MARK_KEY, "1");
         lobby_set(LOBBY_PROTO_KEY, LOBBY_PROTO);
         lobby_set(LOBBY_GAME_KEY, LOBBY_GAME);
+        lobby_set(LOBBY_VER_KEY, MOD_VERSION);
         {  // the expedition's start block: what a solo start put in the pending block (SingleStart ->
            // context vt+8 0xb44630 -> 0xb47470), kept by the game manager for the whole expedition
             char *gm = *(char **)(g_base + 0x3c13258), text[16];
@@ -4267,6 +4274,65 @@ static void lobby_mark(void) {
 
 // One lobby list request at a time, every SEARCH_PERIOD_MS: the invader every idle frame while
 // searching, the host once (who = "host self-check"). Returns 1 when a request has finished.
+// Version notice (131170 newer release seen, 131171 the team with our password plays another version). The text is
+// the launcher's FMG line with "%s"; the notice path copies a MenuString's first field (the text pointer) as is
+// (0x1405bea10 in the summon-message record 0x1408b3240), so the line is built with the game's ctor and its pointer
+// is set to our formatted copy, like the ping after a name. Once per hub visit and once per search start.
+static int g_ver_notice_armed = 1;
+static char g_ver_newest[24], g_ver_team[24];
+static int version_parse(const char *v, int out[3]) {  // a release is "a.b.c", digits only
+    if (!v) return 0;
+    int n = 0, k = 0;
+    out[0] = out[1] = out[2] = 0;
+    for (const char *c = v; *c; c++) {
+        if (*c == '.') { if (++k > 2) return 0; n = 0; continue; }
+        if (*c < '0' || *c > '9' || ++n > 6) return 0;
+        out[k] = out[k] * 10 + (*c - '0');
+    }
+    return k == 2 && n > 0;
+}
+static int version_newer(const char *a, const char *b) {  // a newer release than b (both releases)
+    int x[3], y[3];
+    if (!version_parse(a, x) || !version_parse(b, y)) return 0;
+    for (int i = 0; i < 3; i++) if (x[i] != y[i]) return x[i] > y[i];
+    return 0;
+}
+static void version_seen(const char *ver, int party) {
+    if (!ver || !*ver || !strcmp(ver, MOD_VERSION)) return;
+    if (version_newer(ver, MOD_VERSION) && (!*g_ver_newest || version_newer(ver, g_ver_newest)))
+        snprintf(g_ver_newest, sizeof g_ver_newest, "%s", ver);
+    if (party && !*g_ver_team) snprintf(g_ver_team, sizeof g_ver_team, "%s", ver);  // same password key, other version
+}
+static void notice_with(int id, const char *arg) {
+    static _Alignas(16) char text[2][0x100];
+    static unsigned short line[2][256];
+    int k = id == 131171;
+    char *t = ((char *(*)(void *, int))(g_base + RVA_MENU_TEXT_CTOR))(text[k], id);
+    const unsigned short *tpl = t && *(unsigned short **)t ? *(unsigned short **)t : t ? *(unsigned short **)(t + 0x10) : NULL;
+    int n = 0;
+    for (int i = 0; tpl && !IsBadReadPtr(tpl + i, 2) && tpl[i] && i < 200 && n < 250; i++) {
+        if (tpl[i] == '%' && tpl[i + 1] == 's') {
+            for (const char *a = arg; *a && n < 250; a++) line[k][n++] = (unsigned char)*a;
+            i++;
+        } else line[k][n++] = tpl[i];
+    }
+    line[k][n] = 0;
+    if (!n || !t) return;
+    *(unsigned short **)t = line[k];
+    ((unsigned char (*)(void *))(g_base + RVA_SUMMON_MESSAGE))(t);
+}
+static void version_result(int found_same) {
+    if (g_ver_notice_armed && *g_ver_newest) {
+        g_ver_notice_armed = 0;
+        logf("version: a newer mod version %s is in use (ours %s): notice shown", g_ver_newest, MOD_VERSION);
+        notice_with(131170, g_ver_newest);
+    } else if (g_ver_notice_armed && g_party && !found_same && *g_ver_team) {
+        g_ver_notice_armed = 0;
+        logf("version: the team with our password plays %s (ours %s): notice shown", g_ver_team, MOD_VERSION);
+        notice_with(131171, g_ver_team);
+    }
+    g_ver_newest[0] = g_ver_team[0] = 0;
+}
 static void lobby_search_reset(void) {
     if (g_list_call) logf("search: request %u abandoned", g_list_count);
     g_list_call = 0;
@@ -4278,7 +4344,9 @@ static int lobby_search_frame(const char *who) {
     if (!g_list_call) {
         if (g_list_tick && now - g_list_tick < SEARCH_PERIOD_MS) return 0;
         g_steam.string_filter(g_steam.mm, LOBBY_MARK_KEY, "1", LOBBY_EQUAL);
-        g_steam.string_filter(g_steam.mm, LOBBY_PROTO_KEY, LOBBY_PROTO, LOBBY_EQUAL);
+        // no proto / version filter: lobbies of other versions are listed too, so an older client learns of a
+        // newer release (one request per period as before). ponytail: Steam returns at most 50 lobbies; with many
+        // lobbies of other versions ours could fall out of the list — a version filter then, and a second request.
         if (g_party) g_steam.string_filter(g_steam.mm, LOBBY_PARTY_KEY, g_party_code, LOBBY_EQUAL);
         g_steam.distance_filter(g_steam.mm, LOBBY_WORLDWIDE);
         g_list_call = g_steam.request_list(g_steam.mm);
@@ -4313,7 +4381,10 @@ static int lobby_search_frame(const char *who) {
         logf("%s:   lobby %llu: host block '%s' pos '%s'", who, id, block ? block : "?", pos ? pos : "?");
         const char *afree = g_steam.get_data(g_steam.mm, id, LOBBY_ALLY_FREE_KEY);
         int own = id == g_lobby && g_lobby, slots = g_as_ally ? (afree ? atoi(afree) : 0) : free ? atoi(free) : 0;
-        int fits = !own && slots > 0 && game && !strcmp(game, LOBBY_GAME);
+        const char *ver = g_steam.get_data(g_steam.mm, id, LOBBY_VER_KEY);
+        int same = proto && !strcmp(proto, LOBBY_PROTO) && ver && !strcmp(ver, MOD_VERSION);
+        version_seen(ver, g_party != 0);
+        int fits = same && !own && slots > 0 && game && !strcmp(game, LOBBY_GAME);
         // GetLobbyData gives "" for a key that is not set.
         logf("%s:   lobby %llu: proto '%s' game '%s' squad '%s' free '%s', members %d of %d -> %s", who, id, proto ? proto : "?",
              game ? game : "?", squad ? squad : "?", free ? free : "?", g_steam.members(g_steam.mm, id),
@@ -4337,6 +4408,7 @@ static int lobby_search_frame(const char *who) {
         }
         if (nfit > 1 && chosen) logf("%s: %d hosts with a free place: lobby %llu taken (host level %ld)", who, nfit, chosen, best_lvl);
     }
+    version_result(chosen != 0);
     if (chosen) logf("%s: %s lobby %llu", who, g_join_test ? "candidate" : "would join (join-test is off)", chosen);
     else logf("%s: no lobby to join", who);
     g_candidate = chosen;
@@ -4511,6 +4583,7 @@ static void level_restore(void) {
 }
 static void join_over(const char *why) {
     level_restore();
+    g_ver_notice_armed = 1;  // back in the hub: the version notice may show once more
     if (g_as_ally) {  // the ally's gold look (row 90071611) has no time limit: it goes when our part ends
         char *me = local_player();
         // 0x3cdd40 (chr, id): SpecialEffect remove by id, the shape of Elden Ring's ChrIns remove_speffect
@@ -4658,6 +4731,7 @@ static void join_frame(void) {
             g_join_tick = GetTickCount();
             if (g_diag.set_member && g_steam.mm) {
                 g_diag.set_member(g_steam.mm, g_candidate, LOBBY_ROLE_KEY, g_as_ally ? "ally" : "invader");
+                g_diag.set_member(g_steam.mm, g_candidate, LOBBY_VER_KEY, MOD_VERSION);
                 logf("join: lobby member data %s=%s set", LOBBY_ROLE_KEY, g_as_ally ? "ally" : "invader");
             }
             if (g_enter_test) {
@@ -5865,8 +5939,8 @@ static unsigned short *party_password(char *request) {
 // above 0 (an extra salt, only to keep test runs apart). Only the hash goes into the lobby.
 static unsigned party_key_hash(char *request) {
     unsigned h = 2166136261u;
-    const char *base[3] = {"oisis", LOBBY_GAME, LOBBY_PROTO};
-    for (int k = 0; k < 3; k++)
+    const char *base[2] = {"oisis", LOBBY_GAME};  // no protocol / version: friends on another version share the code
+    for (int k = 0; k < 2; k++)
         for (const char *c = base[k]; *c; c++) h = (h ^ (unsigned char)*c) * 16777619u;
     h = (h ^ '|') * 16777619u;
     unsigned short *w = party_password(request);
@@ -5887,6 +5961,7 @@ static void party_request(char *self, char *request) {
     char *ctx = *(char **)(self + 8);
     snprintf(g_party_code, sizeof g_party_code, "%s", code);
     g_party = PARTY_PENDING, g_party_tick = GetTickCount(), g_party_marked_for = -1, g_party_confirm = 0;
+    g_ver_notice_armed = 1;
     g_as_ally = 1;
     if (!g_network_on) set_network(1);
     logf("party: start request for a squad of %u, pool: %s%s: network %s; looking for a host in it",
@@ -6047,6 +6122,7 @@ static void host_expedition(int step) {
         }
     } else if (g_in_expedition) {
         g_in_expedition = 0;
+        g_ver_notice_armed = 1;  // a new hub visit
         lobby_search_reset();
         logf("host: expedition over (step %s)%s", STEP_NAMES[step], g_host_test == 2 ? ", leaving the session" : "");
         md_end("expedition over");
@@ -6060,6 +6136,7 @@ static void host_expedition(int step) {
 static void toggle_search(const char *where) {
     g_invasion_pending = 0;
     g_searching = !g_searching;
+    if (g_searching) g_ver_notice_armed = 1;
     lobby_search_reset();
     if (g_searching) {
         if (g_stop_pending) finish_pending_stop(1);
@@ -6584,7 +6661,7 @@ static DWORD WINAPI run(LPVOID self) {
         logf("unsupported game build (timestamp %08lx), doing nothing", nt->FileHeader.TimeDateStamp);
         return 0;
     }
-    logf("loaded, game base %p", g_base);
+    logf("loaded, game base %p, mod version %s", g_base, MOD_VERSION);
     if (!g_settings_early) settings_load();
     if (g_guard_ok) logf("net guard: installed, %u of %u imports patched (outbound %s)", (unsigned)GUARDED_COUNT,
                          (unsigned)GUARDED_COUNT, NET_GUARD_REFUSE_OUTBOUND ? "refused" : "logged only");

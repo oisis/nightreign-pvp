@@ -53,12 +53,13 @@ jobs:
       - name: Mod DLL and icons
         run: |
           W="$NRPVP_WORK"; ZIG="$W/tools/zig/zig"; mkdir -p "$W/build/native"
-          "$ZIG" cc -target x86_64-windows-gnu -shared -O2 -Wall -Wextra -o "$W/build/native/invasion.dll" mod/dll/invasion.c
+          V=$(tr -d '[:space:]' < VERSION)
+          "$ZIG" cc -target x86_64-windows-gnu -shared -O2 -Wall -Wextra "-DMOD_VERSION=\"$V\"" -o "$W/build/native/invasion.dll" mod/dll/invasion.c
           "$ZIG" cc -target x86_64-windows-gnu -O2 -o "$W/build/unkrak.exe" mod/tools/unkrak.c
           python3 mod/build_icon.py --blocks "$W/build-launcher-data"
 
       - name: Launcher and packages
-        run: sh launcher/build.sh && sh launcher/package.sh
+        run: MOD_VERSION=$(tr -d '[:space:]' < VERSION) sh launcher/build.sh && sh launcher/package.sh
 
       - name: Release
         env:
