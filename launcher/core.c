@@ -39,7 +39,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 20
+#define BUILD_FORMAT 21
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
                               "porbr", "rusru", "spaar", "spaes", "thath", "zhocn", "zhotw"};
@@ -1126,6 +1126,44 @@ typedef struct {
     int pairs;                                    // attach points on one physical spot that the game never combines
     unsigned short pa[SPOT_PAIRS_MAX], pb[SPOT_PAIRS_MAX];
 } attach_sets;
+// Small-map instances (+0xc smallBaseMapId, +0x10 u8 mapIndex): in the game's 320 patterns no small map is placed
+// twice with the same index; a second copy gets 1, a third 2 (m30_30 #0 / #1, m41_00 #2). The index chooses the
+// instance's own flag block (index * 10^8 + AABB * 10^4 + d * 1000 + nnn): boss death nnn 800, which the scripts
+// (common 9005810 / 90015006) wait for to enable the site of grace nnn 1500. Our merge can bring the same map with
+// index 0 from both sources (pattern 8: m46_68 from Mountaintop 22 at point 756 and from Rotted Woods 30 at 315), so
+// both copies would share one block and one set of entities. A repeat gets the lowest index its map does not have in
+// that pattern, never above the highest index the game itself gives that map.
+static int distinct_instances(buf p) {
+    static u8 top[10000];
+    memset(top, 0, sizeof top);
+    u32 count = rd16(p.p + 0x0A);
+    for (u32 i = 0; i < count; i++) {
+        const u8 *row = p.p + rd64(p.p + 0x40 + i * 24 + 8);
+        u32 m = rd32(row + 0xc);
+        if (m < 10000 && row[0x10] > top[m]) top[m] = row[0x10];
+    }
+    int moved = 0, stuck = 0;
+    for (int slot = 0; slot < TWO_PATTERNS; slot++) {
+        if (!merged_slot(slot)) continue;
+        static u8 used[10000][16];
+        memset(used, 0, sizeof used);
+        for (u32 i = 0; i < count; i++) {
+            u8 *row = p.p + rd64(p.p + 0x40 + i * 24 + 8);
+            u32 m = rd32(row + 0xc);
+            if ((int)rd32(row + 4) != slot || m >= 10000 || row[0x10] >= 16) continue;
+            if (!used[m][row[0x10]]) { used[m][row[0x10]] = 1; continue; }
+            int k = 0;
+            while (k < 16 && used[m][k]) k++;
+            if (k < 16 && k <= top[m]) row[0x10] = (u8)k, used[m][k] = 1, moved++;
+            else if (stuck++ < 4) logf_("two-regions: pattern %d: small map m%02u_%02u placed %d times, the game gives it index 0..%d only", slot,
+                                         m / 100, m % 100, k + 1, top[m]);
+        }
+    }
+    logf_("two-regions: small maps placed twice in one pattern with one index: %d given the next free index%s", moved,
+          stuck ? ", some left (no index the game uses is free)" : "");
+    if (stuck) logf_("two-regions: check failed: %d small maps would share an instance", stuck);
+    return !stuck;
+}
 // Per-tile composition (user's method, analysis/merge/compose.py): the four tiles with Rotted Woods terrain
 // (44..45 x 36..37) take their whole content from the Rotted Woods pattern (40g+30+k), every other tile from
 // the Mountaintop pattern (40g+20+k); no tile mixes rows of both. (A plain pattern of the same index is no
@@ -1528,6 +1566,7 @@ static buf map_test_table(buf src, int table, buf flags, buf points, int two) {
             }
         logf_("two-regions: small bases per tile: %d %s ones on the %s tiles removed, %d of the %s on them added (most on one pattern %d)",
               removed, pair_a()->name, pair_b()->tiles, added, pair_b()->of, most);
+        if (ok) ok = distinct_instances(p);
         if (ok && spot_doubles(p, &sets)) ok = 0, logf_("two-regions: check failed: two small bases on one spot");
         else if (ok) logf_("two-regions: check: no merged pattern has two small bases on one spot");
     }
