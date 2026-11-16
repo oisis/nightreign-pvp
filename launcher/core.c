@@ -43,7 +43,7 @@ typedef struct { u8 *p; size_t n; } buf;
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
                               "porbr", "rusru", "spaar", "spaes", "thath", "zhocn", "zhotw"};
-// Our own menu lines (UTF-8): a fourth "Number of Players" option and the "Invasion" entry of the
+// Our own menu lines (UTF-8): "Team" in the "Number of Players" option and the "Invasion" entry of the
 // expedition menu's Target list.
 // Polish for the Polish game, English for every other language. Keep in sync with mod/build_msg.py.
 // (Adjacent string literals keep \x escapes from swallowing the letters that follow them.)
@@ -58,7 +58,6 @@ static const struct { u32 id; const char *english, *polish; } OUR_TEXT[] = {
     {131172, "Squads in an expedition: %d", "Dru\xc5\xbcyny w wyprawie: %d"},  // counts overlay (%d: the DLL)
     {131173, "Squads looking for a player: %d", "Dru\xc5\xbcyny szukaj\xc4\x85" "ce gracza: %d"},
     {131174, "Hosts waiting in the hub: %d", "Hosty czekaj\xc4\x85" "ce w Twierdzy: %d"},
-    {130460, "4 players", "4 graczy"},
     {131160, "Invasion", "Najazd"},
     {131161, "Enter another squad's expedition as an invader.\nDefeat its host to win.",
              "Wejd\xc5\xba do wyprawy innej dru\xc5\xbcyny jako naje\xc5\xba" "d\xc5\xba" "ca.\n"

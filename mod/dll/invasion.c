@@ -4,9 +4,8 @@
 //   - logs the session manager's state (lobby state, player count, join data) whenever it changes,
 //     and how many invaders the current squad would allow;
 //   - adds an "Invasion" entry to the expedition menu's Target list (row 101 of NightBossMenuParam,
-//     which must exist in regulation.bin: mod/build_regulation.py, or the launcher) and a fourth
-//     entry to the "Number of Players" option;
-//   - makes that fourth option ask for a squad of four and raises the session's player limit to six;
+//     which must exist in regulation.bin: mod/build_regulation.py, or the launcher); the "Number of
+//     Players" option shows only "1 player" and "Team";
 //   - when that Invasion entry is the chosen target: cancels the expedition start and enters the
 //     "searching" state, with a small repeating notice, brings the game's network up (Steam only,
 //     behind the network guard) and lists Steam lobbies carrying the mod's marker. Nothing is joined;
@@ -3323,48 +3322,40 @@ static void hook_target_list(void) {
     hook_call(0x9e7fcc, 0x9e9b60, (void *)builder_second_hook, "target list builder (second)");
 }
 
-// --- "Number of Players": a fourth option --------------------------------------------------------
+// --- "Number of Players": only "1 player" and "Team" ---------------------------------------------
 //
 // The option is a CS::ComboItemList<MENU_MATCHING_SORTIE_NUM, 3>: a vtable, three 0x50-byte items
-// stored inline at +8 and the item count at +0x100. There is no room for a fourth item inside it,
-// but the menu reads the list through its virtual methods (1 = count, 2..5 = item by index). So we
-// give the list a vtable of our own that reports one more item and serves it from this DLL.
+// stored inline at +8 and the item count at +0x100; the menu reads it through its virtual methods
+// (1 = count, 2..5 = item by index). The game fills it itself (0x146dbe7b9 -> 0x1409fb0xx): outside its
+// own team session [1 player (value 2), 2 players (1), 3 players (0)]; in a team session [2, 3] or [3],
+// putting the request's value (+0x49) on a remaining item first. Our vtable shows [1 player, 3 players]
+// for the full list and [3 players] for [2, 3]; 130408 reads "Team". Value 1 becomes 0 the same way.
+// The list sits at dialog +0x3f58, the request pointer at dialog +0x3e08 (both from the refresh code); the refresh's
+// own count calls (returns 0x1409fb070 / 0x1409fb175 / 0x1409fb318) get the real count.
 
 #define RVA_COMBO_LIST_VTABLE     0x2c5efe0  // ComboItemList<MENU_MATCHING_SORTIE_NUM,3>
 #define RVA_COMBO_LIST_VTABLE_LEA 0x9f1b7b   // "lea rax,[vtable]" in the dialog's constructor (7 bytes)
-#define RVA_COMBO_ITEM_VTABLE     0x2c5ef88  // ComboItem<MENU_MATCHING_SORTIE_NUM>
-#define RVA_TEXT_STRING_CTOR      0x7ac800   // string* (string *out, int text id): menu text by id
-#define RVA_STRING_COPY_CTOR      0x5bea10   // void (string *dst, string *src)
 #define COMBO_ITEMS   0x08
 #define COMBO_ITEM_SIZE 0x50
 #define COMBO_COUNT   0x100
-#define TEXT_FOUR_PLAYERS 130460             // added to CL_MenuText by build_msg.py / the launcher
-
-// The fourth item: vtable, value byte at +8, text at +0x10. Built once, on first use.
-// Its value is one the game does not know (3); fill_context_hook turns it into a squad of four.
-// The temporary string used to build it is never destroyed (one small leak per game run).
-static char *fourth_item(void) {
-    static _Alignas(16) char item[COMBO_ITEM_SIZE];
-    static int ready;
-    if (!ready) {
-        static _Alignas(16) char tmp[0x100];
-        void *text = ((void *(*)(void *, int))(g_base + RVA_TEXT_STRING_CTOR))(tmp, TEXT_FOUR_PLAYERS);
-        *(void **)item = g_base + RVA_COMBO_ITEM_VTABLE;
-        item[8] = 3;  // PLAYERS_CHOICE_FOUR
-        ((void (*)(void *, void *))(g_base + RVA_STRING_COPY_CTOR))(item + 0x10, text);
-        ready = 1;
-        logf("players option: fourth item built");
-    }
-    return item;
-}
+#define COMBO_REQUEST (0x3e08 - 0x3f58)      // the dialog's request pointer, from the list
 
 static unsigned combo_count(char *list) {
     unsigned n = *(unsigned *)(list + COMBO_COUNT);
-    return n == 3 ? 4 : n;  // only the full one/two/three list gets the extra entry
+    // the game's own refresh compares the real count (3 / 2 / 1) to decide whether to rebuild the list
+    unsigned from = (unsigned)((char *)__builtin_return_address(0) - g_base);
+    if (from == 0x9fb070 || from == 0x9fb175 || from == 0x9fb318) return n;
+    if (n == 2 || n == 3) {
+        char *req = *(char **)(list + COMBO_REQUEST);
+        if (req && !IsBadReadPtr(req + 0x49, 1) && (req[0x49] == 1 || req[0x49] == 3)) req[0x49] = 0;  // not shown (3: the old fourth option): "Team"
+    }
+    return n == 3 ? 2 : n == 2 ? 1 : n;
 }
 
 static char *combo_item(char *list, int index) {
-    if (index == 3 && *(unsigned *)(list + COMBO_COUNT) == 3) return fourth_item();
+    unsigned n = *(unsigned *)(list + COMBO_COUNT);
+    if (n == 3 && index == 1) index = 2;  // [1 player, 3 players]
+    else if (n == 2 && index == 0) index = 1;  // [3 players]
     char *items = list + COMBO_ITEMS;
     return items + ((0 - (unsigned)(SIZE_T)items) & 7) + (long long)index * COMBO_ITEM_SIZE;
 }
@@ -5934,10 +5925,9 @@ static void party_host_over(void) {
     if (g_lobby) g_party_old_lobby = g_lobby;
     g_party = PARTY_OFF, g_party_host = 0;
 }
-// The menu's password (request +0x48 == 1, UTF-16 at *(request +8), else *(request +0x18), as 0xb67cc0 reads
-// it); NULL when none is typed.
+// The menu's password (UTF-16 at *(request +8), else *(request +0x18), as 0xb67cc0 reads it); NULL when none is
+// typed. The game also asks for request +0x48 == 1 ("No. of Password Players": two); our team uses it either way.
 static unsigned short *party_password(char *request) {
-    if (request[0x48] != 1) return NULL;
     unsigned short *w = *(unsigned short **)(request + 8);
     if (!w) w = *(unsigned short **)(request + 0x18);
     return w && !IsBadReadPtr(w, 2) && *w ? w : NULL;
@@ -6502,7 +6492,7 @@ static void step_hook(void *ctrl, void *time, int step) {
 
 // The menu's start request reaches the context through "fill context" (0xb67cc0, two call sites):
 // u64 (self*, request*), with the context at self+8. In the request: the "Number of Players" choice
-// at +0x49 (0 three, 1 two, 2 one; 3 is our fourth option) and the chosen Target rows as a u32
+// at +0x49 (0 three, 1 two, 2 one) and the chosen Target rows as a u32
 // vector at +0x58 (begin) / +0x60 (end). The function turns rows into boss numbers, where our row
 // becomes boss 0, and the choice into a player count.
 #define RVA_FILL_CONTEXT       0xb67cc0
@@ -6510,7 +6500,7 @@ static void step_hook(void *ctrl, void *time, int step) {
 #define RVA_FILL_CONTEXT_CALL2 0xb671e0  // e8 db 0a 00 00
 #define REQ_PLAYERS_CHOICE     0x49
 #define REQ_ROWS_BEGIN         0x58
-#define PLAYERS_CHOICE_FOUR    3         // value of our combo item
+#define PLAYERS_CHOICE_FOUR    3         // the old fourth option's value; the offline compare below still admits it (harmless)
 static char *g_dialog;                       // defined with the start button code below
 static int cursor_on_invasion(char *dialog);
 static unsigned long long fill_context_hook(char *self, char *request) {
@@ -6520,15 +6510,7 @@ static unsigned long long fill_context_hook(char *self, char *request) {
     // fall back on the chosen rows, where the game itself looks at the last one for its special row.
     int invasion = cursor_on_invasion(g_dialog);
     if (invasion < 0) invasion = count && count <= 64 && begin[count - 1] == INVASION_ROW;
-    // Four players: let the game set everything up as for its largest squad, then correct the count.
-    int four = (unsigned char)request[REQ_PLAYERS_CHOICE] == PLAYERS_CHOICE_FOUR;
-    if (four) request[REQ_PLAYERS_CHOICE] = 0;
     unsigned long long result = ((unsigned long long (*)(char *, char *))(g_base + RVA_FILL_CONTEXT))(self, request);
-    if (four) {
-        request[REQ_PLAYERS_CHOICE] = PLAYERS_CHOICE_FOUR;
-        char *ctx = *(char **)(self + 8);
-        if (ctx && *(char **)ctx == g_base + RVA_QM_CONTEXT_VTABLE) *(unsigned *)(ctx + QM_CTX_PLAYERS) = 4;
-    }
     g_invasion_pending = invasion;
     g_request_tick = GetTickCount();
     unsigned char choice = (unsigned char)request[REQ_PLAYERS_CHOICE];
