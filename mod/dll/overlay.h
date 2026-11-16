@@ -112,14 +112,14 @@ static void ov_set_lines(const unsigned short *const *lines, int n) {
         return;
     }
     HGDIOBJ oldb = gdi.SelectObject(dc, bmp);
-    HFONT font = gdi.CreateFontW(-22, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+    HFONT font = gdi.CreateFontW(-15, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                              ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
     HGDIOBJ oldf = font ? gdi.SelectObject(dc, font) : NULL;
     memset(bits, 0, OV_W * OV_H * 4);
     gdi.SetBkMode(dc, TRANSPARENT);
     gdi.SetTextColor(dc, RGB(255, 255, 255));
     for (int i = 0; i < n && i < 3; i++) {
-        RECT r = {0, 4 + i * 30, OV_W - 8, 4 + i * 30 + 28};
+        RECT r = {0, 4 + i * 20, OV_W - 8, 4 + i * 20 + 19};
         DrawTextW(dc, (const wchar_t *)lines[i], -1, &r, DT_RIGHT | DT_SINGLELINE | DT_NOPREFIX);
     }
     gdi.GdiFlush();
