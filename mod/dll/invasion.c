@@ -4696,9 +4696,9 @@ static int our_speffect_active(char *chr) {
     if (!ref.row) return -1;  // row not in regulation.bin
     return effect_entry_of(chr, ref.row) != NULL;
 }
-// no-sprint (test setting, default on): no sprint for our character. The script starts one with ExecSprintStart,
-// which fires the behaviour event W_SprintStart through hkbFireEvent (ExecEventAllBody -> ExecEvent); fire_hook
-// drops that event for our character. It also sets MoveSpeedIndex 3 directly (act_wrap turns it into 2).
+// no-sprint (test setting, default on): no sprint for our character. env_wrap makes the script skip the sprint
+// start (ExecSprintStart is not called, so the button changes nothing); the script also sets MoveSpeedIndex 3
+// directly (act 148), which act_wrap turns into 2.
 // Until 0998865 the start was blocked with SpEffect 102610 instead: in the game that is the spirit-hawk ride marker
 // (common.emevd event 1161: player has 102610 and not 99230 for 2 s -> OperationGuideParam 101, "Disembark";
 // event 1111 and 90035204/90035221/90035227 of common_func wait for it to end), so the HUD showed "Disembark".
@@ -4726,8 +4726,7 @@ static char *speffect_entry(char *chr, unsigned id) {  // the active entry of Sp
 // Name from 0x140d40640(L, 2), as act 148 in the dispatcher 0x1403f5870 reads it.
 static int (*g_act_real)(void *);
 static volatile LONG g_act_seen, g_act_ours, g_act_all, g_act_148;
-static int g_fire_hooked;
-static volatile LONG g_sprint_dropped;  // W_SprintStart events of our character not fired (fire_hook)
+
 static int act_wrap(void *L) {
     if (setting(S_NO_SPRINT) && L && !IsBadReadPtr((char *)L + 0x48, 16)) {
         char *base = *(char **)((char *)L + 0x50), *top = *(char **)((char *)L + 0x48);
@@ -4755,13 +4754,7 @@ static int act_wrap(void *L) {
     }
     return g_act_real(L);
 }
-// hkbFireEvent (0x1415e9810, registered by 0x140c70fc0): reads its event name with 0x14167bc80(L, 1, 0) and fires
-// it on the behaviour graph; returns 0 (no results). Hooked at its first instruction (mov [rsp+8],rbx, 5 bytes;
-// the trampoline runs that and jumps to 0x1415e9815). "W_SprintStart" for our character (the same chain to the
-// ChrIns as act_wrap: 0x1415c93c0(L) depends on L only, and hkbFireEvent's own 0x1415e1260/0x1415e06b0 calls are
-// the ones inside it) is not fired: return 0 like the original.
-static int (*g_fire_real)(void *);
-static char *script_chr(void *L) {  // the ChrIns whose script L is (act dispatcher chain, see act_wrap)
+static char *script_chr(void *L) {  // the ChrIns whose script L is (act and env use the same chain up to r8)
     void **x = ((void **(*)(void *))(g_base + 0x15c93c0))(L);
     char *r8 = x && !IsBadReadPtr(x, 8) && *x && !IsBadReadPtr((char *)*x + 0x28, 8) ? *(char **)((char *)*x + 0x28) : NULL;
     char *m = r8 && !IsBadReadPtr(r8 + 0x1b8, 8) ? *(char **)(r8 + 0x1b8) : NULL;
@@ -4769,48 +4762,46 @@ static char *script_chr(void *L) {  // the ChrIns whose script L is (act dispatc
     char **obj = m2 && !IsBadReadPtr(m2 + 0x10, 8) ? *(char ***)(m2 + 0x10) : NULL;
     return obj && !IsBadReadPtr(obj, 8) ? *obj : NULL;
 }
-static int fire_hook(void *L) {
-    if (setting(S_NO_SPRINT) && L) {
-        const char *ev = ((const char *(*)(void *, int, void *))(g_base + 0x167bc80))(L, 1, NULL);
-        if (ev && !strcmp(ev, "W_SprintStart")) {
+// The sprint start, without a SpEffect: SpeedUpdate pc 522-560 / SpeedUpdate2 call ExecSprintStart only while
+// ISENABLE_SPRINTSTART, the button (env 1108 ACTION_ARM_L3 > 0), no SetSlowFeet, stamina env(1001) >= 0, and
+// env(1116, 102610) and env(1116, 102001) are FALSE. HKS `env` (0x141624170) calls the pointer at 0x14467afe0 (set to
+// 0x140d403f0 by 0x140d400b0), which passes r8 = *(0x1415c93c0(L))+0x28 to the handler 0x140408030 (registered by
+// 0x140d7dfdc through 0x140d58780): obj = [[r8+0x1b8]+0x10]+0x18, dispatcher 0x1403f7b50(obj, id, L), whose env 1116
+// is 0x1403d2100(*obj, id): "has SpEffect" on the ChrIns *obj (chr+0x190 list). The binding pushes the returned
+// number (0x141624130); TRUE is 1. For env(1116, 102610) on our character we answer 1 without the SpEffect being
+// there: the script then skips the sprint start (pc 547) exactly as with the old marker, and nothing else sees it
+// (the events and the guide test the real effect). Script uses of env(1116, 102610): SpeedUpdate pc 544,
+// SpeedUpdate2 pc 402, ExecDashTurn pc 42 (turn animation, only with 100170).
+static int (*g_env_real)(void *);
+static volatile LONG g_env_answered;
+static int env_wrap(void *L) {
+    if (setting(S_NO_SPRINT) && L && !IsBadReadPtr((char *)L + 0x48, 16)) {
+        char *base = *(char **)((char *)L + 0x50), *top = *(char **)((char *)L + 0x48);
+        if (base && top >= base + 2 * 16 && *(unsigned *)base == 3 && *(float *)(base + 8) == 1116.0f && *(unsigned *)(base + 16) == 3 &&
+            *(float *)(base + 24) == 102610.0f) {
             char *chr = script_chr(L);
-            if (chr && chr == local_player()) { InterlockedIncrement(&g_sprint_dropped); return 0; }
+            if (chr && chr == local_player()) { InterlockedIncrement(&g_env_answered); return 1; }
         }
     }
-    return g_fire_real(L);
-}
-static void fire_hook_install(void) {  // DllMain, before the game runs: a 5-byte patch at the function's start
-    unsigned char *site = (unsigned char *)g_base + 0x15e9810;
-    static const unsigned char want[5] = {0x48, 0x89, 0x5c, 0x24, 0x08};
-    unsigned char *tramp = near_alloc(32), *stub = near_alloc(12);
-    if (memcmp(site, want, 5) || !tramp || !stub) return;
-    memcpy(tramp, want, 5);
-    tramp[5] = 0xFF, tramp[6] = 0x25, memset(tramp + 7, 0, 4);  // jmp [rip+0]
-    unsigned char *back = site + 5;
-    memcpy(tramp + 11, &back, 8);
-    void *hook = (void *)fire_hook;
-    stub[0] = 0x48, stub[1] = 0xB8, memcpy(stub + 2, &hook, 8), stub[10] = 0xFF, stub[11] = 0xE0;  // mov rax, hook; jmp rax
-    g_fire_real = (int (*)(void *))tramp;
-    DWORD old;
-    if (!VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &old)) return;
-    int rel = (int)(stub - (site + 5));
-    site[0] = 0xE9, memcpy(site + 1, &rel, 4);
-    VirtualProtect(site, 5, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), site, 5);
-    g_fire_hooked = 1;
+    return g_env_real(L);
 }
 static void act_wrap_tick(void) {  // run thread: put the wrapper in (again, if the game set the pointer anew)
-    void **slot = (void **)(g_base + 0x467afe8);
+    void **slot = (void **)(g_base + 0x467afe8), **eslot = (void **)(g_base + 0x467afe0);
     if (*slot == (void *)(g_base + 0xd40310)) {
         g_act_real = (int (*)(void *))*slot;
         *slot = (void *)act_wrap;
         logf("no sprint: HKS act wrapped (MoveSpeedIndex 3 -> 2 on our character)");
     }
+    if (*eslot == (void *)(g_base + 0xd403f0)) {
+        g_env_real = (int (*)(void *))*eslot;
+        *eslot = (void *)env_wrap;
+        logf("no sprint: HKS env wrapped (sprint start refused for our character)");
+    }
     static DWORD next;
-    if (g_act_all && (int)(GetTickCount() - next) >= 0) {  // every 30 s while scripts run
+    if ((g_act_all || g_env_answered) && (int)(GetTickCount() - next) >= 0) {  // every 30 s while scripts run
         next = GetTickCount() + 30000;
         logf("no sprint: act calls %ld, act 148 (SetVariable) %ld, MoveSpeedIndex = 3 %ld, on our character %ld (set to 2); "
-             "sprint-start event %s", g_act_all, g_act_148, g_act_seen, g_act_ours, g_fire_hooked ? "hooked" : "NOT hooked");
+             "sprint start refused %ld times", g_act_all, g_act_148, g_act_seen, g_act_ours, InterlockedExchange(&g_env_answered, 0));
         g_act_seen = g_act_ours = g_act_all = g_act_148 = 0;
     }
 }
@@ -4848,8 +4839,8 @@ static void no_sprint_frame(void) {
     if (!next_move) next_move = t + 15000;
     if (t >= next_move) {
         if (moving)
-            logf("move check: %d frames, sprint starts dropped %ld; ground speed m/s: still %d, 0.5-2 %d, 2-4 %d, 4-6 %d, 6-8 %d, 8+ %d, top %.1f",
-                 sampled, InterlockedExchange(&g_sprint_dropped, 0), band[0], band[1], band[2], band[3], band[4], band[5], top);
+            logf("move check: %d frames; ground speed m/s: still %d, 0.5-2 %d, 2-4 %d, 4-6 %d, 6-8 %d, 8+ %d, top %.1f",
+                 sampled, band[0], band[1], band[2], band[3], band[4], band[5], top);
         memset(band, 0, sizeof band), moving = sampled = 0, top = 0, next_move = t + 15000;
     }
 }
@@ -6498,7 +6489,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved) {
         if (dot) strcpy(dot, ".log");
         g_base = (char *)GetModuleHandleA(NULL);
         crash_install(self);
-        if (((IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew))->FileHeader.TimeDateStamp == GAME_TIMESTAMP) fastfail_install(), fire_hook_install();
+        if (((IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew))->FileHeader.TimeDateStamp == GAME_TIMESTAMP) fastfail_install();
         IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew);
         // The guard goes in first, here rather than in run(): this runs before me3 lets the game go
         // on, while run() starts only later, alongside the game's own start-up.
