@@ -48,6 +48,9 @@ static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnj
 // Polish for the Polish game, English for every other language. Keep in sync with mod/build_msg.py.
 // (Adjacent string literals keep \x escapes from swallowing the letters that follow them.)
 static const struct { u32 id; const char *english, *polish; } OUR_TEXT[] = {
+    {130305, "Commence Team Expedition", "Rozpocznij wypraw\xc4\x99 dru\xc5\xbcyny"},
+    {130408, "Team", "Dru\xc5\xbcyna"},  // the game's "three players": a team too (the list cannot lose an entry)
+    {130417, "Team", "Dru\xc5\xbcyna"},  // the game's "two players": team (the DLL joins or hosts a session)
     {130460, "4 players", "4 graczy"},
     {131160, "Invasion", "Najazd"},
     {131161, "Enter another squad's expedition as an invader.\nDefeat its host to win.",
@@ -2590,7 +2593,7 @@ int core_selftest(void) {
                                 "nope = true\r\nloot-test = yes\r\n\r\ndebug-log = false\r\ntest-level = 15\r\nmap-group = 3\r\nult-pvp = 250\r\none-region = 1000";
         short v[SETTINGS_COUNT];
         char bad[64];
-        static const short want[SETTINGS_COUNT] = {1, 1, -1, -1, 0, -1, 15, -1, -1, 3, -1, -1, -1, -1, 250, -1, -1, -1, -1};
+        static const short want[SETTINGS_COUNT] = {1, 1, -1, -1, 0, -1, 15, -1, -1, 3, -1, -1, -1, -1, 250, -1, -1, -1};
         int good = settings_parse(t, sizeof t - 1, v, bad, sizeof bad) == 3 && !memcmp(v, want, sizeof v) &&
                    !strcmp(bad, "nope = true, loot-test = yes, one-region = 1000");
         good = good && !load_settings("/nonexistent/test-settings.toml", v);

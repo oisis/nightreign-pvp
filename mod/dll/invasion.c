@@ -531,9 +531,13 @@ static void **session_impl(char *sm) {
 }
 
 // How many invaders a squad of this size may get. Design rule: 1:1, 2:1, 3:2, 4:2.
+// Team play: the game has 2 remote player-data slots (0x1401fe4c0 returns 2; 0x1401fe530, 0x1401fe150 stop at 2),
+// so a session holds 3 players. Line-ups within that: solo host + 1 invader, squad of 2 + 1 invader; a squad of 3
+// takes no invader (3:1, 2:2, 3:2 need more slots).
+#define SESSION_PLAYERS_MAX 3
 static unsigned invaders_allowed(unsigned squad) {
-    static const unsigned table[] = {0, 1, 1, 2, 2};
-    return squad < sizeof table / sizeof *table ? table[squad] : 2;
+    static const unsigned table[] = {0, 1, 1, 0};
+    return squad < sizeof table / sizeof *table ? table[squad] : 0;
 }
 
 // Log the session manager's state whenever it changes.
@@ -1051,7 +1055,7 @@ static int our_speffect_active(char *chr);
 // invasion (in the host's world), and the host hides every character that has once carried our effect
 // in this session.
 static int g_join_in_world(void);
-// Allies (setting "ally" on the joiner): the same join, without our team effect, so the joiner keeps the base
+// Allies (the menu's "team" choice): the same join, without our team effect, so the joiner keeps the base
 // team 2 both machines give a remote player (0x3d77d0) and the game's relation 2 <-> 2 is Friend (table
 // 0x14398d410). Each joiner writes its role into its Steam lobby member data (nrpvp_role); a member without one
 // counts as an invader, as before. Rules that were "someone is in my session" now ask for an invader in it.
@@ -3508,6 +3512,9 @@ static DWORD g_request_tick;  // when the last start request arrived
 #define LOBBY_START_KEY  "nrpvp_start"   // host's expedition start block (game manager +0xa74), 8 hex digits
 #define LOBBY_ALLY_FREE_KEY "nrpvp_ally_free"  // free places in the host's squad for allies (squad of three)
 #define LOBBY_ROLE_KEY   "nrpvp_role"    // a joiner's own lobby member data: "ally" or "invader"
+#define LOBBY_LEVEL_KEY  "nrpvp_lvl"     // host's level (player data +0x68)
+#define LOBBY_PHASE_KEY  "nrpvp_phase"   // host's expedition phase: "hub", "field", "boss" (a night boss fight), "late" (day-2 boss beaten)
+#define LOBBY_BORN_KEY   "nrpvp_born"    // when the lobby was marked: seconds since 2026-01-01 UTC (its age for the pick order)
 #define SQUAD_MAX        3               // the game's squad
 #define LOBBY_EQUAL      0               // ELobbyComparison
 #define LOBBY_WORLDWIDE  3               // ELobbyDistanceFilter
@@ -4196,6 +4203,29 @@ static void lobby_mark(void) {
         g_squad = g_party_host ? 1 : members;  // a party host's squad mates are allies (their member data says so)
         g_list_tick = GetTickCount();  // self-check one period after marking
     }
+    {  // team play: level, phase and age for the joiners' pick order (no personal data)
+        static DWORD next;
+        static u64 born_for;
+        if (born_for != g_lobby) {
+            born_for = g_lobby;
+            FILETIME ft;
+            GetSystemTimeAsFileTime(&ft);
+            unsigned long long t = ((unsigned long long)ft.dwHighDateTime << 32 | ft.dwLowDateTime) / 10000000ull;
+            char text[24];
+            snprintf(text, sizeof text, "%llu", t > 13410806400ull ? t - 13410806400ull : 0);  // FILETIME seconds of 2026-01-01
+            lobby_set(LOBBY_BORN_KEY, text);
+        }
+        if ((int)(GetTickCount() - next) >= 0) {
+            next = GetTickCount() + 2000;
+            char *gdm = *(char **)(g_base + 0x3c078d0), *pd = gdm ? *(char **)(gdm + 8) : NULL, text[16];
+            snprintf(text, sizeof text, "%d", pd && !IsBadReadPtr(pd + 0x68, 4) ? *(int *)(pd + 0x68) : 0);
+            lobby_set(LOBBY_LEVEL_KEY, text);
+            // EventFlag.txt names: 7504 / 7509 night boss fight of day 1 / 2, 7502 / 7507 that boss beaten
+            const char *phase = !g_in_expedition ? "hub" : two_flag(7507, 0, 0) ? "late"
+                              : (two_flag(7504, 0, 0) && !two_flag(7502, 0, 0)) || two_flag(7509, 0, 0) ? "boss" : "field";
+            lobby_set(LOBBY_PHASE_KEY, phase);
+        }
+    }
     // Squad: the session's members when the lobby was first marked (the expedition's own players are
     // all in it by InGame). Session members beyond it are invaders; Steam lobby members beyond the
     // session's are someone in the middle of joining, and hold a slot too.
@@ -4218,7 +4248,10 @@ static void lobby_mark(void) {
     if (key == g_marked_squad) return;
     g_marked_squad = key;
     unsigned squad = g_squad + allies, allowed = invaders_allowed(squad);
+    unsigned room = SESSION_PLAYERS_MAX > squad + others ? SESSION_PLAYERS_MAX - squad - others : 0;  // places left in the session
     unsigned free_slots = allowed > others ? allowed - others : 0, ally_free = SQUAD_MAX > squad ? SQUAD_MAX - squad : 0;
+    if (free_slots > room) free_slots = room;
+    if (ally_free > room) ally_free = room;
     if (g_party_host && !g_in_expedition) free_slots = 0;  // no invaders before the host is in its expedition
     char text[16];
     snprintf(text, sizeof text, "%u", squad);
@@ -4289,9 +4322,20 @@ static int lobby_search_frame(const char *who) {
         if (fits && !(g_party && id == g_party_old_lobby)) fit[nfit++] = id;
         if (g_party && !own && id != g_party_old_lobby && (!g_party_lowest || id < g_party_lowest)) g_party_lowest = id;
     }
-    if (g_party) {  // the pool: a random host among those with a free place (our own old lobby left out)
-        chosen = nfit ? fit[(GetTickCount() ^ (DWORD)(uintptr_t)&nfit) % (unsigned)nfit] : 0;
-        if (nfit > 1) logf("%s: %d hosts with a free place, one taken at random", who, nfit);
+    if (g_party) {  // team play: lowest host level, then the oldest lobby; never in a night boss fight or after day 2's
+        chosen = 0;
+        long best_lvl = 0, best_born = 0;
+        for (int i = 0; i < nfit; i++) {
+            const char *ph = g_steam.get_data(g_steam.mm, fit[i], LOBBY_PHASE_KEY), *lv = g_steam.get_data(g_steam.mm, fit[i], LOBBY_LEVEL_KEY);
+            const char *bo = g_steam.get_data(g_steam.mm, fit[i], LOBBY_BORN_KEY);
+            if (ph && (!strcmp(ph, "boss") || !strcmp(ph, "late"))) {
+                logf("%s:   lobby %llu left out: phase %s", who, fit[i], ph);
+                continue;
+            }
+            long l = lv && *lv ? atol(lv) : 0, b = bo && *bo ? atol(bo) : 0;
+            if (!chosen || l < best_lvl || (l == best_lvl && b < best_born)) chosen = fit[i], best_lvl = l, best_born = b;
+        }
+        if (nfit > 1 && chosen) logf("%s: %d hosts with a free place: lobby %llu taken (host level %ld)", who, nfit, chosen, best_lvl);
     }
     if (chosen) logf("%s: %s lobby %llu", who, g_join_test ? "candidate" : "would join (join-test is off)", chosen);
     else logf("%s: no lobby to join", who);
@@ -4341,8 +4385,8 @@ static void join_test_start(void) {
     g_join = 0;
     g_candidate = 0;
     g_join_test = g_enter_test = g_move_test = 1;  // "Invasion" always joins (no switches since 14c271a)
-    g_as_ally = setting(S_ALLY) != 0;
-    logf("join: search started as %s, the first candidate is joined; controller +0x10d %d", g_as_ally ? "an ALLY (setting ally)" : "an invader",
+    g_as_ally = 0;  // the menu's "team" sets it after this (party_frame); "Invasion" is always an invader
+    logf("join: search started as %s, the first candidate is joined; controller +0x10d %d", g_as_ally ? "an ally" : "an invader",
          g_qm_ctrl ? (unsigned char)g_qm_ctrl[QM_CTRL_REFUSED] : -1);
 }
 // Every frame while joining: one line per change of the session's state, with ms since the call.
