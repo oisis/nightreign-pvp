@@ -6604,9 +6604,6 @@ static unsigned long long fill_context_hook(char *self, char *request) {
     // fall back on the chosen rows, where the game itself looks at the last one for its special row.
     int invasion = cursor_on_invasion(g_dialog);
     if (invasion < 0) invasion = count && count <= 64 && begin[count - 1] == INVASION_ROW;
-    // the owner's rule: a typed password means a team start, even when the menu still says one player
-    if (!invasion && (unsigned char)request[REQ_PLAYERS_CHOICE] == 2 && party_password(request))
-        request[REQ_PLAYERS_CHOICE] = 0, logf("party: a password is set: team start (menu said one player)");
     unsigned long long result = ((unsigned long long (*)(char *, char *))(g_base + RVA_FILL_CONTEXT))(self, request);
     g_invasion_pending = invasion;
     g_request_tick = GetTickCount();
