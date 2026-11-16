@@ -13,6 +13,7 @@
 //  - slot allocation (only call: 0x140df5f0e in member add 0x140df5ae0) through slot_alloc: allies 0/1 first,
 //    invaders 2/3 first (lobby member data role at that moment; no role yet = invader), slot-test reverses each group;
 //  - the id sync 0x1401fc260 offline branch clears slots 0 and 1 itself; our wrapper clears 2 and 3 too.
+//  - the party list (3 entries, kept) gets only the local player's side: the remote add 0x140c44760 through party_add.
 // Not changed (display limits accepted by the owner): named messages 0x140bd8b80 and result data 0x140211350 keep
 // local + slots 0/1.
 typedef struct { unsigned rva; unsigned char n; const char *orig, *repl; } cap_site;
@@ -88,6 +89,29 @@ static int slot_alloc(unsigned long long *steam_id) {
     logf("slot: member %04x got slot %d (%s%s)", id_tag(id), slot, ally ? "ally" : "invader or no role yet", test ? ", slot-test" : "");
     return slot;
 }
+// Party list (CS::PartyMemberInfo, [0x143c13258]+0xdc8): 3 entries of 0x30 from +0x28, every loop bounded by 3;
+// the add 0x140aed5f0 writes nothing when they are taken. Added: the local player (0x140c389dd) and each remote
+// character at its creation (0x140c44760, steam id at the caller's [rsp+0x28]). Its readers: party bars, over-head
+// names, event conditions counting party members (0x14059e550/e710, 0x140602670, 0x14073e610), a member's death
+// (0x140aedb20 -> after a timer the session remove 0x140df1130), menus (0x140a98d30, 0x140a94430, 0x1408e0cc0).
+// With late summons (host, ally, invader, ally) the second ally would be left out; so a remote character of the
+// other side (by lobby member data, the owner = host's side) is not added: the list holds the local player's side.
+// No role yet: the game's add, logged.
+static unsigned long long party_add(void *party, void *entry, unsigned long long *steam_id) {
+    unsigned long long id = steam_id && !IsBadReadPtr(steam_id, 8) ? *steam_id : 0, lobby = our_lobby();
+    unsigned long long owner = lobby && id && g_steam.mm && g_diag.owner ? g_diag.owner(g_steam.mm, lobby) : 0;
+    const char *r = owner && id != owner && g_diag.get_member ? g_diag.get_member(g_steam.mm, lobby, id, LOBBY_ROLE_KEY) : NULL;
+    int known = owner && (id == owner || (r && *r)), invader = known && id != owner && strcmp(r, "ally") != 0;
+    int we_invader = g_join == 4 && !g_as_ally;
+    if (known && invader != we_invader) {
+        logf("party list: member %04x (%s) is of the other side: not added", id_tag(id), invader ? "invader" : "host's side");
+        return 0;
+    }
+    unsigned long long got = ((unsigned long long (*)(void *, void *))(g_base + 0xaed5f0))(party, entry);
+    logf("party list: member %04x (%s) %s, %d in the list", id_tag(id), known ? (invader ? "invader" : "host's side") : "no role yet",
+         got & 0xff ? "added" : "not added (full or there)", party && !IsBadReadPtr((char *)party + 0x14, 4) ? *(int *)((char *)party + 0x14) : -1);
+    return got;
+}
 static void capacity_install(void) {  // DllMain
     if (GetModuleHandleA("nrsc.dll")) {
         logf("capacity: Seamless Co-op is loaded: 2 remote player slots (the game's)");
@@ -106,16 +130,20 @@ static void capacity_install(void) {  // DllMain
         if (memcmp(g_base + SYNC_CALLS[i], e8, 5)) { logf("capacity: id sync call %x not as expected: nothing patched", SYNC_CALLS[i]); return; }
     }
     {
-        int rel = (int)(0x214e8d0 - (0x1fd5ea + 5)), rel2 = (int)(0x1fe150 - (0xdf5f0e + 5));
-        unsigned char *a = (unsigned char *)g_base + 0x1fd5ea, *b = (unsigned char *)g_base + 0xdf5f0e;
-        if (a[0] != 0xE8 || memcmp(a + 1, &rel, 4) || b[0] != 0xE8 || memcmp(b + 1, &rel2, 4)) {
+        int rel = (int)(0x214e8d0 - (0x1fd5ea + 5)), rel2 = (int)(0x1fe150 - (0xdf5f0e + 5)), rel3 = (int)(0xaed5f0 - (0xc44760 + 5));
+        unsigned char *a = (unsigned char *)g_base + 0x1fd5ea, *b = (unsigned char *)g_base + 0xdf5f0e, *c = (unsigned char *)g_base + 0xc44760;
+        if (a[0] != 0xE8 || memcmp(a + 1, &rel, 4) || b[0] != 0xE8 || memcmp(b + 1, &rel2, 4) || c[0] != 0xE8 || memcmp(c + 1, &rel3, 4)) {
             logf("capacity: allocation calls not as expected: nothing patched");
             return;
         }
     }
     // the slot allocation stub: rcx = &steam id ([rsp+0x28] at our entry = the caller's [rsp+0x20]), then slot_alloc
-    unsigned char *stub = near_alloc(24);
-    if (!stub) { logf("capacity: no memory near the game: nothing patched"); return; }
+    unsigned char *stub = near_alloc(24), *pstub = near_alloc(24);
+    if (!stub || !pstub) { logf("capacity: no memory near the game: nothing patched"); return; }
+    void *pf = (void *)party_add;  // the party add stub: r8 = &steam id ([rsp+0x30] at our entry = the caller's [rsp+0x28])
+    memcpy(pstub, "\x4c\x8d\x44\x24\x30\x48\xb8", 7);  // lea r8,[rsp+0x30]; mov rax, imm64
+    memcpy(pstub + 7, &pf, 8);
+    pstub[15] = 0xFF, pstub[16] = 0xE0;  // jmp rax
     void *f = (void *)slot_alloc;
     memcpy(stub, "\x48\x8d\x4c\x24\x28\x48\xb8", 7);  // lea rcx,[rsp+0x28]; mov rax, imm64
     memcpy(stub + 7, &f, 8);
@@ -141,6 +169,7 @@ static void capacity_install(void) {  // DllMain
     hook_call(0x1fd5ea, 0x214e8d0, (void *)cap_alloc_hook, "capacity: GameDataMan allocation");
     for (int i = 0; i < 3; i++) hook_call(SYNC_CALLS[i], 0x1fc260, (void *)cap_id_sync_hook, "capacity: id sync");
     patch_rel32((unsigned char *)g_base + 0xdf5f0e + 1, (unsigned char *)g_base + 0xdf5f0e + 5, stub);
+    patch_rel32((unsigned char *)g_base + 0xc44760 + 1, (unsigned char *)g_base + 0xc44760 + 5, pstub);
     g_cap_remote = 4;
-    logf("capacity: %d remote player slots (patched %u sites)", g_cap_remote, patched + 5);
+    logf("capacity: %d remote player slots (patched %u sites); party list: the local player's side only", g_cap_remote, patched + 6);
 }
