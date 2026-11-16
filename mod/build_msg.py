@@ -24,6 +24,9 @@ OUR_TEXT = {
         131172: ("Squads in an expedition: %d", "Drużyny w wyprawie: %d"),  # counts overlay, %d filled in by the DLL
         131173: ("Squads looking for a player: %d", "Drużyny szukające gracza: %d"),
         131174: ("Hosts waiting in the hub: %d", "Hosty czekające w Twierdzy: %d"),
+        131175: ("Host", "Host"),  # expedition ping overlay labels (the DLL adds ": N ms")
+        131176: ("Ally", "Sojusznik"),
+        131177: ("Invader", "Najeźdźca"),
         131160: ("Invasion", "Najazd"),
         131161: ("Enter another squad's expedition as an invader.\nDefeat its host to win.",
                  "Wejdź do wyprawy innej drużyny jako najeźdźca.\nPokonaj hosta, aby wygrać."),

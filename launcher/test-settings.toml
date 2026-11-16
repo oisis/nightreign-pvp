@@ -13,6 +13,6 @@ revive-hits = false       # test, invasions: a downed player is finished by the 
 no-sprint = true          # the fast run (sprint) is off; false turns it back on
 ult-pvp = 100             # test, invasions: ultimate damage against players of the other side in percent (100 = unchanged, 0..999)
 party = 0                 # test only: a number mixed into the squad matchmaking key, to keep test runs apart (0 = off)
-show-ping = true          # the round trip to each other player (ms) after its name on the party bars; false hides it
+show-ping = true          # the round trip (ms): after each name on the party bars, and to the other side (invaders / host and allies) in the top-right corner during an expedition; false hides both
 show-counts = true        # in the Roundtable Hold: how many mod squads are in an expedition / looking for a player, top right; false hides it
 slot-test = false         # test: new session members take the highest free player slot first (3 machines reach slots 3 and 2)

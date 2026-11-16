@@ -1,5 +1,5 @@
-// Online counts overlay (show-counts, default on): a few lines of text in the top-right corner, drawn on the
-// game's own D3D12 swap chain right before its Present.
+// Corner overlay: a few lines of text in the top-right corner, drawn on the game's own D3D12 swap chain right before
+// its Present. In the hub the online counts (show-counts), in an expedition the ping to the other side (show-ping).
 //
 // How we get there (the game's imports: dxgi CreateDXGIFactory / CreateDXGIFactory1, d3d12 by ordinal):
 //  - DllMain patches those two import slots; the factory they return gets CreateSwapChain and
