@@ -4166,6 +4166,44 @@ static void **name_hook(void **out, char *chr, unsigned char flag, void *a4) {  
     r[0] = g_name_buf;
     return r;
 }
+// Ping in the enemy tag (show-ping): the tag over a hostile player (CSFeMan +0xca60, 8 entries of 0x70) is added
+// when it takes damage (0x1407c5710 -> 0x1407dd3f0, which also sets +0x2c to 0) and dropped by the per-frame update
+// 0x1407d8c40 once +0x2c, the time since the last hit, reaches 1.5 s (0x142be32b4). The view 0x1407c8a90 (from
+// 0x1407c8f83) rebuilds the eight tags each frame and gets each name with 0x7aa960(out, chr, 0) at 0x7c8cb4; it keeps
+// out[0] as the text pointer, so the tag's text lives in a buffer per character here. Only for a member of the
+// other side (lobby member data: owner and "ally" = host's side) and while its echo answers ("name  N ms").
+static void **tag_name_hook(void **out, char *chr, unsigned char flag, void *a4) {
+    void **r = ((void **(*)(void **, char *, unsigned char, void *))(g_base + 0x7aa960))(out, chr, flag, a4);
+    if (!r || !chr || !g_in_exped || !setting(S_SHOW_PING) || IsBadReadPtr(chr, 0x600)) return r;
+    int no = -1;
+    ((int *(*)(char *, int *))(g_base + 0x66c6f0))(chr, &no);
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
+    char *b = sm ? *(char **)(sm + SM_PLAYERS_BEGIN) : NULL, *e = sm ? *(char **)(sm + SM_PLAYERS_BEGIN + 8) : NULL;
+    u64 id = 0, lobby = our_lobby(), owner = lobby && g_steam.mm && g_diag.owner ? g_diag.owner(g_steam.mm, lobby) : 0;
+    for (char *m = b; no != -1 && b && m < e && !IsBadReadPtr(m, SM_PLAYER_SIZE); m += SM_PLAYER_SIZE)
+        if (*(int *)(m + 0xd4) == no && !m[0xe1]) id = *(u64 *)(m + 0x10);
+    if (!id || !owner) return r;
+    int invader = id != owner && !member_ally(lobby, id), we_invader = g_join == 4 && !g_as_ally;
+    struct lag_peer *p = invader != we_invader ? lag_find(id) : NULL;
+    if (!p || !p->rtt_last_ok) return r;
+    static char *who[8];
+    static unsigned short buf[8][96];
+    int k = 0;
+    while (k < 8 && who[k] != chr) k++;
+    if (k == 8) {
+        static int next;
+        k = next, next = (next + 1) % 8, who[k] = chr;
+    }
+    const unsigned short *name = r[0] ? (const unsigned short *)r[0] : (const unsigned short *)r[2];
+    int n = 0;
+    while (name && !IsBadReadPtr(name + n, 2) && name[n] && n < 64) buf[k][n] = name[n], n++;
+    char tail[24];
+    snprintf(tail, sizeof tail, "  %d ms", p->rtt_shown);
+    for (int i = 0; tail[i] && n < 95; i++) buf[k][n++] = (unsigned char)tail[i];
+    buf[k][n] = 0;
+    r[0] = buf[k];
+    return r;
+}
 static void lag_tick(void) {  // run thread; once Steam is ready: hooks and the echo thread
     static int done;
     if (done || !steam_ready() || !g_diag.net || !g_diag.member || !g_diag.self || !g_diag.user) return;
@@ -4182,6 +4220,7 @@ static void lag_tick(void) {  // run thread; once Steam is ready: hooks and the 
     CreateThread(NULL, 0, lag_thread, NULL, 0, NULL);
     logf("lag: measuring (echo on P2P channel %d, game packets counted per member, a line every %d s)", LAG_CHANNEL, LAG_LOG_MS / 1000);
     hook_call(0x7dab36, 0x7aa960, (void *)name_hook, "lag: party bar name (ping after it)");
+    hook_call(0x7c8cb4, 0x7aa960, (void *)tag_name_hook, "lag: enemy tag name (ping after it)");
 }
 // Remote session members other than the session host (the lobby owner): allies (want_allies 1) or invaders (0;
 // a member without a role is an invader). Recounted at most every 250 ms.
@@ -6565,6 +6604,9 @@ static unsigned long long fill_context_hook(char *self, char *request) {
     // fall back on the chosen rows, where the game itself looks at the last one for its special row.
     int invasion = cursor_on_invasion(g_dialog);
     if (invasion < 0) invasion = count && count <= 64 && begin[count - 1] == INVASION_ROW;
+    // the owner's rule: a typed password means a team start, even when the menu still says one player
+    if (!invasion && (unsigned char)request[REQ_PLAYERS_CHOICE] == 2 && party_password(request))
+        request[REQ_PLAYERS_CHOICE] = 0, logf("party: a password is set: team start (menu said one player)");
     unsigned long long result = ((unsigned long long (*)(char *, char *))(g_base + RVA_FILL_CONTEXT))(self, request);
     g_invasion_pending = invasion;
     g_request_tick = GetTickCount();
