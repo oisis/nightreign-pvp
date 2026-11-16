@@ -62,7 +62,7 @@ static const char *const KEY_LINES[] = {
     "host: session up", "host: expedition reached", "host: expedition over", "host: member admitted", "role: ",
     "host: no member left", "leave done", "join: search started", "joining lobby", "join -> ", "stopping (",
     "in the host's world", "world sync at step", "invasion won", "invasion lost", "invasion neither", "level: ", "map test", "two-regions", "expedition: result", "reward test: won", "reward test: lost",
-    "expedition end requested", "flags: ", "lag: ", "move check: ", "map test",  "still down", "watchdog", "no map load", "went back", "code patch", "crash"};
+    "expedition end requested", "flags: ", "lag: ", "move check: ", "map pin: ", "name tag: ", "map test",  "still down", "watchdog", "no map load", "went back", "code patch", "crash"};
 static void logf(const char *fmt, ...) {
     char line[1024];
     va_list ap;
@@ -1080,6 +1080,9 @@ static int member_no_is_invader(int no);    // a remote session member with this
 static int g_host_killed, g_reward_pending;  // decision 23, defined with join_over
 static int g_host_player_no = -1;  // invader: the session host's player number (member +0xd4), -1 unknown
 static char *g_hud_invaders[4];
+static unsigned long long pin_read_73(void *a, unsigned long long *sender, void *buf);
+static unsigned long long pin_read_74(void *a, unsigned long long *sender, void *buf);
+static void remote_tags_hook(void *a, void *b, void *c, void *d);
 static int g_host_switched, g_host_old_dc;
 // Who ends a session: every readable call of the session leave (0xdf1180, 44 call sites) and of the
 // client's role-1 timeout leave (0xdf5840) is logged with its call site (the return address) and
@@ -2911,6 +2914,11 @@ static void hook_acceptance(void) {
         if ((g_settings[S_ULT_PVP] && g_settings[S_ULT_PVP] != 100) || g_debug_log) ult_pvp_install();
         rune_install();
         pkt_guard_install();
+        hook_call(0xba0e42, 0xddb9c0, (void *)pin_read_73, "map pin: pin packet read (1)");
+        hook_call(0xba11aa, 0xddb9c0, (void *)pin_read_73, "map pin: pin packet read (2)");
+        hook_call(0xba11e6, 0xddb900, (void *)pin_read_74, "map pin: pin reaction read (1)");
+        hook_call(0xba130c, 0xddb900, (void *)pin_read_74, "map pin: pin reaction read (2)");
+        hook_call(0xc3bb92, 0x7d9f80, (void *)remote_tags_hook, "name tag: over-head names");
     }
     hook_call(0xc27a41, 0x6b06f0, (void *)map_request_hook, "two-regions: map request");
     hook_call(0x5e7ff6, 0x6ab300, (void *)tile_flag_space_hook, "two-regions: tile flag space");
@@ -4784,6 +4792,58 @@ static int env_wrap(void *L) {
         }
     }
     return g_env_real(L);
+}
+
+// Map pins placed by players (decision: the other side's pins are not seen). CS::CSPinManImp (global 0x143c17be0)
+// reads them in its update 0x140ba0d90: packet 0x73 (40 bytes, the pin: kind < 3, pin id with the owner's player
+// number in the high 16 bits, position; checked by 0x140de4ac0) through 0x140ddb9c0, and packet 0x74 (12 bytes,
+// a reaction to a pin, sent to the pin's owner by 0x140ddf7f0) through 0x140ddb900; both use 0x140df1de0, which
+// also gives the sender's Steam id. Kind 0 creates the pin in the manager's list, which the map, the compass and
+// the beacon draw from (0x140ee1fb0 walks the same list). We read on in a loop and leave out every packet whose
+// sender is on the other side: the invader drops the host's and the allies' pins, the host and the allies drop
+// the invaders'. Side by the lobby: the owner and members with role "ally" are the host's side. System markers
+// (graces, bosses, events) are not pins of this manager and are not touched.
+static int pin_from_other_side(u64 sender) {
+    u64 lobby = our_lobby();
+    if (!lobby || !sender || !g_steam.mm || !g_diag.owner) return 0;
+    u64 owner = g_diag.owner(g_steam.mm, lobby);
+    int sender_invader = sender != owner && !member_ally(lobby, sender), we_invader = g_join == 4 && !g_as_ally;
+    return sender_invader != we_invader;
+}
+static unsigned long long pin_read(unsigned rva, int type, void *a, u64 *sender, void *buf) {
+    for (;;) {
+        unsigned long long r = ((unsigned long long (*)(void *, u64 *, void *))(g_base + rva))(a, sender, buf);
+        if (!(r & 0xff) || !sender || !pin_from_other_side(*sender)) return r;
+        static DWORD next;
+        if ((int)(GetTickCount() - next) >= 0)
+            next = GetTickCount() + 5000, logf("map pin: packet 0x%x from member %04x of the other side left out", type, id_tag(*sender));
+    }
+}
+static unsigned long long pin_read_73(void *a, unsigned long long *sender, void *buf) { return pin_read(0xddb9c0, 0x73, a, sender, buf); }
+static unsigned long long pin_read_74(void *a, unsigned long long *sender, void *buf) { return pin_read(0xddb900, 0x74, a, sender, buf); }
+// Over-head name of other players (CSFeMan 0x143c14a70): 0x1407d9f80 (called at 0x140c3bb92) fills 7 tag slots,
+// FE +0xd350 + i*0x60, for the members of the party list (0x140aed2a0): name, screen position, +0x18 "shown"
+// (1 while on screen; no distance limit in the code), +0x50 the character's handle. The draw 0x1407cefc0 draws a
+// slot only while +0x18 is set (and looks the handle up with 0x140518f30). The invader is in the party list on the
+// host, so the host saw his name at any distance. After the fill, on the host's side, a slot whose character
+// carries our team effect is set not shown. The enemy tag (FE +0xca60, name with HP bar, added by 0x1407c5710 when
+// a hostile player loses HP) is the game's own and stays. On the invader the party lookups already give no
+// character (hud_lookup_hook), so he sees no over-head names of the host's side either.
+static void remote_tags_hook(void *a, void *b, void *c, void *d) {
+    ((void (*)(void *, void *, void *, void *))(g_base + 0x7d9f80))(a, b, c, d);
+    if (g_join == 4 && !g_as_ally) return;
+    char *fe = *(char **)(g_base + 0x3c14a70), *wcm = *(char **)(g_base + 0x3c0f0a8);
+    if (!fe || !wcm || IsBadReadPtr(fe + 0xd350, 7 * 0x60)) return;
+    for (int i = 0; i < 7; i++) {
+        char *slot = fe + 0xd350 + i * 0x60;
+        if (!slot[0x18]) continue;
+        char *chr = ((char *(*)(void *, void *))(g_base + 0x518f30))(wcm, slot + 0x50);
+        if (chr && !IsBadReadPtr(chr, 0x200) && our_speffect_active(chr) == 1) {
+            slot[0x18] = 0;
+            static DWORD next;
+            if ((int)(GetTickCount() - next) >= 0) next = GetTickCount() + 10000, logf("name tag: over-head name of a character with our team effect not shown");
+        }
+    }
 }
 static void act_wrap_tick(void) {  // run thread: put the wrapper in (again, if the game set the pointer anew)
     void **slot = (void **)(g_base + 0x467afe8), **eslot = (void **)(g_base + 0x467afe0);
