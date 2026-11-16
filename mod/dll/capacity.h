@@ -10,8 +10,8 @@
 //    allocation wrapper; the ctor zeroes +0x10a as before, now unused);
 //  - WorldChrMan character sets: players 0x1404ae430 3 -> 5 entries, per-player set 0x1404ae340 ((id+2)·10+k)
 //    60 -> 80 entries (player ids are reused, lowest free first: <= 5 with 5 players);
-//  - slot allocation (only call: 0x140df5f0e in member add 0x140df5ae0) through slot_alloc: allies 0/1 first,
-//    invaders 2/3 first (lobby member data role at that moment; no role yet = invader), slot-test reverses each group;
+//  - slot allocation (only call: 0x140df5f0e in member add 0x140df5ae0) through slot_alloc: the host's side (lobby
+//    owner, allies) 0/1 first, invaders 2/3 first (lobby member data role at that moment; no role yet = invader), slot-test reverses each group;
 //  - the id sync 0x1401fc260 offline branch clears slots 0 and 1 itself; our wrapper clears 2 and 3 too.
 //  - the party list (3 entries, kept) gets only the local player's side: the remote add 0x140c44760 through party_add.
 // Not changed (display limits accepted by the owner): named messages 0x140bd8b80 and result data 0x140211350 keep
@@ -76,7 +76,8 @@ static int slot_alloc(unsigned long long *steam_id) {
     if (!state) return -1;
     unsigned long long id = steam_id && !IsBadReadPtr(steam_id, 8) ? *steam_id : 0;
     unsigned long long lobby = our_lobby();
-    int ally = id && lobby && member_ally(lobby, id);
+    unsigned long long owner = lobby && g_steam.mm && g_diag.owner ? g_diag.owner(g_steam.mm, lobby) : 0;
+    int ally = id && lobby && (member_ally(lobby, id) || id == owner);  // the host's side: the lobby owner and allies
     int test = setting(S_SLOT_TEST) != 0;
     static const int ORDER[2][2][4] = {{{0, 1, 2, 3}, {2, 3, 0, 1}}, {{1, 0, 3, 2}, {3, 2, 1, 0}}};  // [test][invader]
     const int *o = ORDER[test][!ally];
@@ -86,7 +87,7 @@ static int slot_alloc(unsigned long long *steam_id) {
         if (s < g_cap_remote && !state[s]) slot = s;
     }
     // the session number is given right after this (0x140df5f4d), so the member is named by its tag here
-    logf("slot: member %04x got slot %d (%s%s)", id_tag(id), slot, ally ? "ally" : "invader or no role yet", test ? ", slot-test" : "");
+    logf("slot: member %04x got slot %d (%s%s)", id_tag(id), slot, ally ? "host's side" : "invader or no role yet", test ? ", slot-test" : "");
     return slot;
 }
 // Party list (CS::PartyMemberInfo, [0x143c13258]+0xdc8): 3 entries of 0x30 from +0x28, every loop bounded by 3;

@@ -38,7 +38,7 @@ static int g_cap_remote = 2;  // remote player slots in effect (4 once the capac
 #define SM_PLAYERS_BEGIN 0x78   // players vector: begin, end (+0x80); entries are 0xF0 bytes
 #define SM_PLAYER_SIZE   0xF0
 #define SM_PLAYER_LIMIT  0x170  // u32, 3 in vanilla
-#define SESSION_PLAYERS  6      // squad of four + two invaders
+#define SESSION_PLAYERS  SESSION_PLAYERS_MAX  // one per remote slot plus the local player: 5 with the capacity patch, else 3
 #define IMPL_VT_EXPORT_JOIN_DATA 0x40  // bool (impl*, u32 handle, void *buf, u32 *size)
 
 // Expedition menu, Target list (CS::MatchingBossSelectDialog::_CreateBossList and helpers).
@@ -1848,7 +1848,7 @@ static void map_list_draw(const char *where, char *ctl, char *list, int selected
 }
 static void marker_tick(void) {
     static DWORD next;
-    static char last[2][0x60];
+    static char last[4][0x60];
     char *m = g_map_dialog_model ? g_map_dialog_model : g_view_models[0] ? g_view_models[0] : g_view_models[1];
     if (!m || (int)(GetTickCount() - next) < 0) return;
     next = GetTickCount() + 2000;
@@ -1857,7 +1857,7 @@ static void marker_tick(void) {
         return;
     }
     char **b = *(char ***)(m + 0xb0), **e = *(char ***)(m + 0xb8);
-    for (int i = 0; b && b + i < e && i < 2; i++) {
+    for (int i = 0; b && b + i < e && i < g_cap_remote; i++) {  // one pin per remote slot (0x14090dc80: 0x1401fe4c0 pins)
         char *pin = b[i];
         if (!pin || IsBadReadPtr(pin, 0x60) || !memcmp(last[i], pin, 0x60)) continue;
         memcpy(last[i], pin, 0x60);
@@ -1917,7 +1917,7 @@ static void marker_apply(int map_rule) {
         char *m = g_view_models[k];
         if (!m || IsBadReadPtr(m, 0xc0) || *(char **)m != g_base + 0x2c4a548) continue;
         char **b = *(char ***)(m + 0xb0), **e = *(char ***)(m + 0xb8);
-        for (int i = 0; b && b + i < e && i < 2; i++) {
+        for (int i = 0; b && b + i < e && i < g_cap_remote; i++) {  // one pin per remote slot (0x14090dc80: 0x1401fe4c0 pins)
             char *pin = b[i];
             if (!pin || IsBadReadPtr(pin, 0x20) || !pin[0xc]) continue;
             int no = *(int *)(pin + 0x1c), hide = 0;
@@ -3107,9 +3107,9 @@ static void watch_session(void) {
     static unsigned last_players = 0xffffffff;
     char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
     if (!sm) return;
-    // The game allows three players per session (set once, in the manager's constructor). Ours hold a
-    // squad of up to four plus up to two invaders. Seamless Co-op raises the same field to six.
-    if (*(unsigned *)(sm + SM_PLAYER_LIMIT) == 3) {
+    // The game allows three players per session (set once, in the manager's constructor). With the capacity patch
+    // ours hold a squad of up to three plus up to two invaders: one player per remote slot plus the local one.
+    if (*(unsigned *)(sm + SM_PLAYER_LIMIT) == 3 && SESSION_PLAYERS != 3) {
         *(unsigned *)(sm + SM_PLAYER_LIMIT) = SESSION_PLAYERS;
         logf("session: player limit raised from 3 to %u", SESSION_PLAYERS);
     }
@@ -3815,13 +3815,13 @@ static void name_watch(char *sm, const char *side, int fill) {
 // sides: each slot's handle and HP, and the HP of the character with that handle as this machine sees it.
 static void slot_hp_watch(const char *side) {
     static DWORD next;
-    static int last[2][2] = {{-9, -9}, {-9, -9}};
+    static int last[4][2] = {{-9, -9}, {-9, -9}, {-9, -9}, {-9, -9}};
     if ((int)(GetTickCount() - next) < 0) return;
     next = GetTickCount() + 2000;
     char *ps = *(char **)(g_base + 0x3c078d0), *wcm = *(char **)(g_base + 0x3c0f0a8);
     char *slots = ps ? *(char **)(ps + 0x10) : NULL;
-    if (!slots || !wcm || IsBadReadPtr(slots, 2 * 0x8a0)) return;
-    for (int i = 0; i < 2; i++) {
+    if (!slots || !wcm || IsBadReadPtr(slots, g_cap_remote * 0x8a0)) return;
+    for (int i = 0; i < g_cap_remote; i++) {
         char *sl = slots + i * 0x8a0;
         int hp = *(int *)(sl + 0x10), chp = -1;
         unsigned long long h = *(unsigned long long *)(sl + 8);  // run 19: the player number, not a handle
@@ -5143,7 +5143,7 @@ static void crash_watch_members(void) {
         if (st == 0x1f && (last_state[i] != 0x1f || last_no[i] != no))
             logf("crash watch: member player %d (slot %d) state 1f: its character is made now (we are the %s)", no, slot, role);
         last_state[i] = st, last_no[i] = no;
-        char *sd = !m[0xe1] && pd && slot >= 0 && slot < 2 && *(char **)(pd + 0x10) ? *(char **)(pd + 0x10) + slot * 0x8a0 : NULL;
+        char *sd = !m[0xe1] && pd && slot >= 0 && slot < g_cap_remote && *(char **)(pd + 0x10) ? *(char **)(pd + 0x10) + slot * 0x8a0 : NULL;
         if (sd && no != -1 && !IsBadReadPtr(sd + 8, 4) && *(int *)(sd + 8) != no) id_stale = no, id_had = *(int *)(sd + 8), id_slot = slot;
     }
     for (; i < 8; i++) last_state[i] = -1;
@@ -5479,7 +5479,7 @@ static void enter_watch(char *sm) {
         char *ps = *(char **)(g_base + 0x3c078d0);
         char *slots = ps ? *(char **)(ps + 0x10) : NULL, *pd = ps ? *(char **)(ps + 8) : NULL;
         int host_no = g_host_player_no >= 0 ? g_host_player_no : 1;
-        for (int i = 0; slots && pd && !IsBadReadPtr(slots, 2 * 0x8a0) && !IsBadReadPtr(pd, 0x110) && i < 2; i++) {
+        for (int i = 0; slots && pd && !IsBadReadPtr(slots, g_cap_remote * 0x8a0) && !IsBadReadPtr(pd, 0x110) && i < g_cap_remote; i++) {
             char *sl = slots + i * 0x8a0;
             int no = *(int *)(sl + 8), lv = *(int *)(sl + 0x68);
             if (no != host_no || lv < 1 || lv > 15) continue;
@@ -6703,8 +6703,9 @@ static void diff_region(diff_t *d, void *base, unsigned bytes) {
 }
 static void level_watch(void) {
     static DWORD next;
-    static diff_t pd, cm, sl[2];
+    static diff_t pd, cm, sl[4];
     pd.name = "player data", cm.name = "character data", sl[0].name = "other slot 0", sl[1].name = "other slot 1";
+    sl[2].name = "other slot 2", sl[3].name = "other slot 3";
     if (!g_debug_log || (int)(GetTickCount() - next) < 0) return;
     next = GetTickCount() + 1000;
     char *ps = *(char **)(g_base + 0x3c078d0);
@@ -6718,7 +6719,7 @@ static void level_watch(void) {
     diff_region(&st, ps, 0x400);
     if (g_join_in_world()) {
         char *slots = *(char **)(ps + 0x10);
-        for (int i = 0; i < 2; i++) diff_region(&sl[i], slots ? slots + i * 0x8a0 : NULL, 0x8a0);
+        for (int i = 0; i < g_cap_remote; i++) diff_region(&sl[i], slots ? slots + i * 0x8a0 : NULL, 0x8a0);
     }
 }
 static DWORD WINAPI run(LPVOID self) {
