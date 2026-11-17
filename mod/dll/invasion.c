@@ -1683,6 +1683,41 @@ static int rune_kill_hook(char *chr, float amount, char *enemy, unsigned char fl
                                  full, amount, got);
     return got;
 }
+// Flask charges (measurement, pattern 16: 3 charges, churches 101 / 104 cleared): every write of the HP / FP
+// charge counts goes through 0x20d9d0(PlayerGameData, hp, fp) (+0xff / +0x100). Each call is logged with
+// its site (the call's address, or for the two tail jumps the jump and the caller of the function that
+// jumps), the counts before and after and +0x1a8 (charges added in the expedition), whether it is the
+// local player's data (GameDataMan +8), at most 200 lines a session. Sites: 0x200ed7 load (CharaInitParam
+// +0xfe), 0x20123f / 0x20260e / 0x2027b1 / 0x202a6c / 0x202c94 player-data set-up, 0x5fdafa 2004[86],
+// 0x60acb6 (-1, EMEVD), 0xfd912e (0xfd90e0, from 0xfdee30), jumps 0x7ea74c (0x7ea6f0, lambda 0xa02660) and
+// 0xfd9112.
+static int g_flask_lines;
+static void flask_set_logged(unsigned site, unsigned caller, char *pgd, unsigned hp, unsigned fp) {
+    char *gdm = *(char **)(g_base + 0x3c078d0), *mine = gdm ? *(char **)(gdm + 8) : NULL;
+    unsigned b_hp = pgd ? (unsigned char)pgd[0xff] : 0, b_fp = pgd ? (unsigned char)pgd[0x100] : 0;
+    int b_add = pgd ? *(int *)(pgd + 0x1a8) : 0;
+    ((void (*)(char *, unsigned, unsigned))(g_base + 0x20d9d0))(pgd, hp, fp);
+    if (!pgd || g_flask_lines >= 200) return;
+    g_flask_lines++;
+    logf("flasks: set at %x%s%x (%s): HP %u -> %u (asked %u), FP %u -> %u, added in the expedition (+0x1a8) %d -> %d", site,
+         caller ? ", caller " : "", caller, pgd == mine ? "local player" : "other player data", b_hp, (unsigned char)pgd[0xff], hp & 0xff, b_fp,
+         (unsigned char)pgd[0x100], b_add, *(int *)(pgd + 0x1a8));
+}
+static void flask_call_hook(char *pgd, unsigned hp, unsigned fp) {
+    flask_set_logged((unsigned)((char *)__builtin_return_address(0) - g_base) - 5, 0, pgd, hp, fp);
+}
+static void flask_jmp_7ea_hook(char *pgd, unsigned hp, unsigned fp) {
+    flask_set_logged(0x7ea74c, (unsigned)((char *)__builtin_return_address(0) - g_base), pgd, hp, fp);
+}
+static void flask_jmp_fd9_hook(char *pgd, unsigned hp, unsigned fp) {
+    flask_set_logged(0xfd9112, (unsigned)((char *)__builtin_return_address(0) - g_base), pgd, hp, fp);
+}
+static void flask_log_install(void) {
+    static const unsigned CALLS[] = {0x200ed7, 0x20123f, 0x20260e, 0x2027b1, 0x202a6c, 0x202c94, 0x5fdafa, 0x60acb6, 0xfd912e};
+    for (unsigned i = 0; i < sizeof CALLS / sizeof *CALLS; i++) hook_call(CALLS[i], 0x20d9d0, (void *)flask_call_hook, "flasks: charge write log");
+    hook_jump(0x7ea74c, 0x20d9d0, (void *)flask_jmp_7ea_hook, "flasks: charge write log (jump)");
+    hook_jump(0xfd9112, 0x20d9d0, (void *)flask_jmp_fd9_hook, "flasks: charge write log (jump)");
+}
 static void rune_install(void) {
     hook_call(0x3de800, RUNE_KILL_FN, (void *)rune_kill_hook, "runes: kill reward (own kill)");
     hook_call(0x51dc0b, RUNE_KILL_FN, (void *)rune_kill_hook, "runes: kill reward (reported kill)");
@@ -2937,7 +2972,7 @@ static void two_regions_churches_log(unsigned pat) {
 // +0x20 from it, defaults when the key is missing). Logged each time the map screen is built, per church.
 static void church_pins_log(char *model) {
     char *gm = *(char **)(g_base + 0x3c13258), *man = flag_man();
-    if (!g_debug_log || !g_two_active || !gm || !man || !model || IsBadReadPtr(model, 0x250)) return;
+    if (!g_two_active || !gm || !man || !model || IsBadReadPtr(model, 0x250)) return;  // also without debug-log (pattern 16 measurement)
     unsigned pat = *(unsigned *)(gm + 0xb4c);
     char path[MAX_PATH], line[128], out[700] = "";
     next_to_dll(path, sizeof path, "two-regions.txt");
@@ -2964,8 +2999,9 @@ static void church_pins_log(char *model) {
         if (found && !IsBadReadPtr(found, 0x22))
             snprintf(ent, sizeof ent, "%u/%u/%u/%u/%u", *(unsigned short *)found, *(unsigned short *)(found + 2), *(unsigned short *)(found + 4),
                      (unsigned char)found[0x17], *(unsigned short *)(found + 0x20));
-        snprintf(out + strlen(out), sizeof out - strlen(out), " | %u (m%02u_%02u_%02u): rule %d, %u=%d %u=%d, +0x240 %s", at, area, gx, gz,
-                 gate, 73000 + at, flag_state_in(man, 73000 + at), 74000 + at, flag_state_in(man, 74000 + at), ent);
+        snprintf(out + strlen(out), sizeof out - strlen(out), " | %u (m%02u_%02u_%02u): rule %d, %u=%d %u=%d %u=%d, +0x240 %s", at, area, gx, gz,
+                 gate, 73000 + at, flag_state_in(man, 73000 + at), 74000 + at, flag_state_in(man, 74000 + at), 73810 + at,
+                 flag_state_in(man, 73810 + at), ent);
         n++;
     }
     if (f) fclose(f);
@@ -3061,6 +3097,7 @@ static void hook_acceptance(void) {
         hook_call(0x43dac3, 0x66dec0, (void *)finish_hit_hook, "finish test: gauge hit");
         if ((g_settings[S_ULT_PVP] && g_settings[S_ULT_PVP] != 100) || g_debug_log) ult_pvp_install();
         rune_install();
+        flask_log_install();
         pkt_guard_install();
         hook_call(0xba0e42, 0xddb9c0, (void *)pin_read_73, "map pin: pin packet read (1)");
         hook_call(0xba11aa, 0xddb9c0, (void *)pin_read_73, "map pin: pin packet read (2)");
