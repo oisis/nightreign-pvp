@@ -103,22 +103,6 @@ def no_rain(param):
     return bytes(out)
 
 
-# Graces at night (owner's go, 17.11; the launcher does the same): GameSystemCommonParam row 0 +0x468 nightTimeFlag
-# 9019 is read by the event manager each frame to refuse every site of grace while on (set at 23:59 by common 1108);
-# 0 = no flag, graces stay usable.
-SYSTEM_PARAM = "\\GameSystemCommonParam.param"
-NIGHT_TIME_FLAG = 0x468
-
-
-def night_graces(param):
-    out = bytearray(param)
-    rid, _, off, _ = struct.unpack_from("<iiqq", param, 0x40)
-    assert struct.unpack_from("<H", param, 0x0A)[0] == 1 and rid == 0
-    assert struct.unpack_from("<i", out, off + NIGHT_TIME_FLAG)[0] == 9019
-    struct.pack_into("<i", out, off + NIGHT_TIME_FLAG, 0)
-    return bytes(out)
-
-
 def insert_row(param, template_id, new_id, size, patch):
     """Copy row template_id as new_id, kept in id order (the game binary-searches ids); patch(row)
     edits the copy. Same layout as add_row; the data area is rebuilt in descriptor order."""
@@ -216,7 +200,6 @@ def main(src, dst, no_row=False, rain=True):
         SPEFFECT_PARAM: insert_row(insert_row(speffect, SPEFFECT_TEMPLATE, SPEFFECT_TEAM_ROW, SPEFFECT_SIZE, team_row),
                                    SPEFFECT_TEMPLATE, SPEFFECT_ALLY_ROW, SPEFFECT_SIZE, ally_row),
         NPC_PARAM: scarab_rows(npc),
-        SYSTEM_PARAM: night_graces(next(b for n, b in bnd4_read(bundle) if n.endswith(SYSTEM_PARAM))),
         **({} if rain else {PLAY_AREA_PARAM: no_rain(next(b for n, b in bnd4_read(bundle) if n.endswith(PLAY_AREA_PARAM)))})})
 
     # Compress the way Smithbox does (level 15, 64 KB window, no content size in the frame header).
@@ -254,10 +237,6 @@ def main(src, dst, no_row=False, rain=True):
                  if struct.unpack_from("<i", p, 0x40 + i * 24)[0] in SCARAB_IDS]
         assert teams == [SCARAB_TEAM] * 30
         print(f"regulation.bin: {len(teams)} scarab NpcParam rows on team {SCARAB_TEAM}")
-        p = next(b for n, b in bnd4_read(check) if n.endswith(SYSTEM_PARAM))
-        off = struct.unpack_from("<q", p, 0x48)[0]
-        assert struct.unpack_from("<i", p, off + NIGHT_TIME_FLAG)[0] == 0
-        print("regulation.bin: sites of grace stay usable at night (nightTimeFlag 9019 -> 0)")
         p = next(b for n, b in bnd4_read(check) if n.endswith(PLAY_AREA_PARAM))
         off = struct.unpack_from("<q", p, 0x48)[0]
         values = [struct.unpack_from("<i", p, off + f)[0] for f in RAIN_FIELDS]
