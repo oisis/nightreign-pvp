@@ -2100,8 +2100,10 @@ static int g_flog_last_mode = -1;  // mode of the last layout (run 32: 1 = the e
 static struct { unsigned id; DWORD t; } g_flog_back[8];  // ten-digit flags turned on, read back 5 s later
 static int g_flog_back_n, g_flog_back_logged;
 static double flog_t(void) { return (GetTickCount() - g_flog_layout_tick) / 1000.0; }
+static void bf3_kill(unsigned id);
 static void flag_note(char *man, unsigned id, int on, int before) {
     (void)man;
+    if (on && before == 0 && id >= 10000000u && id % 1000 >= 800 && id % 1000 < 900 && id / 1000 % 10 == 0) bf3_kill(id);
     if (!setting(S_FLAG_LOG)) {
         // always (boss-grace check): a boss-death flag (the scripts' nnn 800..899 in a block with d = 0, the d digit
         // being (id / 1000) % 10 in tile ids 10XXYYdnnn / 10XYVddnnn and small-map ids, which common 9005810 / 90015006
@@ -5902,8 +5904,67 @@ static void bf_log(char *pa, const char *what) {
          bf_flag(1029100800), bf_flag(1039100800), bf_flag(1039100801), bf_flag(1056300800), bf_flag(1046300800),
          bf_flag(1047300800), bf_flag(1057300800));
 }
+// boss-flow = 3 (the owner's flow, default): the day runs to 09:00 and holds until a boss is killed, then runs two more
+// hours and holds again: stops 09, 11, ..., 21 and 23 (held at 22:59:00, so the 23:00 world changes and the night
+// come only once the clock really gets there; after the 23 stop it runs on to 23:59 and the night boss comes as in
+// the game). Kills are banked: a kill while the clock runs towards a stop pays for that stop. A boss = a death flag
+// nnn 800..899 with d = 0 turning on in the host's flag storage (flag_note: small maps, tile field bosses, region
+// bosses; joiners' kills arrive synced). Day 2 (7505 on) starts over at 07:00 with the stop 09; after its 23 stop
+// the clock is left alone (night 2 and the final as in the game). Both clocks are held together (circle clock
+// +0x118 / +0x11c and time of day +0x34 / +0x38 rates 0, the 30 min apart kept); joiners take both from the host
+// (0x6987b0 / 0x140ddf130 every 15 s). Phases and flags stay the game's: holding only pauses the clock.
+static volatile LONG g_bf3_kills;          // boss kills not yet seen by the frame (flag_note, any thread)
+static volatile unsigned g_bf3_last_flag;
+static void bf3_kill(unsigned id) { g_bf3_last_flag = id, InterlockedIncrement(&g_bf3_kills); }
+static void bf3_frame(int first) {
+    static int day, stop, banked, held, done;
+    static float base_pa, base_clock;
+    char *pa = *(char **)(g_base + RVA_PLAY_AREA_PTR), *clock = *(char **)(g_base + RVA_CLOCK_PTR);
+    if (first) day = 0, stop = 9, banked = 0, held = 0, done = 0, InterlockedExchange(&g_bf3_kills, 0);
+    if (!pa || !clock || done) return;
+    if (!day) {
+        day = 1, base_pa = *(float *)(pa + PA_BASE_RATE), base_clock = *(float *)(clock + CLOCK_BASE_RATE);
+        logf("clock: boss flow 3: day 1, stops every 2 hours from 09:00 (rates %.3f / %.3f)", base_pa, base_clock);
+    }
+    LONG k = InterlockedExchange(&g_bf3_kills, 0);
+    if (k > 0) {
+        banked += (int)k;
+        int next = stop + 2 * banked;  // held at a stop: the kill pays it; running: it pays the coming one
+        logf("clock: boss killed (flag %u): next stop %02d:00%s", g_bf3_last_flag, next > 23 ? 23 : next, next > 23 ? " (then the night)" : "");
+    }
+    if (day == 1 && bf_flag(7505)) {
+        day = 2, stop = 9, held = 0;
+        logf("clock: boss flow 3: day 2 (7505 on), stops every 2 hours from 09:00 again (%d kill(s) banked)", banked);
+    }
+    unsigned long long v = *(unsigned long long *)(pa + PA_TIME);
+    unsigned secs = (((unsigned)(v >> 34) & 0x1f) * 60 + ((unsigned)(v >> 39) & 0x3f)) * 60 + ((unsigned)(v >> 45) & 0x3f);
+    unsigned at = stop == 23 ? (22 * 60 + 59) * 60 : (unsigned)stop * 3600;
+    if (stop <= 23 && secs >= at && secs < 23 * 3600 + 30 * 60) {  // reached (not the night's 23:59 / after-midnight times)
+        if (banked > 0) {
+            banked--, stop += 2;
+            if (held) {
+                held = 0;
+                *(float *)(pa + PA_RATE) = base_pa, *(float *)(pa + PA_BASE_RATE) = base_pa;
+                *(float *)(clock + CLOCK_RATE) = base_clock, *(float *)(clock + CLOCK_BASE_RATE) = base_clock;
+            }
+            logf("clock: boss flow 3: stop %02d:00 paid, running%s", stop - 2, stop > 23 ? " on to the night" : "");
+            if (stop > 23 && day == 2) done = 1;
+        } else {
+            if (!held) {
+                ((void (*)(char *, int, int, int))(g_base + RVA_PA_SET_TIME))(pa, stop == 23 ? 22 : stop, stop == 23 ? 59 : 0, 0);
+                held = 1, bf_log(pa, stop == 23 ? "22:59 reached (23 stop), held until a boss is killed" : "stop reached, held until a boss is killed");
+            }
+            *(float *)(pa + PA_RATE) = 0.0f, *(float *)(pa + PA_BASE_RATE) = 0.0f;
+            *(float *)(clock + CLOCK_RATE) = 0.0f, *(float *)(clock + CLOCK_BASE_RATE) = 0.0f;
+        }
+    }
+}
 static void boss_flow_frame(int first) {
     if (first) g_bf_state = BF_WAIT, g_bf_held = 0, g_bf_repeats = 0;
+    if (g_settings[S_BOSS_FLOW] == 3) {
+        bf3_frame(first);
+        return;
+    }
     if (!setting(S_BOSS_FLOW) || g_bf_state == BF_NIGHT2) return;
     char *pa = *(char **)(g_base + RVA_PLAY_AREA_PTR);
     if (!pa) return;

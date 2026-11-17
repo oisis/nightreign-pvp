@@ -18,7 +18,7 @@ static const char *const SETTING_RETIRED[] = {"ally", "no-rain", "two-regions", 
 // Settings that take a whole number 0..999 instead of true / false (0 = off).
 static int setting_is_number(int i) { return i == S_TEST_LEVEL || i == S_MAP_GROUP || i == S_ONE_REGION || i == S_BOSS_FLOW || i == S_ULT_PVP || i == S_PAIR || i == S_PARTY; }
 // Settings that are on when the file does not mention them.
-static int setting_default(int i) { return i == S_FULL_SYNC || i == S_NO_SPRINT || i == S_SHOW_PING || i == S_SHOW_COUNTS || i == S_RAIN_HOOKS_LEGACY; }  // no-sprint: the fast run is off unless a file says false
+static int setting_default(int i) { return i == S_BOSS_FLOW ? 3 : i == S_FULL_SYNC || i == S_NO_SPRINT || i == S_SHOW_PING || i == S_SHOW_COUNTS || i == S_RAIN_HOOKS_LEGACY; }  // boss-flow: 3, the owner's flow  // no-sprint: the fast run is off unless a file says false
 
 static int settings_word(const char *s, size_t n, const char *w) {  // case-insensitive, whole word
     size_t i = 0;
