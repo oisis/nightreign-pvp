@@ -1115,7 +1115,7 @@ static void party_host_over(void);
 #define LOBBY_PARTY_KEY "nrpvp_party"   // a gathering host's party code
 #define LOBBY_HP_KEY    "nrpvp_hp"      // the host's HP flask charges (+0xff), once its start value is final
 #define ALLY_FLASK_CUT  2                // an ally's charges at arrival = max(ALLY_FLASK_MIN, host's - this)
-#define ALLY_FLASK_MIN  1
+#define ALLY_FLASK_MIN  3                // owner, 2026-11-17: a summon never has fewer than 3 HP charges
 #define LOBBY_GO_KEY    "nrpvp_go"      // "1" once the host's expedition is generated (start block, generator results final)
 static int g_invader_in_world(void);        // joined as an invader and in the host's world
 static int side_count(int want_allies);     // remote session members that are allies / invaders (not the host)
@@ -5760,7 +5760,7 @@ static void enter_watch(char *sm) {
             ((void (*)(void))(g_base + 0x60ad60))();
             int s0 = slots && !IsBadReadPtr(slots, 2 * 0x8a0) ? (unsigned char)slots[0xff] : -1, s1 = slots && !IsBadReadPtr(slots, 2 * 0x8a0) ? (unsigned char)slots[0x8a0 + 0xff] : -1;
             logf("ally flasks: host has %d HP charges (its lobby); ours %d -> %d (%s), filled | slots +0xff: %d %d", host, before,
-                 (unsigned char)pd[0xff], g_join_cut ? "late summon: host's - 2, at least 1" : "early summon: the host's", s0, s1);
+                 (unsigned char)pd[0xff], g_join_cut ? "late summon: host's - 2, at least 3" : "early summon: the host's, at least 3", s0, s1);
         }
     }
     // decision 24: once the world sync is through and the host's slot holds its level, take that level
