@@ -1,5 +1,5 @@
 // Decompress the Kraken body of a FromSoftware DCX file with the game's own Oodle library.
-//   unkrak.exe <oo2core_9_win64.dll> <in.dcx> <out>
+//   unkrak.exe <oo2core_9_win64.dll> <in.dcx> <out> [<in2.dcx> <out2> ...]   (pairs: one wine start for many files)
 // The DLL is the user's own copy from the game folder; it is never shipped with the mod.
 #include <windows.h>
 #include <stdio.h>
@@ -13,14 +13,20 @@ typedef long long (*decompress_fn)(const void *src, long long src_len, void *dst
 
 static unsigned be32(const unsigned char *p) { return p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
 
+static int one(decompress_fn decompress, const char *in, const char *outp);
 int main(int argc, char **argv) {
-    if (argc != 4) return fprintf(stderr, "usage: unkrak <oo2core dll> <in.dcx> <out>\n"), 2;
+    if (argc < 4 || argc % 2) return fprintf(stderr, "usage: unkrak <oo2core dll> <in.dcx> <out> [<in.dcx> <out> ...]\n"), 2;
     HMODULE dll = LoadLibraryA(argv[1]);
     decompress_fn decompress = dll ? (decompress_fn)GetProcAddress(dll, "OodleLZ_Decompress") : NULL;
     if (!decompress) return fprintf(stderr, "cannot load OodleLZ_Decompress from %s\n", argv[1]), 1;
-
-    FILE *f = fopen(argv[2], "rb");
-    if (!f) return fprintf(stderr, "cannot open %s\n", argv[2]), 1;
+    int rc = 0;
+    for (int i = 2; i + 1 < argc; i += 2)
+        if (one(decompress, argv[i], argv[i + 1])) rc = 1;
+    return rc;
+}
+static int one(decompress_fn decompress, const char *in, const char *outp) {
+    FILE *f = fopen(in, "rb");
+    if (!f) return fprintf(stderr, "cannot open %s\n", in), 1;
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -28,7 +34,7 @@ int main(int argc, char **argv) {
     if (fread(d, 1, n, f) != (size_t)n) return 1;
     fclose(f);
     if (n < 0x4c || memcmp(d, "DCX", 3) || memcmp(d + 0x28, "KRAK", 4))
-        return fprintf(stderr, "%s is not a Kraken DCX\n", argv[2]), 1;
+        return fprintf(stderr, "%s is not a Kraken DCX\n", in), 1;
 
     unsigned usize = be32(d + 0x1c), csize = be32(d + 0x20);
     if ((long)csize > n - 0x4c) return fprintf(stderr, "truncated file\n"), 1;
@@ -36,8 +42,9 @@ int main(int argc, char **argv) {
     long long got = decompress(d + 0x4c, csize, out, usize, 1, 0, 0, NULL, 0, NULL, NULL, NULL, 0, 3);
     if (got != usize) return fprintf(stderr, "decompress returned %lld, expected %u\n", got, usize), 1;
 
-    f = fopen(argv[3], "wb");
-    if (!f || fwrite(out, 1, usize, f) != usize) return fprintf(stderr, "cannot write %s\n", argv[3]), 1;
+    f = fopen(outp, "wb");
+    if (!f || fwrite(out, 1, usize, f) != usize) return fprintf(stderr, "cannot write %s\n", outp), 1;
     fclose(f);
+    free(d), free(out);
     return 0;
 }

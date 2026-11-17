@@ -23,3 +23,13 @@ export fn nr_zlib_compress(src: [*]const u8, src_len: usize, dst: [*]u8, dst_cap
     stream.finish() catch return 0;
     return out.end;
 }
+
+/// Decompress one zlib stream into dst (the game's DFLT DCX files). Returns the number of bytes written, 0 on any error.
+export fn nr_zlib_decompress(src: [*]const u8, src_len: usize, dst: [*]u8, dst_cap: usize) usize {
+    const flate = std.compress.flate;
+    var in: std.Io.Reader = .fixed(src[0..src_len]);
+    var out: std.Io.Writer = .fixed(dst[0..dst_cap]);
+    var window: [flate.max_window_len]u8 = undefined;
+    var stream: flate.Decompress = .init(&in, .zlib, &window);
+    return stream.reader.streamRemaining(&out) catch 0;
+}

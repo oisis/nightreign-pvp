@@ -39,7 +39,8 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 23
+#define BUILD_FORMAT 24
+#define BOSS_DEATHS_MIN 100  // the game (1.3.3) has 158 such flags; fewer = its event scripts changed
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
                               "porbr", "rusru", "spaar", "spaes", "thath", "zhocn", "zhotw"};
@@ -529,6 +530,81 @@ static int kraken(const char *game_dir, const u8 *dcx, size_t n, u8 *dst, size_t
     return ok;
 }
 #endif
+
+static void dcx_read_many_krak(const char *game_dir, buf *in, buf *out, int n);
+// Many DCX files at once: zlib ones here; Kraken on Linux with one start of the helper for up to 64 files (each start of wine is slow), on
+// Windows the Oodle library directly. out[i] is empty for a file that failed.
+size_t nr_zlib_decompress(const u8 *src, size_t n, u8 *dst, size_t cap);
+static int dcx_zlib(buf in, buf *out) {  // a DFLT DCX (some of the game's event scripts): 1 when unpacked
+    if (!in.p || in.n < 0x4C || memcmp(in.p + 0x28, "DFLT", 4)) return 0;
+    u32 usize = be32(in.p + 0x1C), csize = be32(in.p + 0x20);
+    if (csize > in.n - 0x4C) return 0;
+    out->p = xalloc(usize), out->n = usize;
+    if (nr_zlib_decompress(in.p + 0x4C, csize, out->p, usize) != usize) free(out->p), out->p = NULL, out->n = 0;
+    return 1;
+}
+static void dcx_read_many(const char *game_dir, buf *in, buf *out, int n) {
+    for (int i = 0; i < n; i++) out[i].p = NULL, out[i].n = 0;
+    static buf krak[4096];
+    int map[4096], k = 0;
+    for (int i = 0; i < n && k < 4096; i++)
+        if (!dcx_zlib(in[i], &out[i])) map[k] = i, krak[k++] = in[i];
+    if (k < n) {  // the Kraken ones through the helper below
+        static buf got[4096];
+        dcx_read_many_krak(game_dir, krak, got, k);
+        for (int j = 0; j < k; j++) out[map[j]] = got[j];
+        return;
+    }
+    dcx_read_many_krak(game_dir, in, out, n);
+}
+static void dcx_read_many_krak(const char *game_dir, buf *in, buf *out, int n) {
+    for (int i = 0; i < n; i++) out[i].p = NULL, out[i].n = 0;
+#ifdef _WIN32
+    for (int i = 0; i < n; i++) {
+        if (!in[i].p || in[i].n < 0x4C || memcmp(in[i].p + 0x28, "KRAK", 4)) continue;
+        u32 usize = be32(in[i].p + 0x1C), csize = be32(in[i].p + 0x20);
+        if (csize > in[i].n - 0x4C) continue;
+        out[i].p = xalloc(usize), out[i].n = usize;
+        if (!kraken(game_dir, in[i].p + 0x4C, csize, out[i].p, usize)) free(out[i].p), out[i].p = NULL, out[i].n = 0;
+    }
+#else
+    char exe[1100], dll[1100], prefix[1100], win_dll[1200];
+    snprintf(exe, sizeof exe, "%s/data/unkrak.exe", g_app);
+    snprintf(dll, sizeof dll, "%s/oo2core_9_win64.dll", game_dir);
+    snprintf(prefix, sizeof prefix, "WINEPREFIX=%s/work/wineprefix", g_app);
+    wine_path(win_dll, sizeof win_dll, dll);
+    static char paths[128][2][1200];
+    for (int at = 0; at < n; at += 64) {
+        int m = n - at < 64 ? n - at : 64, k = 0;
+        char *argv[4 + 128 + 1];
+        argv[k++] = (char *)find_wine(game_dir), argv[k++] = exe, argv[k++] = win_dll;
+        for (int i = 0; i < m; i++) {
+            char in_path[1100], out_path[1100];
+            snprintf(in_path, sizeof in_path, "%s/work/tmp%d.dcx", g_app, i);
+            snprintf(out_path, sizeof out_path, "%s/work/tmp%d.bin", g_app, i);
+            remove(out_path);
+            if (!in[at + i].p || !write_file(in_path, in[at + i].p, in[at + i].n)) continue;
+            wine_path(paths[2 * i][0], sizeof paths[0][0], in_path);
+            wine_path(paths[2 * i][1], sizeof paths[0][1], out_path);
+            argv[k++] = paths[2 * i][0], argv[k++] = paths[2 * i][1];
+        }
+        argv[k] = NULL;
+        if (k > 3) run(argv, prefix);  // a file the helper could not unpack just has no output
+        for (int i = 0; i < m; i++) {
+            char in_path[1100], out_path[1100];
+            snprintf(in_path, sizeof in_path, "%s/work/tmp%d.dcx", g_app, i);
+            snprintf(out_path, sizeof out_path, "%s/work/tmp%d.bin", g_app, i);
+            remove(in_path);
+            if (in[at + i].p && in[at + i].n >= 0x24) {
+                buf b = read_file(out_path);
+                if (b.p && b.n == be32(in[at + i].p + 0x1C)) out[at + i] = b;
+                else free(b.p);
+            }
+            remove(out_path);
+        }
+    }
+#endif
+}
 
 // Decompress a DCX file. Only Kraken (what the game ships) and zlib (what we write) are handled.
 static buf dcx_read(const char *game_dir, buf d) {
@@ -2395,6 +2471,76 @@ static int build_pair_half(const char *game_dir) {
     return ok;
 }
 
+// Boss deaths for the DLL's day clock (boss-flow 3): every flag a site-of-grace chain waits for, i.e. the first
+// parameter of common_func 9005810 and the third of 90015006 in "Initialize (Common) Event" (2000[0] / 2000[6]:
+// slot +0, event id +4, parameters from +8) of the field tiles' scripts (m60_42..45_36..39, every variant) and the
+// small maps' (mAA_BB_00_00), read from the game archive. Written to work/native/boss-deaths.txt (header line with the
+// count, one id per line); the game's ids are never shipped. Returns the number of flags, -1 on failure.
+// EMEVD: +0x10 event count, +0x18 events (0x30 each: id u64, instruction count u64, offset u64, ...), +0x28
+// instructions (0x20 each: bank u32, id u32, argument length u64, argument offset s64), +0x78 argument data.
+static int emevd_boss_deaths(buf d, u32 *flags, int have, int cap) {
+    if (d.n < 0x80 || memcmp(d.p, "EVD", 3)) return have;
+    u64 ec = rd64(d.p + 0x10), eo = rd64(d.p + 0x18), io = rd64(d.p + 0x28), ao = rd64(d.p + 0x78);
+    for (u64 e = 0; e < ec && eo + (e + 1) * 0x30 <= d.n; e++) {
+        const u8 *ev = d.p + eo + e * 0x30;
+        u64 n = rd64(ev + 8), ioff = rd64(ev + 0x10);
+        for (u64 k = 0; k < n && io + ioff + (k + 1) * 0x20 <= d.n; k++) {
+            const u8 *in = d.p + io + ioff + k * 0x20;
+            u32 bank = rd32(in), id = rd32(in + 4);
+            u64 alen = rd64(in + 8), aoff = rd64(in + 0x10);
+            if (bank != 2000 || (id != 0 && id != 6) || ao + aoff + alen > d.n || alen < 12) continue;
+            const u8 *a = d.p + ao + aoff;
+            u32 ev_id = rd32(a + 4), flag = 0;
+            if (ev_id == 9005810) flag = rd32(a + 8);
+            else if (ev_id == 90015006 && alen >= 20) flag = rd32(a + 16);
+            else continue;
+            if (flag < 10000000u) continue;
+            int seen = 0;
+            for (int i = 0; i < have && !seen; i++) seen = flags[i] == flag;
+            if (!seen && have < cap) flags[have++] = flag;
+        }
+    }
+    return have;
+}
+static int cmp_u32(const void *a, const void *b) { u32 x = *(const u32 *)a, y = *(const u32 *)b; return x < y ? -1 : x > y; }
+static int build_boss_deaths(const char *game_dir, buf bhd, const char *bdt) {
+    static char names[4096][48];
+    static buf in[4096], out[4096];
+    int n = 0;
+    for (int x = 42; x <= 45; x++)
+        for (int y = 36; y <= 39; y++)
+            for (int v = 0; v <= 5; v++) snprintf(names[n++], sizeof names[0], "/event/m60_%02d_%02d_%d0.emevd.dcx", x, y, v);
+    for (int aa = 20; aa <= 59; aa++)
+        for (int bb = 0; bb <= 99; bb++) snprintf(names[n++], sizeof names[0], "/event/m%02d_%02d_00_00.emevd.dcx", aa, bb);
+    int found = 0;
+    for (int i = 0; i < n; i++) {
+        in[i] = archive_read(bhd, bdt, names[i]);
+        if (in[i].p) in[found] = in[i], memmove(names[found], names[i], sizeof names[0]), found += 1;
+    }
+    dcx_read_many(game_dir, in, out, found);
+    static u32 flags[2048];
+    int have = 0, read = 0;
+    int failed = -1;
+    char kind[8] = "";
+    for (int i = 0; i < found; i++) {
+        if (out[i].p) read++, have = emevd_boss_deaths(out[i], flags, have, 2048);
+        else if (failed < 0) failed = i, snprintf(kind, sizeof kind, "%.4s", in[i].p && in[i].n >= 0x2C ? (const char *)in[i].p + 0x28 : "?");
+        free(in[i].p), free(out[i].p);
+    }
+    if (failed >= 0) logf_("Boss deaths: %s not unpacked (compression %s)", names[failed], kind);
+    qsort(flags, (size_t)have, sizeof *flags, cmp_u32);
+    char path[1300];
+    snprintf(path, sizeof path, "%s" SEP "work" SEP "native" SEP "boss-deaths.txt", g_app);
+    size_t cap = 64 + (size_t)have * 12, at = 0;
+    char *text = xalloc(cap);
+    at += (size_t)snprintf(text + at, cap - at, "# boss death flags: %d\n", have);
+    for (int i = 0; i < have; i++) at += (size_t)snprintf(text + at, cap - at, "%u\n", flags[i]);
+    int ok = read == found && have > 0 && write_file(path, (const u8 *)text, at);
+    free(text);
+    logf_("Boss deaths for the day clock: %d flags from %d of %d event scripts", have, read, found);
+    return ok ? have : -1;
+}
+
 int core_build(const char *game_dir) {
     char bhd_path[1100], bdt_path[1100], from[1300], to[1300];
     if (!core_check_game(game_dir)) return logf_("This is not the game's folder: %s", game_dir), 0;
@@ -2442,6 +2588,8 @@ int core_build(const char *game_dir) {
     ok = ok && build_icons(game_dir, bhd, bdt_path, 'h') && build_icons(game_dir, bhd, bdt_path, 'l');
     if (ok && one_region()) remove_two_region_map(), logf_("one-region (test): region %d only, no two-region map", one_region());
     else if (ok) ok = build_two_region_map(game_dir, bhd, bdt_path);
+    if (ok && build_boss_deaths(game_dir, bhd, bdt_path) < BOSS_DEATHS_MIN)
+        ok = 0, logf_("The game's event scripts look different than expected (too few boss deaths). The game may have been updated; the mod needs an update too.");
     free(bhd.p);
     if (ok && two_pair()->halves) ok = build_pair_half(game_dir);
     if (!ok) return 0;
@@ -2633,6 +2781,20 @@ int core_selftest(void) {
         }
         if (!good) { ok = 0; logf_("selftest: param row insertion failed"); }
         free(q.p);
+    }
+    {  // boss deaths from an event script: 9005810's first and 90015006's third parameter, others ignored, no repeats
+        static u8 ev[0x200];
+        memset(ev, 0, sizeof ev);
+        memcpy(ev, "EVD", 3);
+        wr64(ev + 0x10, 1), wr64(ev + 0x18, 0x80), wr64(ev + 0x28, 0x100), wr64(ev + 0x78, 0x180);
+        wr64(ev + 0x80, 1), wr64(ev + 0x88, 3), wr64(ev + 0x90, 0);
+        const u32 ins[3][4] = {{2000, 6, 12, 0}, {2000, 0, 20, 16}, {2000, 6, 12, 40}};  // bank, id, length, offset
+        for (int i = 0; i < 3; i++) wr32(ev + 0x100 + i * 0x20, ins[i][0]), wr32(ev + 0x104 + i * 0x20, ins[i][1]), wr64(ev + 0x108 + i * 0x20, ins[i][2]), wr64(ev + 0x110 + i * 0x20, ins[i][3]);
+        const u32 args[] = {0, 9005810, 46500800, 0, 0, 90015006, 30301510, 30300510, 30300810, 0, 0, 9005810, 46500800};
+        for (unsigned i = 0; i < sizeof args / sizeof *args; i++) wr32(ev + 0x180 + i * 4, args[i]);
+        u32 got[4];
+        int k = emevd_boss_deaths((buf){ev, sizeof ev}, got, 0, 4);
+        if (k != 2 || got[0] != 46500800 || got[1] != 30300810) { ok = 0; logf_("selftest: boss deaths from an event script failed"); }
     }
     {  // test settings: values, comments, CRLF, case, a retired key (no-rain), unknown keys and bad values, a missing file
         static const char t[] = "# c\r\nteam-test = true\r\n  NO-RAIN=FALSE # x\r\nslow-time\t= True\r\ntwo-regions = true\r\n"

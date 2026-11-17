@@ -2137,33 +2137,36 @@ static struct { unsigned id; DWORD t; } g_flog_back[8];  // ten-digit flags turn
 static int g_flog_back_n, g_flog_back_logged;
 static double flog_t(void) { return (GetTickCount() - g_flog_layout_tick) / 1000.0; }
 static void bf3_kill(unsigned id);
-// Boss deaths: every flag a site-of-grace chain waits for (common_func 9005810 argument 1, 90015006 argument 3) in the
-// game's tile and small-map scripts (155 flags, from analysis/gamefiles/event-nr, 1.3.3). One per boss: a small map's
-// boss set-up (90045002) also sets a flag of its variant (m46_50: 46500820 / 830 / 840 / 860 beside 46500800), which
-// is not in here. Small-map ids of instance n are n * 10^8 + the script's id; tile ids are exact.
-static const unsigned BOSS_DEATH[] = {
-    20000800, 20100800, 20200800, 20300800, 20400800, 20500800, 20600800, 20700800, 20800800, 20900800, 21000800,
-    21100800, 21200800, 21300800, 21400800, 21500800, 30000800, 30000810, 30300800, 30300810, 32000800, 32000810,
-    32100800, 32100810, 32100820, 32200800, 32200810, 34000800, 34000810, 34000820, 34000830, 34100800, 34100810,
-    34100820, 34100830, 34100840, 34200800, 34200810, 34300800, 38000810, 38000850, 38100800, 38100810, 42380800,
-    42380805, 45510800, 46500800, 46510800, 46520800, 46530800, 46540800, 46550800, 46560800, 46570800, 46580800,
-    46590800, 46600800, 46620800, 46630800, 46640800, 46650800, 46660800, 46670800, 46680800, 46690800, 46700800,
-    46710800, 46720800, 46740800, 46770800, 46800800, 46810800, 46820800, 46860800, 46870800, 46880800, 46910800,
-    46950800, 50000800, 50010810, 50020800, 50030800, 50040800, 50050800, 50060800, 50100800, 50100820, 50100830,
-    50100840, 50110820, 50110830, 50110840, 50110860, 52400800, 52400810, 52420800, 52420810, 52450810, 52460810,
-    52500800, 52500810, 52520800, 52520810, 52550800, 52550810, 52570800, 52570810, 53500800, 53500810, 53510800,
-    53510810, 53670810, 53670820, 53680800, 53680810, 53800800, 53810800, 53820800, 53830800, 1026400800,
-    1026500800, 1026500810, 1026500820, 1026500830, 1026500840, 1026500850, 1026500860, 1027500800, 1028100800,
-    1028100810, 1028100820, 1029100800, 1029100820, 1036500800, 1037500800, 1038100800, 1038202800, 1039100800,
-    1039100801, 1039100810, 1039100820, 1039202800, 1039202810, 1042380800, 1042380805, 1042390800, 1043360800,
-    1045360800, 1045370800, 1048202800, 1048202830, 1049202800, 1049202810, 1049202820, 1056300800};
+// Boss deaths: every flag a site-of-grace chain waits for (common_func 9005810's first and 90015006's third parameter
+// in the game's tile and small-map scripts), listed by the launcher at the mod build from the player's own game files:
+// work/native/boss-deaths.txt (a header line, one id per line). One per boss: a small map's boss set-up (90045002)
+// also sets a flag of its variant (m46_50: 46500830 beside 46500800), which is not listed. Small-map ids of instance
+// n are n * 10^8 + the script's id; tile ids are exact. Without the file: any nnn 800..899 with d = 0 (logged).
+static unsigned *g_boss_death;
+static int g_boss_deaths = -1;  // -1: no list, the fallback rule
+static void boss_deaths_load(void) {
+    char path[MAX_PATH];
+    next_to_dll(path, sizeof path, "boss-deaths.txt");
+    FILE *f = fopen(path, "rb");
+    static unsigned list[4096];
+    int n = 0;
+    char line[64];
+    while (f && fgets(line, sizeof line, f))
+        if (line[0] >= '0' && line[0] <= '9' && n < 4096) list[n++] = (unsigned)strtoul(line, NULL, 10);
+    if (f) fclose(f);
+    for (int i = 1; i < n; i++)  // keep it sorted (the launcher writes it sorted)
+        for (int j = i; j > 0 && list[j - 1] > list[j]; j--) { unsigned t = list[j]; list[j] = list[j - 1], list[j - 1] = t; }
+    if (n > 0) g_boss_death = list, g_boss_deaths = n, logf("clock: %d boss death flags loaded", n);
+    else logf("clock: no boss death list (boss-deaths.txt%s): any nnn 800..899 with d = 0 counts as a boss", f ? " empty" : " missing");
+}
 static int boss_death(unsigned id) {
+    if (g_boss_deaths < 0) return id % 1000 >= 800 && id % 1000 < 900 && id / 1000 % 10 == 0;
     unsigned key = id >= 1000000000u ? id : id % 100000000u;
-    int lo = 0, hi = (int)(sizeof BOSS_DEATH / sizeof *BOSS_DEATH) - 1;
+    int lo = 0, hi = g_boss_deaths - 1;
     while (lo <= hi) {
         int mid = (lo + hi) / 2;
-        if (BOSS_DEATH[mid] == key) return 1;
-        if (BOSS_DEATH[mid] < key) lo = mid + 1; else hi = mid - 1;
+        if (g_boss_death[mid] == key) return 1;
+        if (g_boss_death[mid] < key) lo = mid + 1; else hi = mid - 1;
     }
     return 0;
 }
@@ -7027,6 +7030,7 @@ static DWORD WINAPI run(LPVOID self) {
     }
     logf("loaded, game base %p, mod version %s", g_base, MOD_VERSION);
     if (!g_settings_early) settings_load();
+    boss_deaths_load();
     if (g_guard_ok) logf("net guard: installed, %u of %u imports patched (outbound %s)", (unsigned)GUARDED_COUNT,
                          (unsigned)GUARDED_COUNT, NET_GUARD_REFUSE_OUTBOUND ? "refused" : "logged only");
     else logf("net guard: NOT installed (%s); the network will not be started", g_guard_msg);
