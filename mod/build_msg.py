@@ -14,7 +14,16 @@ from fsformats import bnd4_read, bnd4_replace, dcx_write_deflate, fmg_read, fmg_
 OUR_TEXT = {
     # Entry in the expedition menu's Target list (NightBossMenuParam row 101, mod/build_regulation.py).
     "CL_MenuText.fmg": {
-        130460: ("4 players", "4 graczy"),  # fourth "Number of Players" option, added by the DLL
+        130305: ("Commence Team Expedition", "Rozpocznij wyprawę drużyny"),
+        130408: ("Team", "Drużyna"),  # the game's "three players": a team too (the list cannot lose an entry)
+        130417: ("Team", "Drużyna"),  # the game's "two players": team (the DLL joins or hosts a session)
+        131170: ("A newer mod version (%s) is available. Update to play with others.",
+                 "Dostępna jest nowsza wersja moda (%s). Zaktualizuj, żeby grać z innymi."),  # %s: filled in by the DLL
+        131171: ("Your team (same password) plays mod version %s. Everyone needs the same version.",
+                 "Twoja drużyna (to samo hasło) gra na wersji moda %s. Wszyscy potrzebują tej samej wersji."),
+        131172: ("Squads in an expedition: %d", "Drużyny w wyprawie: %d"),  # counts overlay, %d filled in by the DLL
+        131173: ("Squads looking for a player: %d", "Drużyny szukające gracza: %d"),
+        131174: ("Hosts waiting in the hub: %d", "Hosty czekające w Twierdzy: %d"),
         131160: ("Invasion", "Najazd"),
         131161: ("Enter another squad's expedition as an invader.\nDefeat its host to win.",
                  "Wejdź do wyprawy innej drużyny jako najeźdźca.\nPokonaj hosta, aby wygrać."),

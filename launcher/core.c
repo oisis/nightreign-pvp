@@ -39,16 +39,26 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 20
+#define BUILD_FORMAT 25
+#define BOSS_DEATHS_MIN 100  // the game (1.3.3) has 158 such flags; fewer = its event scripts changed
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
                               "porbr", "rusru", "spaar", "spaes", "thath", "zhocn", "zhotw"};
-// Our own menu lines (UTF-8): a fourth "Number of Players" option and the "Invasion" entry of the
+// Our own menu lines (UTF-8): "Team" in the "Number of Players" option and the "Invasion" entry of the
 // expedition menu's Target list.
 // Polish for the Polish game, English for every other language. Keep in sync with mod/build_msg.py.
 // (Adjacent string literals keep \x escapes from swallowing the letters that follow them.)
 static const struct { u32 id; const char *english, *polish; } OUR_TEXT[] = {
-    {130460, "4 players", "4 graczy"},
+    {130305, "Commence Team Expedition", "Rozpocznij wypraw\xc4\x99 dru\xc5\xbcyny"},
+    {130408, "Team", "Dru\xc5\xbcyna"},  // the game's "three players": a team too (the list cannot lose an entry)
+    {130417, "Team", "Dru\xc5\xbcyna"},  // the game's "two players": team (the DLL joins or hosts a session)
+    {131170, "A newer mod version (%s) is available. Update to play with others.",  // %s: the DLL puts the number in
+             "Dost\xc4\x99pna jest nowsza wersja moda (%s). Zaktualizuj, \xc5\xbc" "eby gra\xc4\x87 z innymi."},
+    {131171, "Your team (same password) plays mod version %s. Everyone needs the same version.",
+             "Twoja dru\xc5\xbcyna (to samo has\xc5\x82o) gra na wersji moda %s. Wszyscy potrzebuj\xc4\x85 tej samej wersji."},
+    {131172, "Squads in an expedition: %d", "Dru\xc5\xbcyny w wyprawie: %d"},  // counts overlay (%d: the DLL)
+    {131173, "Squads looking for a player: %d", "Dru\xc5\xbcyny szukaj\xc4\x85" "ce gracza: %d"},
+    {131174, "Hosts waiting in the hub: %d", "Hosty czekaj\xc4\x85" "ce w Twierdzy: %d"},
     {131160, "Invasion", "Najazd"},
     {131161, "Enter another squad's expedition as an invader.\nDefeat its host to win.",
              "Wejd\xc5\xba do wyprawy innej dru\xc5\xbcyny jako naje\xc5\xba" "d\xc5\xba" "ca.\n"
@@ -520,6 +530,81 @@ static int kraken(const char *game_dir, const u8 *dcx, size_t n, u8 *dst, size_t
     return ok;
 }
 #endif
+
+static void dcx_read_many_krak(const char *game_dir, buf *in, buf *out, int n);
+// Many DCX files at once: zlib ones here; Kraken on Linux with one start of the helper for up to 64 files (each start of wine is slow), on
+// Windows the Oodle library directly. out[i] is empty for a file that failed.
+size_t nr_zlib_decompress(const u8 *src, size_t n, u8 *dst, size_t cap);
+static int dcx_zlib(buf in, buf *out) {  // a DFLT DCX (some of the game's event scripts): 1 when unpacked
+    if (!in.p || in.n < 0x4C || memcmp(in.p + 0x28, "DFLT", 4)) return 0;
+    u32 usize = be32(in.p + 0x1C), csize = be32(in.p + 0x20);
+    if (csize > in.n - 0x4C) return 0;
+    out->p = xalloc(usize), out->n = usize;
+    if (nr_zlib_decompress(in.p + 0x4C, csize, out->p, usize) != usize) free(out->p), out->p = NULL, out->n = 0;
+    return 1;
+}
+static void dcx_read_many(const char *game_dir, buf *in, buf *out, int n) {
+    for (int i = 0; i < n; i++) out[i].p = NULL, out[i].n = 0;
+    static buf krak[4096];
+    int map[4096], k = 0;
+    for (int i = 0; i < n && k < 4096; i++)
+        if (!dcx_zlib(in[i], &out[i])) map[k] = i, krak[k++] = in[i];
+    if (k < n) {  // the Kraken ones through the helper below
+        static buf got[4096];
+        dcx_read_many_krak(game_dir, krak, got, k);
+        for (int j = 0; j < k; j++) out[map[j]] = got[j];
+        return;
+    }
+    dcx_read_many_krak(game_dir, in, out, n);
+}
+static void dcx_read_many_krak(const char *game_dir, buf *in, buf *out, int n) {
+    for (int i = 0; i < n; i++) out[i].p = NULL, out[i].n = 0;
+#ifdef _WIN32
+    for (int i = 0; i < n; i++) {
+        if (!in[i].p || in[i].n < 0x4C || memcmp(in[i].p + 0x28, "KRAK", 4)) continue;
+        u32 usize = be32(in[i].p + 0x1C), csize = be32(in[i].p + 0x20);
+        if (csize > in[i].n - 0x4C) continue;
+        out[i].p = xalloc(usize), out[i].n = usize;
+        if (!kraken(game_dir, in[i].p + 0x4C, csize, out[i].p, usize)) free(out[i].p), out[i].p = NULL, out[i].n = 0;
+    }
+#else
+    char exe[1100], dll[1100], prefix[1100], win_dll[1200];
+    snprintf(exe, sizeof exe, "%s/data/unkrak.exe", g_app);
+    snprintf(dll, sizeof dll, "%s/oo2core_9_win64.dll", game_dir);
+    snprintf(prefix, sizeof prefix, "WINEPREFIX=%s/work/wineprefix", g_app);
+    wine_path(win_dll, sizeof win_dll, dll);
+    static char paths[128][2][1200];
+    for (int at = 0; at < n; at += 64) {
+        int m = n - at < 64 ? n - at : 64, k = 0;
+        char *argv[4 + 128 + 1];
+        argv[k++] = (char *)find_wine(game_dir), argv[k++] = exe, argv[k++] = win_dll;
+        for (int i = 0; i < m; i++) {
+            char in_path[1100], out_path[1100];
+            snprintf(in_path, sizeof in_path, "%s/work/tmp%d.dcx", g_app, i);
+            snprintf(out_path, sizeof out_path, "%s/work/tmp%d.bin", g_app, i);
+            remove(out_path);
+            if (!in[at + i].p || !write_file(in_path, in[at + i].p, in[at + i].n)) continue;
+            wine_path(paths[2 * i][0], sizeof paths[0][0], in_path);
+            wine_path(paths[2 * i][1], sizeof paths[0][1], out_path);
+            argv[k++] = paths[2 * i][0], argv[k++] = paths[2 * i][1];
+        }
+        argv[k] = NULL;
+        if (k > 3) run(argv, prefix);  // a file the helper could not unpack just has no output
+        for (int i = 0; i < m; i++) {
+            char in_path[1100], out_path[1100];
+            snprintf(in_path, sizeof in_path, "%s/work/tmp%d.dcx", g_app, i);
+            snprintf(out_path, sizeof out_path, "%s/work/tmp%d.bin", g_app, i);
+            remove(in_path);
+            if (in[at + i].p && in[at + i].n >= 0x24) {
+                buf b = read_file(out_path);
+                if (b.p && b.n == be32(in[at + i].p + 0x1C)) out[at + i] = b;
+                else free(b.p);
+            }
+            remove(out_path);
+        }
+    }
+#endif
+}
 
 // Decompress a DCX file. Only Kraken (what the game ships) and zlib (what we write) are handled.
 static buf dcx_read(const char *game_dir, buf d) {
@@ -1117,6 +1202,44 @@ typedef struct {
     int pairs;                                    // attach points on one physical spot that the game never combines
     unsigned short pa[SPOT_PAIRS_MAX], pb[SPOT_PAIRS_MAX];
 } attach_sets;
+// Small-map instances (+0xc smallBaseMapId, +0x10 u8 mapIndex): in the game's 320 patterns no small map is placed
+// twice with the same index; a second copy gets 1, a third 2 (m30_30 #0 / #1, m41_00 #2). The index chooses the
+// instance's own flag block (index * 10^8 + AABB * 10^4 + d * 1000 + nnn): boss death nnn 800, which the scripts
+// (common 9005810 / 90015006) wait for to enable the site of grace nnn 1500. Our merge can bring the same map with
+// index 0 from both sources (pattern 8: m46_68 from Mountaintop 22 at point 756 and from Rotted Woods 30 at 315), so
+// both copies would share one block and one set of entities. A repeat gets the lowest index its map does not have in
+// that pattern, never above the highest index the game itself gives that map.
+static int distinct_instances(buf p) {
+    static u8 top[10000];
+    memset(top, 0, sizeof top);
+    u32 count = rd16(p.p + 0x0A);
+    for (u32 i = 0; i < count; i++) {
+        const u8 *row = p.p + rd64(p.p + 0x40 + i * 24 + 8);
+        u32 m = rd32(row + 0xc);
+        if (m < 10000 && row[0x10] > top[m]) top[m] = row[0x10];
+    }
+    int moved = 0, stuck = 0;
+    for (int slot = 0; slot < TWO_PATTERNS; slot++) {
+        if (!merged_slot(slot)) continue;
+        static u8 used[10000][16];
+        memset(used, 0, sizeof used);
+        for (u32 i = 0; i < count; i++) {
+            u8 *row = p.p + rd64(p.p + 0x40 + i * 24 + 8);
+            u32 m = rd32(row + 0xc);
+            if ((int)rd32(row + 4) != slot || m >= 10000 || row[0x10] >= 16) continue;
+            if (!used[m][row[0x10]]) { used[m][row[0x10]] = 1; continue; }
+            int k = 0;
+            while (k < 16 && used[m][k]) k++;
+            if (k < 16 && k <= top[m]) row[0x10] = (u8)k, used[m][k] = 1, moved++;
+            else if (stuck++ < 4) logf_("two-regions: pattern %d: small map m%02u_%02u placed %d times, the game gives it index 0..%d only", slot,
+                                         m / 100, m % 100, k + 1, top[m]);
+        }
+    }
+    logf_("two-regions: small maps placed twice in one pattern with one index: %d given the next free index%s", moved,
+          stuck ? ", some left (no index the game uses is free)" : "");
+    if (stuck) logf_("two-regions: check failed: %d small maps would share an instance", stuck);
+    return !stuck;
+}
 // Per-tile composition (user's method, analysis/merge/compose.py): the four tiles with Rotted Woods terrain
 // (44..45 x 36..37) take their whole content from the Rotted Woods pattern (40g+30+k), every other tile from
 // the Mountaintop pattern (40g+20+k); no tile mixes rows of both. (A plain pattern of the same index is no
@@ -1519,6 +1642,7 @@ static buf map_test_table(buf src, int table, buf flags, buf points, int two) {
             }
         logf_("two-regions: small bases per tile: %d %s ones on the %s tiles removed, %d of the %s on them added (most on one pattern %d)",
               removed, pair_a()->name, pair_b()->tiles, added, pair_b()->of, most);
+        if (ok) ok = distinct_instances(p);
         if (ok && spot_doubles(p, &sets)) ok = 0, logf_("two-regions: check failed: two small bases on one spot");
         else if (ok) logf_("two-regions: check: no merged pattern has two small bases on one spot");
     }
@@ -2347,12 +2471,170 @@ static int build_pair_half(const char *game_dir) {
     return ok;
 }
 
+// Boss deaths for the DLL's day clock (boss-flow 3): every flag a site-of-grace chain waits for, i.e. the first
+// parameter of common_func 9005810 and the third of 90015006 in "Initialize (Common) Event" (2000[0] / 2000[6]:
+// slot +0, event id +4, parameters from +8) of the field tiles' scripts (m60_42..45_36..39, every variant) and the
+// small maps' (mAA_BB_00_00), read from the game archive. Written to work/native/boss-deaths.txt (header line with the
+// count, one id per line); the game's ids are never shipped. Returns the number of flags, -1 on failure.
+// EMEVD: +0x10 event count, +0x18 events (0x30 each: id u64, instruction count u64, offset u64, ...), +0x28
+// instructions (0x20 each: bank u32, id u32, argument length u64, argument offset s64), +0x78 argument data.
+static int emevd_boss_deaths(buf d, u32 *flags, int have, int cap) {
+    if (d.n < 0x80 || memcmp(d.p, "EVD", 3)) return have;
+    u64 ec = rd64(d.p + 0x10), eo = rd64(d.p + 0x18), io = rd64(d.p + 0x28), ao = rd64(d.p + 0x78);
+    for (u64 e = 0; e < ec && eo + (e + 1) * 0x30 <= d.n; e++) {
+        const u8 *ev = d.p + eo + e * 0x30;
+        u64 n = rd64(ev + 8), ioff = rd64(ev + 0x10);
+        for (u64 k = 0; k < n && io + ioff + (k + 1) * 0x20 <= d.n; k++) {
+            const u8 *in = d.p + io + ioff + k * 0x20;
+            u32 bank = rd32(in), id = rd32(in + 4);
+            u64 alen = rd64(in + 8), aoff = rd64(in + 0x10);
+            if (bank != 2000 || (id != 0 && id != 6) || ao + aoff + alen > d.n || alen < 12) continue;
+            const u8 *a = d.p + ao + aoff;
+            u32 ev_id = rd32(a + 4), flag = 0;
+            if (ev_id == 9005810) flag = rd32(a + 8);
+            else if (ev_id == 90015006 && alen >= 20) flag = rd32(a + 16);
+            else continue;
+            if (flag < 10000000u) continue;
+            int seen = 0;
+            for (int i = 0; i < have && !seen; i++) seen = flags[i] == flag;
+            if (!seen && have < cap) flags[have++] = flag;
+        }
+    }
+    return have;
+}
+static int cmp_u32(const void *a, const void *b) { u32 x = *(const u32 *)a, y = *(const u32 *)b; return x < y ? -1 : x > y; }
+// The boss character of each death flag (for hiding bosses while the night boss is active): a boss's death is set by
+// the event that watches the boss die, either a common_func template (an instruction "IF Character Dead/Alive"
+// 4[0], "IF Character HP Value" 4[14], "IF Character Ratio Dead/Alive" 4[15] or "IF Character Ratio HP Value" 4[23]
+// on an entity from the caller's arguments, and "Set (Network-Connected) Event Flag" 2003[66] / 2003[69] with a flag
+// from the caller's arguments: 90015002, 90015407, 90035013, 90045002 ...) or a map script's own event with both
+// literal. Parameter table of an event: +0x18 count, +0x20 offset into the table at header +0x58, entries 0x20: index
+// of the instruction u64, offset in its arguments u64, offset in the caller's arguments u64, size u32.
+#define BOSS_TMPL_MAX 8192
+static struct { u32 id; int nf, ne; u32 fsrc[4], esrc[4]; } g_tmpl[BOSS_TMPL_MAX];
+static int g_ntmpl;
+static int is_death_cond(u32 bank, u32 id) { return bank == 4 && (id == 0 || id == 14 || id == 15 || id == 23); }
+static int is_flag_set(u32 bank, u32 id) { return bank == 2003 && (id == 66 || id == 69); }
+static void emevd_templates(buf d) {
+    if (d.n < 0x80 || memcmp(d.p, "EVD", 3)) return;
+    u64 ec = rd64(d.p + 0x10), eo = rd64(d.p + 0x18), io = rd64(d.p + 0x28), po = rd64(d.p + 0x58);
+    for (u64 e = 0; e < ec && eo + (e + 1) * 0x30 <= d.n && g_ntmpl < BOSS_TMPL_MAX; e++) {
+        const u8 *ev = d.p + eo + e * 0x30;
+        u64 ioff = rd64(ev + 0x10), pc = rd64(ev + 0x18), poff = rd64(ev + 0x20);
+        int nf = 0, ne = 0;
+        u32 fsrc[4], esrc[4];
+        for (u64 k = 0; k < pc && po + poff + (k + 1) * 0x20 <= d.n; k++) {
+            const u8 *pe = d.p + po + poff + k * 0x20;
+            u64 idx = rd64(pe), tgt = rd64(pe + 8), src = rd64(pe + 0x10);
+            if (io + ioff + (idx + 1) * 0x20 > d.n || tgt != 4) continue;
+            const u8 *in = d.p + io + ioff + idx * 0x20;
+            if (is_death_cond(rd32(in), rd32(in + 4)) && ne < 4) esrc[ne++] = (u32)src;
+            if (is_flag_set(rd32(in), rd32(in + 4)) && nf < 4) fsrc[nf++] = (u32)src;
+        }
+        if (nf && ne) {
+            g_tmpl[g_ntmpl].id = (u32)rd64(ev), g_tmpl[g_ntmpl].nf = nf, g_tmpl[g_ntmpl].ne = ne;
+            memcpy(g_tmpl[g_ntmpl].fsrc, fsrc, sizeof fsrc), memcpy(g_tmpl[g_ntmpl].esrc, esrc, sizeof esrc), g_ntmpl++;
+        }
+    }
+}
+#define BOSS_ENT_MAX 8
+static u32 g_boss_ent[2048][BOSS_ENT_MAX];
+static int g_boss_nent[2048];
+static void boss_entity_add(const u32 *flags, int have, u32 flag, u32 ent) {
+    const u32 *at = bsearch(&flag, flags, (size_t)have, sizeof *flags, cmp_u32);
+    if (!at || ent < 1000 || ent == 10000 || ent == 20000) return;
+    int i = (int)(at - flags);
+    for (int k = 0; k < g_boss_nent[i]; k++) if (g_boss_ent[i][k] == ent) return;
+    if (g_boss_nent[i] < BOSS_ENT_MAX) g_boss_ent[i][g_boss_nent[i]++] = ent;
+}
+static void emevd_boss_entities(buf d, const u32 *flags, int have) {
+    if (d.n < 0x80 || memcmp(d.p, "EVD", 3)) return;
+    u64 ec = rd64(d.p + 0x10), eo = rd64(d.p + 0x18), io = rd64(d.p + 0x28), ao = rd64(d.p + 0x78);
+    for (u64 e = 0; e < ec && eo + (e + 1) * 0x30 <= d.n; e++) {
+        const u8 *ev = d.p + eo + e * 0x30;
+        u64 n = rd64(ev + 8), ioff = rd64(ev + 0x10);
+        u32 ents[16], fls[16];
+        int ne = 0, nf = 0;
+        for (u64 k = 0; k < n && io + ioff + (k + 1) * 0x20 <= d.n; k++) {
+            const u8 *in = d.p + io + ioff + k * 0x20;
+            u32 bank = rd32(in), id = rd32(in + 4);
+            u64 alen = rd64(in + 8), aoff = rd64(in + 0x10);
+            if (ao + aoff + alen > d.n) continue;
+            const u8 *a = d.p + ao + aoff;
+            if (bank == 2000 && (id == 0 || id == 6) && alen >= 8) {  // a call: through its template
+                u32 ev_id = rd32(a + 4);
+                for (int t = 0; t < g_ntmpl; t++) {
+                    if (g_tmpl[t].id != ev_id) continue;
+                    for (int f = 0; f < g_tmpl[t].nf; f++)
+                        for (int x = 0; x < g_tmpl[t].ne; x++)
+                            if (8 + g_tmpl[t].fsrc[f] + 4 <= alen && 8 + g_tmpl[t].esrc[x] + 4 <= alen)
+                                boss_entity_add(flags, have, rd32(a + 8 + g_tmpl[t].fsrc[f]), rd32(a + 8 + g_tmpl[t].esrc[x]));
+                    break;
+                }
+            } else if (is_death_cond(bank, id) && alen >= 8 && ne < 16) ents[ne++] = rd32(a + 4);
+            else if (is_flag_set(bank, id) && alen >= 8 && nf < 16) fls[nf++] = rd32(a + 4);
+        }
+        for (int f = 0; f < nf; f++)  // the script's own event, both literal
+            for (int x = 0; x < ne; x++) boss_entity_add(flags, have, fls[f], ents[x]);
+    }
+}
+static int build_boss_deaths(const char *game_dir, buf bhd, const char *bdt) {
+    static char names[1 + 4 * 4 * 6 + 40 * 100][48];
+    static buf in[sizeof names / sizeof names[0]], out[sizeof names / sizeof names[0]];
+    int n = 0;
+    snprintf(names[n++], sizeof names[0], "/event/common_func.emevd.dcx");  // the templates (first)
+    for (int x = 42; x <= 45; x++)
+        for (int y = 36; y <= 39; y++)
+            for (int v = 0; v <= 5; v++) snprintf(names[n++], sizeof names[0], "/event/m60_%02d_%02d_%d0.emevd.dcx", x, y, v);
+    for (int aa = 20; aa <= 59; aa++)
+        for (int bb = 0; bb <= 99; bb++) snprintf(names[n++], sizeof names[0], "/event/m%02d_%02d_00_00.emevd.dcx", aa, bb);
+    int found = 0;
+    for (int i = 0; i < n; i++) {
+        in[i] = archive_read(bhd, bdt, names[i]);
+        if (in[i].p) in[found] = in[i], memmove(names[found], names[i], sizeof names[0]), found += 1;
+    }
+    dcx_read_many(game_dir, in, out, found);
+    static u32 flags[2048];
+    int have = 0, read = 0;
+    int failed = -1;
+    char kind[8] = "";
+    for (int i = 0; i < found; i++) {
+        if (out[i].p) read++, have = emevd_boss_deaths(out[i], flags, have, 2048);
+        else if (failed < 0) failed = i, snprintf(kind, sizeof kind, "%.4s", in[i].p && in[i].n >= 0x2C ? (const char *)in[i].p + 0x28 : "?");
+    }
+    if (failed >= 0) logf_("Boss deaths: %s not unpacked (compression %s)", names[failed], kind);
+    qsort(flags, (size_t)have, sizeof *flags, cmp_u32);
+    g_ntmpl = 0;
+    memset(g_boss_nent, 0, sizeof g_boss_nent);
+    if (found && out[0].p && strstr(names[0], "common_func")) emevd_templates(out[0]);
+    for (int i = 0; i < found; i++) if (out[i].p) emevd_boss_entities(out[i], flags, have);
+    for (int i = 0; i < found; i++) free(in[i].p), free(out[i].p);
+    int with = 0;
+    for (int i = 0; i < have; i++) with += g_boss_nent[i] > 0;
+    char path[1300];
+    snprintf(path, sizeof path, "%s" SEP "work" SEP "native" SEP "boss-deaths.txt", g_app);
+    size_t cap = 128 + (size_t)have * 12 * (1 + BOSS_ENT_MAX), at = 0;
+    char *text = xalloc(cap);
+    at += (size_t)snprintf(text + at, cap - at, "# boss death flags: %d (each: flag, then the boss characters' entity ids)\n", have);
+    for (int i = 0; i < have; i++) {
+        at += (size_t)snprintf(text + at, cap - at, "%u", flags[i]);
+        for (int k = 0; k < g_boss_nent[i]; k++) at += (size_t)snprintf(text + at, cap - at, " %u", g_boss_ent[i][k]);
+        at += (size_t)snprintf(text + at, cap - at, "\n");
+    }
+    int ok = read == found && have > 0 && write_file(path, (const u8 *)text, at);
+    free(text);
+    logf_("Boss deaths for the day clock: %d flags (%d with their boss character, %d templates) from %d of %d event scripts", have, with,
+          g_ntmpl, read, found);
+    return ok ? have : -1;
+}
+
 int core_build(const char *game_dir) {
     char bhd_path[1100], bdt_path[1100], from[1300], to[1300];
     if (!core_check_game(game_dir)) return logf_("This is not the game's folder: %s", game_dir), 0;
     if (!read_settings()) return 0;
     snprintf(bhd_path, sizeof bhd_path, "%s" SEP "data0.bhd", game_dir);
     snprintf(bdt_path, sizeof bdt_path, "%s" SEP "data0.bdt", game_dir);
+    logf_("Nightreign Invasions " MOD_VERSION);
     logf_("Reading the game archive...");
     rsa_init();
     aes_init();
@@ -2393,6 +2675,8 @@ int core_build(const char *game_dir) {
     ok = ok && build_icons(game_dir, bhd, bdt_path, 'h') && build_icons(game_dir, bhd, bdt_path, 'l');
     if (ok && one_region()) remove_two_region_map(), logf_("one-region (test): region %d only, no two-region map", one_region());
     else if (ok) ok = build_two_region_map(game_dir, bhd, bdt_path);
+    if (ok && build_boss_deaths(game_dir, bhd, bdt_path) < BOSS_DEATHS_MIN)
+        ok = 0, logf_("The game's event scripts look different than expected (too few boss deaths). The game may have been updated; the mod needs an update too.");
     free(bhd.p);
     if (ok && two_pair()->halves) ok = build_pair_half(game_dir);
     if (!ok) return 0;
@@ -2585,12 +2869,26 @@ int core_selftest(void) {
         if (!good) { ok = 0; logf_("selftest: param row insertion failed"); }
         free(q.p);
     }
+    {  // boss deaths from an event script: 9005810's first and 90015006's third parameter, others ignored, no repeats
+        static u8 ev[0x200];
+        memset(ev, 0, sizeof ev);
+        memcpy(ev, "EVD", 3);
+        wr64(ev + 0x10, 1), wr64(ev + 0x18, 0x80), wr64(ev + 0x28, 0x100), wr64(ev + 0x78, 0x180);
+        wr64(ev + 0x80, 1), wr64(ev + 0x88, 3), wr64(ev + 0x90, 0);
+        const u32 ins[3][4] = {{2000, 6, 12, 0}, {2000, 0, 20, 16}, {2000, 6, 12, 40}};  // bank, id, length, offset
+        for (int i = 0; i < 3; i++) wr32(ev + 0x100 + i * 0x20, ins[i][0]), wr32(ev + 0x104 + i * 0x20, ins[i][1]), wr64(ev + 0x108 + i * 0x20, ins[i][2]), wr64(ev + 0x110 + i * 0x20, ins[i][3]);
+        const u32 args[] = {0, 9005810, 46500800, 0, 0, 90015006, 30301510, 30300510, 30300810, 0, 0, 9005810, 46500800};
+        for (unsigned i = 0; i < sizeof args / sizeof *args; i++) wr32(ev + 0x180 + i * 4, args[i]);
+        u32 got[4];
+        int k = emevd_boss_deaths((buf){ev, sizeof ev}, got, 0, 4);
+        if (k != 2 || got[0] != 46500800 || got[1] != 30300810) { ok = 0; logf_("selftest: boss deaths from an event script failed"); }
+    }
     {  // test settings: values, comments, CRLF, case, a retired key (no-rain), unknown keys and bad values, a missing file
         static const char t[] = "# c\r\nteam-test = true\r\n  NO-RAIN=FALSE # x\r\nslow-time\t= True\r\ntwo-regions = true\r\n"
                                 "nope = true\r\nloot-test = yes\r\n\r\ndebug-log = false\r\ntest-level = 15\r\nmap-group = 3\r\nult-pvp = 250\r\none-region = 1000";
         short v[SETTINGS_COUNT];
         char bad[64];
-        static const short want[SETTINGS_COUNT] = {1, 1, -1, -1, 0, -1, 15, -1, -1, 3, -1, -1, -1, -1, 250, -1, -1, -1, -1};
+        static const short want[SETTINGS_COUNT] = {1, 1, -1, -1, 0, -1, 15, -1, -1, 3, -1, -1, -1, -1, 250, -1, -1, -1, -1, -1, -1};
         int good = settings_parse(t, sizeof t - 1, v, bad, sizeof bad) == 3 && !memcmp(v, want, sizeof v) &&
                    !strcmp(bad, "nope = true, loot-test = yes, one-region = 1000");
         good = good && !load_settings("/nonexistent/test-settings.toml", v);

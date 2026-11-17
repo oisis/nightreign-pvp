@@ -28,9 +28,13 @@ jobs:
       - name: Version
         run: |
           V=$(tr -d '[:space:]' < VERSION); P=${V##*.}
-          LAST=$(git tag -l "v${V%.*}.*" --sort=-v:refname | head -n 1)
+          LAST=$(git tag -l "v${V%.*}.*" --sort=-v:refname | grep -v -- '-dev' | head -n 1)
           [ -n "$LAST" ] && [ $(( ${LAST##*.} + 1 )) -gt "$P" ] && P=$(( ${LAST##*.} + 1 ))
-          echo "${V%.*}.$P" | tee VERSION
+          # Builds from any branch other than main are test builds: "a.b.c-dev.<run>". The mod treats
+          # such a version as no release (it pairs only with the same string and never shows the
+          # update notice), and main's numbering is not affected.
+          S=""; [ "$GITHUB_REF_NAME" = main ] || S="-dev.$GITHUB_RUN_NUMBER"
+          echo "${V%.*}.$P$S" | tee VERSION
 
       - name: Tools
         run: |
@@ -53,12 +57,13 @@ jobs:
       - name: Mod DLL and icons
         run: |
           W="$NRPVP_WORK"; ZIG="$W/tools/zig/zig"; mkdir -p "$W/build/native"
-          "$ZIG" cc -target x86_64-windows-gnu -shared -O2 -Wall -Wextra -o "$W/build/native/invasion.dll" mod/dll/invasion.c
+          V=$(tr -d '[:space:]' < VERSION)
+          "$ZIG" cc -target x86_64-windows-gnu -shared -O2 -Wall -Wextra "-DMOD_VERSION=\"$V\"" -o "$W/build/native/invasion.dll" mod/dll/invasion.c
           "$ZIG" cc -target x86_64-windows-gnu -O2 -o "$W/build/unkrak.exe" mod/tools/unkrak.c
           python3 mod/build_icon.py --blocks "$W/build-launcher-data"
 
       - name: Launcher and packages
-        run: sh launcher/build.sh && sh launcher/package.sh
+        run: MOD_VERSION=$(tr -d '[:space:]' < VERSION) sh launcher/build.sh && sh launcher/package.sh
 
       - name: Release
         env:
@@ -67,7 +72,7 @@ jobs:
           V=$(tr -d '[:space:]' < VERSION)
           set -- "$NRPVP_WORK"/dist/packages/*.zip
           # Changelog: the subjects of the commits since the previous version's tag.
-          PREV=$(git tag -l 'v*' --sort=-v:refname | head -n 1)
+          PREV=$(git tag -l 'v*' --sort=-v:refname | grep -v -- '-dev' | head -n 1)
           { echo "## Changes"; echo
             if [ -n "$PREV" ]; then git log --no-merges --format='- %s' "$PREV..HEAD" | sed 's/^- \[build\] */- /'
             else echo "- First test release"; fi
@@ -83,6 +88,7 @@ jobs:
         run: |
           [ -n "$DISCORD_WEBHOOK" ] || { echo "DISCORD_WEBHOOK not set, skipping"; exit 0; }
           V=$(tr -d '[:space:]' < VERSION)
+          case "$V" in *-dev*) echo "test build $V, not announced"; exit 0;; esac
           URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/v$V"
           # Embed descriptions hold at most 4096 characters.
           jq -n --arg v "$V" --arg url "$URL" --rawfile notes notes.md '{embeds: [{

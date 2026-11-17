@@ -6,6 +6,10 @@
 #include <stddef.h>
 
 #define APP_NAME "Nightreign Invasions"
+// The mod's version: the release workflow passes the final VERSION (-DMOD_VERSION="\"0.1.37\""); local builds say "dev".
+#ifndef MOD_VERSION
+#define MOD_VERSION "dev"
+#endif
 #define STEAM_APP_ID "2622380"
 #define MOD_SAVE_NAME "NR0000-invasion.sl2"
 

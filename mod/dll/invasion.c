@@ -4,9 +4,8 @@
 //   - logs the session manager's state (lobby state, player count, join data) whenever it changes,
 //     and how many invaders the current squad would allow;
 //   - adds an "Invasion" entry to the expedition menu's Target list (row 101 of NightBossMenuParam,
-//     which must exist in regulation.bin: mod/build_regulation.py, or the launcher) and a fourth
-//     entry to the "Number of Players" option;
-//   - makes that fourth option ask for a squad of four and raises the session's player limit to six;
+//     which must exist in regulation.bin: mod/build_regulation.py, or the launcher); the "Number of
+//     Players" option shows only "1 player" and "Team";
 //   - when that Invasion entry is the chosen target: cancels the expedition start and enters the
 //     "searching" state, with a small repeating notice, brings the game's network up (Steam only,
 //     behind the network guard) and lists Steam lobbies carrying the mod's marker. Nothing is joined;
@@ -22,6 +21,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+// The mod's version: the release workflow passes the final VERSION (-DMOD_VERSION="\"0.1.37\""); local builds say "dev".
+// Only the same version pairs up (lobby key nrpvp_ver); "dev" is never a release, so it is never "newer" than one.
+#ifndef MOD_VERSION
+#define MOD_VERSION "dev"
+#endif
+static int g_cap_remote = 2;  // remote player slots in effect (4 once the capacity patch is in, capacity.h)
 #define GAME_TIMESTAMP 0x69e0dc2a  // nightreign.exe 1.3.3, Steam build 22818764
 
 // Session manager (same first fields as Elden Ring's CSSessionManager).
@@ -33,7 +38,7 @@
 #define SM_PLAYERS_BEGIN 0x78   // players vector: begin, end (+0x80); entries are 0xF0 bytes
 #define SM_PLAYER_SIZE   0xF0
 #define SM_PLAYER_LIMIT  0x170  // u32, 3 in vanilla
-#define SESSION_PLAYERS  6      // squad of four + two invaders
+#define SESSION_PLAYERS  SESSION_PLAYERS_MAX  // one per remote slot plus the local player: 5 with the capacity patch, else 3
 #define IMPL_VT_EXPORT_JOIN_DATA 0x40  // bool (impl*, u32 handle, void *buf, u32 *size)
 
 // Expedition menu, Target list (CS::MatchingBossSelectDialog::_CreateBossList and helpers).
@@ -62,7 +67,7 @@ static const char *const KEY_LINES[] = {
     "host: session up", "host: expedition reached", "host: expedition over", "host: member admitted", "role: ",
     "host: no member left", "leave done", "join: search started", "joining lobby", "join -> ", "stopping (",
     "in the host's world", "world sync at step", "invasion won", "invasion lost", "invasion neither", "level: ", "map test", "two-regions", "expedition: result", "reward test: won", "reward test: lost",
-    "expedition end requested", "flags: ", "lag: ", "move check: ", "map pin: ", "name tag: ", "map test",  "still down", "watchdog", "no map load", "went back", "code patch", "crash"};
+    "expedition end requested", "flags: ", "lag: ", "move check: ", "map pin: ", "name tag: ", "scaling: ", "version: ", "counts overlay: ", "capacity: ", "slot: ", "map test",  "still down", "watchdog", "no map load", "went back", "code patch", "crash"};
 static void logf(const char *fmt, ...) {
     char line[1024];
     va_list ap;
@@ -280,6 +285,42 @@ static void fastfail_install(void) {  // DllMain: import slot and the second poi
         VirtualProtect(slots[i], 8, old, &old);
         g_ff_hooked |= 1 << i;
     }
+}
+// Steam going away (dev.46 runs 74 / 61: at every game exit our echo thread read a freed Steam interface, "reading
+// 0xbeef" in lsteamclient, after the game's last frame). The game shuts Steam down once, at exit, through its import
+// SteamAPI_Shutdown (steam_api64.dll); going back to the Roundtable Hold does not call it. Our wrapper first stops
+// every Steam use of ours (g_steam_down: the echo thread leaves its loop, steam_ready() answers no) and waits until
+// the echo thread is out of its Steam calls (at most 500 ms), then lets the game's call through.
+static volatile LONG g_steam_down, g_steam_busy;
+static void (*g_steam_shutdown_real)(void);
+static void steam_shutdown_hook(void) {
+    InterlockedExchange(&g_steam_down, 1);
+    for (int i = 0; i < 250 && g_steam_busy; i++) Sleep(2);
+    logf("steam: the game shuts Steam down; our Steam use stopped first%s", g_steam_busy ? " (the echo thread did not finish in 500 ms)" : "");
+    if (g_steam_shutdown_real) g_steam_shutdown_real();
+}
+static void steam_shutdown_install(void) {  // DllMain: the exe's import slot of SteamAPI_Shutdown, only if it holds the real one
+    HMODULE m = GetModuleHandleA("steam_api64.dll");
+    void *real = m ? (void *)GetProcAddress(m, "SteamAPI_Shutdown") : NULL;
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew);
+    IMAGE_DATA_DIRECTORY dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    void **slot = NULL;
+    for (IMAGE_IMPORT_DESCRIPTOR *d = (IMAGE_IMPORT_DESCRIPTOR *)(g_base + dir.VirtualAddress); real && dir.VirtualAddress && d->Name && !slot; d++) {
+        IMAGE_THUNK_DATA64 *names = (IMAGE_THUNK_DATA64 *)(g_base + d->OriginalFirstThunk);
+        for (size_t i = 0; d->OriginalFirstThunk && names[i].u1.Ordinal && !slot; i++)
+            if (!IMAGE_SNAP_BY_ORDINAL64(names[i].u1.Ordinal) &&
+                !strcmp(((IMAGE_IMPORT_BY_NAME *)(g_base + names[i].u1.Ordinal))->Name, "SteamAPI_Shutdown"))
+                slot = (void **)(g_base + d->FirstThunk) + i;
+    }
+    DWORD old;
+    if (!slot || *slot != real || !VirtualProtect(slot, 8, PAGE_READWRITE, &old)) {
+        logf("steam: SteamAPI_Shutdown import not found or not the real one: not wrapped");
+        return;
+    }
+    g_steam_shutdown_real = (void (*)(void))real;
+    *slot = (void *)steam_shutdown_hook;
+    VirtualProtect(slot, 8, old, &old);
+    logf("steam: SteamAPI_Shutdown wrapped (our Steam use stops before it)");
 }
 // Exit line (DLL_PROCESS_DETACH, written the same allocation-free way): process exit or unload. No line and no
 // crash record = the process was ended from outside (TerminateProcess, killed) or died where we cannot see.
@@ -531,9 +572,15 @@ static void **session_impl(char *sm) {
 }
 
 // How many invaders a squad of this size may get. Design rule: 1:1, 2:1, 3:2, 4:2.
+// Team play: the game has 2 remote player-data slots (0x1401fe4c0 returns 2; 0x1401fe530, 0x1401fe150 stop at 2),
+// so a session holds 3 players. Line-ups within that: solo host + 1 invader, squad of 2 + 1 invader; a squad of 3
+// takes no invader (3:1, 2:2, 3:2 need more slots).
+// With the capacity patch (4 remote slots, 5 players): solo host 1 invader, squad of 2 or 3 up to 2; squad <= 3.
+#define SESSION_PLAYERS_MAX ((unsigned)g_cap_remote + 1)
 static unsigned invaders_allowed(unsigned squad) {
-    static const unsigned table[] = {0, 1, 1, 2, 2};
-    return squad < sizeof table / sizeof *table ? table[squad] : 2;
+    static const unsigned table3[] = {0, 1, 1, 0}, table5[] = {0, 1, 2, 2};
+    const unsigned *t = g_cap_remote == 4 ? table5 : table3;
+    return squad < 4 ? t[squad] : 0;
 }
 
 // Log the session manager's state whenever it changes.
@@ -1051,7 +1098,7 @@ static int our_speffect_active(char *chr);
 // invasion (in the host's world), and the host hides every character that has once carried our effect
 // in this session.
 static int g_join_in_world(void);
-// Allies (setting "ally" on the joiner): the same join, without our team effect, so the joiner keeps the base
+// Allies (the menu's "team" choice): the same join, without our team effect, so the joiner keeps the base
 // team 2 both machines give a remote player (0x3d77d0) and the game's relation 2 <-> 2 is Friend (table
 // 0x14398d410). Each joiner writes its role into its Steam lobby member data (nrpvp_role); a member without one
 // counts as an invader, as before. Rules that were "someone is in my session" now ask for an invader in it.
@@ -1068,7 +1115,7 @@ static void party_host_over(void);
 #define LOBBY_PARTY_KEY "nrpvp_party"   // a gathering host's party code
 #define LOBBY_HP_KEY    "nrpvp_hp"      // the host's HP flask charges (+0xff), once its start value is final
 #define ALLY_FLASK_CUT  2                // an ally's charges at arrival = max(ALLY_FLASK_MIN, host's - this)
-#define ALLY_FLASK_MIN  1
+#define ALLY_FLASK_MIN  3                // owner, 2026-11-17: a summon never has fewer than 3 HP charges
 #define LOBBY_GO_KEY    "nrpvp_go"      // "1" once the host's expedition is generated (start block, generator results final)
 static int g_invader_in_world(void);        // joined as an invader and in the host's world
 static int side_count(int want_allies);     // remote session members that are allies / invaders (not the host)
@@ -1083,6 +1130,8 @@ static char *g_hud_invaders[4];
 static unsigned long long pin_read_73(void *a, unsigned long long *sender, void *buf);
 static unsigned long long pin_read_74(void *a, unsigned long long *sender, void *buf);
 static void remote_tags_hook(void *a, void *b, void *c, void *d);
+static int squad_count_hook(void);
+static void squad_count_tick(void);
 static int g_host_switched, g_host_old_dc;
 // Who ends a session: every readable call of the session leave (0xdf1180, 44 call sites) and of the
 // client's role-1 timeout leave (0xdf5840) is logged with its call site (the return address) and
@@ -1634,6 +1683,41 @@ static int rune_kill_hook(char *chr, float amount, char *enemy, unsigned char fl
                                  full, amount, got);
     return got;
 }
+// Flask charges (measurement, pattern 16: 3 charges, churches 101 / 104 cleared): every write of the HP / FP
+// charge counts goes through 0x20d9d0(PlayerGameData, hp, fp) (+0xff / +0x100). Each call is logged with
+// its site (the call's address, or for the two tail jumps the jump and the caller of the function that
+// jumps), the counts before and after and +0x1a8 (charges added in the expedition), whether it is the
+// local player's data (GameDataMan +8), at most 200 lines a session. Sites: 0x200ed7 load (CharaInitParam
+// +0xfe), 0x20123f / 0x20260e / 0x2027b1 / 0x202a6c / 0x202c94 player-data set-up, 0x5fdafa 2004[86],
+// 0x60acb6 (-1, EMEVD), 0xfd912e (0xfd90e0, from 0xfdee30), jumps 0x7ea74c (0x7ea6f0, lambda 0xa02660) and
+// 0xfd9112.
+static int g_flask_lines;
+static void flask_set_logged(unsigned site, unsigned caller, char *pgd, unsigned hp, unsigned fp) {
+    char *gdm = *(char **)(g_base + 0x3c078d0), *mine = gdm ? *(char **)(gdm + 8) : NULL;
+    unsigned b_hp = pgd ? (unsigned char)pgd[0xff] : 0, b_fp = pgd ? (unsigned char)pgd[0x100] : 0;
+    int b_add = pgd ? *(int *)(pgd + 0x1a8) : 0;
+    ((void (*)(char *, unsigned, unsigned))(g_base + 0x20d9d0))(pgd, hp, fp);
+    if (!pgd || g_flask_lines >= 200) return;
+    g_flask_lines++;
+    logf("flasks: set at %x%s%x (%s): HP %u -> %u (asked %u), FP %u -> %u, added in the expedition (+0x1a8) %d -> %d", site,
+         caller ? ", caller " : "", caller, pgd == mine ? "local player" : "other player data", b_hp, (unsigned char)pgd[0xff], hp & 0xff, b_fp,
+         (unsigned char)pgd[0x100], b_add, *(int *)(pgd + 0x1a8));
+}
+static void flask_call_hook(char *pgd, unsigned hp, unsigned fp) {
+    flask_set_logged((unsigned)((char *)__builtin_return_address(0) - g_base) - 5, 0, pgd, hp, fp);
+}
+static void flask_jmp_7ea_hook(char *pgd, unsigned hp, unsigned fp) {
+    flask_set_logged(0x7ea74c, (unsigned)((char *)__builtin_return_address(0) - g_base), pgd, hp, fp);
+}
+static void flask_jmp_fd9_hook(char *pgd, unsigned hp, unsigned fp) {
+    flask_set_logged(0xfd9112, (unsigned)((char *)__builtin_return_address(0) - g_base), pgd, hp, fp);
+}
+static void flask_log_install(void) {
+    static const unsigned CALLS[] = {0x200ed7, 0x20123f, 0x20260e, 0x2027b1, 0x202a6c, 0x202c94, 0x5fdafa, 0x60acb6, 0xfd912e};
+    for (unsigned i = 0; i < sizeof CALLS / sizeof *CALLS; i++) hook_call(CALLS[i], 0x20d9d0, (void *)flask_call_hook, "flasks: charge write log");
+    hook_jump(0x7ea74c, 0x20d9d0, (void *)flask_jmp_7ea_hook, "flasks: charge write log (jump)");
+    hook_jump(0xfd9112, 0x20d9d0, (void *)flask_jmp_fd9_hook, "flasks: charge write log (jump)");
+}
 static void rune_install(void) {
     hook_call(0x3de800, RUNE_KILL_FN, (void *)rune_kill_hook, "runes: kill reward (own kill)");
     hook_call(0x51dc0b, RUNE_KILL_FN, (void *)rune_kill_hook, "runes: kill reward (reported kill)");
@@ -1835,7 +1919,7 @@ static void map_list_draw(const char *where, char *ctl, char *list, int selected
 }
 static void marker_tick(void) {
     static DWORD next;
-    static char last[2][0x60];
+    static char last[4][0x60];
     char *m = g_map_dialog_model ? g_map_dialog_model : g_view_models[0] ? g_view_models[0] : g_view_models[1];
     if (!m || (int)(GetTickCount() - next) < 0) return;
     next = GetTickCount() + 2000;
@@ -1844,7 +1928,7 @@ static void marker_tick(void) {
         return;
     }
     char **b = *(char ***)(m + 0xb0), **e = *(char ***)(m + 0xb8);
-    for (int i = 0; b && b + i < e && i < 2; i++) {
+    for (int i = 0; b && b + i < e && i < g_cap_remote; i++) {  // one pin per remote slot (0x14090dc80: 0x1401fe4c0 pins)
         char *pin = b[i];
         if (!pin || IsBadReadPtr(pin, 0x60) || !memcmp(last[i], pin, 0x60)) continue;
         memcpy(last[i], pin, 0x60);
@@ -1904,7 +1988,7 @@ static void marker_apply(int map_rule) {
         char *m = g_view_models[k];
         if (!m || IsBadReadPtr(m, 0xc0) || *(char **)m != g_base + 0x2c4a548) continue;
         char **b = *(char ***)(m + 0xb0), **e = *(char ***)(m + 0xb8);
-        for (int i = 0; b && b + i < e && i < 2; i++) {
+        for (int i = 0; b && b + i < e && i < g_cap_remote; i++) {  // one pin per remote slot (0x14090dc80: 0x1401fe4c0 pins)
             char *pin = b[i];
             if (!pin || IsBadReadPtr(pin, 0x20) || !pin[0xc]) continue;
             int no = *(int *)(pin + 0x1c), hide = 0;
@@ -2087,9 +2171,66 @@ static int g_flog_last_mode = -1;  // mode of the last layout (run 32: 1 = the e
 static struct { unsigned id; DWORD t; } g_flog_back[8];  // ten-digit flags turned on, read back 5 s later
 static int g_flog_back_n, g_flog_back_logged;
 static double flog_t(void) { return (GetTickCount() - g_flog_layout_tick) / 1000.0; }
+static void bf3_kill(unsigned id);
+// Boss deaths: every flag a site-of-grace chain waits for (common_func 9005810's first and 90015006's third parameter
+// in the game's tile and small-map scripts), listed by the launcher at the mod build from the player's own game files:
+// work/native/boss-deaths.txt (a header line, one id per line). One per boss: a small map's boss set-up (90045002)
+// also sets a flag of its variant (m46_50: 46500830 beside 46500800), which is not listed. Small-map ids of instance
+// n are n * 10^8 + the script's id; tile ids are exact. Without the file: any nnn 800..899 with d = 0 (logged).
+static unsigned *g_boss_death;
+static int g_boss_deaths = -1;
+#define HIDE_MAX 1024
+static unsigned g_hide_ent[HIDE_MAX];  // every listed boss's characters
+static int g_hide_n;  // -1: no list, the fallback rule
+static void boss_deaths_load(void) {
+    char path[MAX_PATH];
+    next_to_dll(path, sizeof path, "boss-deaths.txt");
+    FILE *f = fopen(path, "rb");
+    static unsigned list[4096];
+    int n = 0;
+    char line[256];
+    while (f && fgets(line, sizeof line, f))
+        if (line[0] >= '0' && line[0] <= '9' && n < 4096) {
+            char *at = line;
+            list[n++] = (unsigned)strtoul(at, &at, 10);
+            for (;;) {  // then the boss's characters (entity ids, launcher: the event that sets the flag on its death)
+                unsigned e = (unsigned)strtoul(at, &at, 10);
+                if (!e) break;
+                int dup = 0;
+                for (int k = 0; k < g_hide_n; k++) dup |= g_hide_ent[k] == e;
+                if (!dup && g_hide_n < HIDE_MAX) g_hide_ent[g_hide_n++] = e;
+            }
+        }
+    if (f) fclose(f);
+    for (int i = 1; i < n; i++)  // keep it sorted (the launcher writes it sorted)
+        for (int j = i; j > 0 && list[j - 1] > list[j]; j--) { unsigned t = list[j]; list[j] = list[j - 1], list[j - 1] = t; }
+    if (n > 0) g_boss_death = list, g_boss_deaths = n, logf("clock: %d boss death flags loaded (%d boss characters)", n, g_hide_n);
+    else logf("clock: no boss death list (boss-deaths.txt%s): any nnn 800..899 with d = 0 counts as a boss", f ? " empty" : " missing");
+}
+static int boss_death(unsigned id) {
+    if (g_boss_deaths < 0) return id % 1000 >= 800 && id % 1000 < 900 && id / 1000 % 10 == 0;
+    unsigned key = id >= 1000000000u ? id : id % 100000000u;
+    int lo = 0, hi = g_boss_deaths - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (g_boss_death[mid] == key) return 1;
+        if (g_boss_death[mid] < key) lo = mid + 1; else hi = mid - 1;
+    }
+    return 0;
+}
 static void flag_note(char *man, unsigned id, int on, int before) {
     (void)man;
-    if (!setting(S_FLAG_LOG) || before == (on != 0)) return;
+    if (on && before == 0 && id >= 10000000u && boss_death(id)) bf3_kill(id);
+    if (!setting(S_FLAG_LOG)) {
+        // always (boss-grace check): a boss-family flag (nnn 800..899 in a block with d = 0, the d digit being
+        // (id / 1000) % 10 in tile ids 10XXYYdnnn / 10XYVddnnn and small-map ids) turned on, or dropped for want of a
+        // block; whether it is a boss death (a grace chain's flag, counted by boss-flow 3) is said on the line.
+        if (on && before != 1 && id >= 10000000u && id % 1000 >= 800 && id % 1000 < 900 && id / 1000 % 10 == 0)
+            logf("flags: boss-family flag %u -> 1%s%s", id, before < 0 ? " DROPPED, no block" : "",
+                 boss_death(id) ? " (a boss death)" : " (not a grace chain's death flag: not counted)");
+        return;
+    }
+    if (before == (on != 0)) return;
     EnterCriticalSection(&g_flog_lock);
     unsigned h = (id * 2654435761u) % FLOG_SLOTS;
     for (int k = 0; k < 64 && g_flog[h].id && g_flog[h].id != id; k++) h = (h + 1) % FLOG_SLOTS;
@@ -2597,11 +2738,18 @@ static unsigned *variant_hook(unsigned *out, unsigned *id, unsigned long long mo
 // started only by 0x6953b0 (called only at 0x68e229): that call is skipped.
 static DWORD g_expedition_start_tick;  // defined with g_expedition_tick below
 static DWORD g_norain_seen[13];
+static DWORD g_enter_tick, g_enter_world;  // joiner: join time, in the host's world (defined with the join code)
+static int g_join;
+static DWORD norain_key(void) {  // the host's own expedition, or a joiner's stay in the host's world (0: neither)
+    return g_join == 4 && g_enter_world ? g_enter_tick | 1 : g_expedition_start_tick;
+}
 static void norain_first(int k, const char *what) {
     if (k < 0 || k >= (int)(sizeof g_norain_seen / sizeof *g_norain_seen)) return;
-    if (g_debug_log && g_norain_seen[k] != g_expedition_start_tick) {
-        g_norain_seen[k] = g_expedition_start_tick;
-        logf("no rain: %s (first time this expedition)", what);
+    // (until 17.11 joiners never logged: the key was the host-only expedition start, 0 on a joiner)
+    DWORD key = norain_key();
+    if (g_debug_log && key && g_norain_seen[k] != key) {
+        g_norain_seen[k] = key;
+        logf("no rain: %s (first time this expedition%s)", what, key == g_expedition_start_tick ? "" : ", joined");
     }
 }
 static char *stage_rend(void) {
@@ -2614,8 +2762,31 @@ static void norain_effect_off(void) {
     char *sr = stage_rend();
     if (sr) sr[0xc553] = 0;
 }
+// The circle held at full size (owner's go, 17.11): the play-area manager's three phase entries (0x20 each from
+// +0x190: +0x10 radius, so +0x1a0 / +0x1c0 / +0x1e0) and the three pending ones the update copies in (+0x200 /
+// +0x220 / +0x240) get radius 5000 before each circle update (0x696170 / 0x698c90, our wrappers below), on every
+// machine (a joiner's entries come from the host; the update runs everywhere). The current radius +0x260 is the
+// update's interpolation of those, so every test of the circle (character outside bit, player inside, the
+// per-character map, the phase effect on characters, EcTestIsInsidePlayArea, the map) answers "inside" by the game's
+// own geometry. Written only while +0x159 says a circle exists; nothing else is touched. Phases and the clock are
+// time-driven and unchanged.
+#define CIRCLE_HELD_RADIUS 5000.0f
+static void circle_hold(char *mgr) {
+    if (!mgr || IsBadReadPtr(mgr, 0x264) || !mgr[0x159]) return;
+    static const int OFF[6] = {0x1a0, 0x1c0, 0x1e0, 0x200, 0x220, 0x240};
+    static DWORD told_for, next;
+    DWORD key = norain_key();
+    if (key && told_for != key) {
+        told_for = key, next = GetTickCount() + 30000;
+        logf("no rain: circle radius held at %.0f (phase radii were %.1f/%.1f/%.1f, current +0x260 %.1f)", CIRCLE_HELD_RADIUS,
+             *(float *)(mgr + 0x1a0), *(float *)(mgr + 0x1c0), *(float *)(mgr + 0x1e0), *(float *)(mgr + 0x260));
+    } else if (key && (int)(GetTickCount() - next) >= 0)
+        next = GetTickCount() + 30000, logf("no rain: circle radius now %.1f (every 30 s)", *(float *)(mgr + 0x260));
+    for (int i = 0; i < 6; i++) *(float *)(mgr + OFF[i]) = CIRCLE_HELD_RADIUS;
+}
 static volatile int g_c553_pre = -1;  // measurement: StageRend +0xc553 just before the circle update (after last frame's clear)
 static void norain_circle_hook(char *mgr, float dt, unsigned long long c) {
+    circle_hold(mgr);
     char *sr = stage_rend();
     g_c553_pre = sr ? (unsigned char)sr[0xc553] : -1;
     ((void (*)(char *, float, unsigned long long))(g_base + 0x696170))(mgr, dt, c);
@@ -2623,6 +2794,7 @@ static void norain_circle_hook(char *mgr, float dt, unsigned long long c) {
     norain_first(0, "circle update 0x696170, effect switched off");
 }
 static void norain_circle2_hook(char *mgr, float dt) {
+    circle_hold(mgr);
     ((void (*)(char *, float))(g_base + 0x698c90))(mgr, dt);
     norain_effect_off();
     norain_first(1, "circle update 0x698c90, effect switched off");
@@ -2696,6 +2868,17 @@ static unsigned long long pin_row_shown_hook(unsigned long long type, unsigned *
         return (int)((v >> 4) & 0xf) == TWO_ADDED.variant;
     }
     return ((unsigned long long (*)(unsigned long long, unsigned *))(g_base + RVA_PIN_ROW_SHOWN))(type, id);
+}
+// Map circles: the world map view model update 0x140910300 (every model: map screen and compass) asks the play-area
+// manager for the current circle (0x14068bab0 at 0x14091079b -> model +0x134 shown, +0x138 centre, +0x140 radius) and
+// for the circle of the current phase entry, the next-circle preview (0x14068bcd0 at 0x1409108e6, gated by 0x14068c650
+// "shrinking" -> model +0x14c, +0x150, +0x158); the map screen 0x140ac9410 draws each only while its flag is set
+// (0x140ac9843 / 0x140ac98c6, else 0x140ad3cc0(.., 0) hides it). Both answered "no circle": neither is drawn. The
+// phase-2 marker (+0x168, the final site from manager +0x2f8, 0x14068b8a0 at 0x1409109f6) stays.
+static unsigned long long map_no_circle_hook(void *mgr, void *a, void *b, void *c) {
+    (void)mgr, (void)a, (void)b, (void)c;
+    norain_first(8, "map: circle and next-circle preview not drawn");
+    return 0;
 }
 static unsigned long long hud_circle_state_hook(char *mgr, unsigned long long chr) {
     (void)mgr, (void)chr;
@@ -2789,7 +2972,7 @@ static void two_regions_churches_log(unsigned pat) {
 // +0x20 from it, defaults when the key is missing). Logged each time the map screen is built, per church.
 static void church_pins_log(char *model) {
     char *gm = *(char **)(g_base + 0x3c13258), *man = flag_man();
-    if (!g_debug_log || !g_two_active || !gm || !man || !model || IsBadReadPtr(model, 0x250)) return;
+    if (!g_two_active || !gm || !man || !model || IsBadReadPtr(model, 0x250)) return;  // also without debug-log (pattern 16 measurement)
     unsigned pat = *(unsigned *)(gm + 0xb4c);
     char path[MAX_PATH], line[128], out[700] = "";
     next_to_dll(path, sizeof path, "two-regions.txt");
@@ -2816,8 +2999,9 @@ static void church_pins_log(char *model) {
         if (found && !IsBadReadPtr(found, 0x22))
             snprintf(ent, sizeof ent, "%u/%u/%u/%u/%u", *(unsigned short *)found, *(unsigned short *)(found + 2), *(unsigned short *)(found + 4),
                      (unsigned char)found[0x17], *(unsigned short *)(found + 0x20));
-        snprintf(out + strlen(out), sizeof out - strlen(out), " | %u (m%02u_%02u_%02u): rule %d, %u=%d %u=%d, +0x240 %s", at, area, gx, gz,
-                 gate, 73000 + at, flag_state_in(man, 73000 + at), 74000 + at, flag_state_in(man, 74000 + at), ent);
+        snprintf(out + strlen(out), sizeof out - strlen(out), " | %u (m%02u_%02u_%02u): rule %d, %u=%d %u=%d %u=%d, +0x240 %s", at, area, gx, gz,
+                 gate, 73000 + at, flag_state_in(man, 73000 + at), 74000 + at, flag_state_in(man, 74000 + at), 73810 + at,
+                 flag_state_in(man, 73810 + at), ent);
         n++;
     }
     if (f) fclose(f);
@@ -2913,34 +3097,43 @@ static void hook_acceptance(void) {
         hook_call(0x43dac3, 0x66dec0, (void *)finish_hit_hook, "finish test: gauge hit");
         if ((g_settings[S_ULT_PVP] && g_settings[S_ULT_PVP] != 100) || g_debug_log) ult_pvp_install();
         rune_install();
+        flask_log_install();
         pkt_guard_install();
         hook_call(0xba0e42, 0xddb9c0, (void *)pin_read_73, "map pin: pin packet read (1)");
         hook_call(0xba11aa, 0xddb9c0, (void *)pin_read_73, "map pin: pin packet read (2)");
         hook_call(0xba11e6, 0xddb900, (void *)pin_read_74, "map pin: pin reaction read (1)");
         hook_call(0xba130c, 0xddb900, (void *)pin_read_74, "map pin: pin reaction read (2)");
         hook_call(0xc3bb92, 0x7d9f80, (void *)remote_tags_hook, "name tag: over-head names");
+        hook_call(0x3db2b9, 0x519660, (void *)squad_count_hook, "scaling: player count (apply)");
+        hook_call(0x3c7ee8, 0x519660, (void *)squad_count_hook, "scaling: player count (re-apply check)");
+        hook_call(0x3d2d3d, 0x519660, (void *)squad_count_hook, "scaling: player count (creation)");
     }
     hook_call(0xc27a41, 0x6b06f0, (void *)map_request_hook, "two-regions: map request");
     hook_call(0x5e7ff6, 0x6ab300, (void *)tile_flag_space_hook, "two-regions: tile flag space");
     if (g_settings[S_PAIR] >= 1)
         for (unsigned i = 0; i < sizeof VARIANT_SITES / sizeof *VARIANT_SITES; i++)
             hook_call(VARIANT_SITES[i], 0x6ab7a0, (void *)variant_hook, "pair: per-tile variant");
-    hook_call(0x68e1d2, 0x696170, (void *)norain_circle_hook, "no rain: play-area effect off after the circle update");
+    // rain-hooks-legacy (test, default on): the 8 hooks the held radius makes the game answer by itself (rain around
+    // the player, health bar circle state x2, weather side x4, no character outside); off = the radius alone
+    int legacy = setting(S_RAIN_HOOKS_LEGACY);
+    hook_call(0x68e1d2, 0x696170, (void *)norain_circle_hook, "no rain: circle radius held, play-area effect off after the circle update");
     hook_call(0x68e1ea, 0x698c90, (void *)norain_circle2_hook, "no rain: play-area effect off after the second circle update");
     hook_call(0x68e229, 0x6953b0, (void *)norain_sound_hook, "no rain: circle edge sound skipped");
-    hook_call(0x68e208, 0x695f80, (void *)norain_player_rain_hook, "no rain: rain around the player skipped");
+    if (legacy) hook_call(0x68e208, 0x695f80, (void *)norain_player_rain_hook, "no rain: rain around the player skipped");
     hook_call(0x68e213, 0x692350, (void *)norain_edge_rain_hook, "no rain: rain along the circle edge skipped");
     hook_call(0x68e21e, 0x694580, (void *)norain_border_hook, "no rain: circle border effects skipped");
-    hook_call(0x7cbf86, 0x68c5f0, (void *)hud_circle_state_hook, "no rain: health bar circle state (1)");
-    hook_call(0x7cee41, 0x68c5f0, (void *)hud_circle_state_hook, "no rain: health bar circle state (2)");
+    if (legacy) hook_call(0x7cbf86, 0x68c5f0, (void *)hud_circle_state_hook, "no rain: health bar circle state (1)");
+    if (legacy) hook_call(0x7cee41, 0x68c5f0, (void *)hud_circle_state_hook, "no rain: health bar circle state (2)");
     hook_call(0x69722c, 0x7c52f0, (void *)hud_circle_notice_hook, "no rain: circle notice skipped");
-    hook_call(0x65ff39, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (1)");
-    hook_call(0x6639c3, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (2)");
-    hook_call(0x664170, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (3)");
-    hook_call(0xef5cdd, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (4)");
+    hook_call(0x91079b, 0x68bab0, (void *)map_no_circle_hook, "no rain: map circle not drawn");
+    hook_call(0x9108e6, 0x68bcd0, (void *)map_no_circle_hook, "no rain: map next-circle preview not drawn");
+    if (legacy) hook_call(0x65ff39, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (1)");
+    if (legacy) hook_call(0x6639c3, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (2)");
+    if (legacy) hook_call(0x664170, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (3)");
+    if (legacy) hook_call(0xef5cdd, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (4)");
     hook_call(0x693ae8, 0x704cd0, (void *)asset_enable_hook, "no rain: circle far asset disabled (1)");
     hook_call(0x693dc3, 0x704cd0, (void *)asset_enable_hook, "no rain: circle far asset disabled (2)");
-    hook_call(0x3e2a16, 0x68c500, (void *)outside_circle_hook, "no rain: no character outside the circle");
+    if (legacy) hook_call(0x3e2a16, 0x68c500, (void *)outside_circle_hook, "no rain: no character outside the circle");
     hook_call(0x911081, RVA_PIN_ROW_SHOWN, (void *)pin_row_shown_hook, "map pins: woods tiles by the Rotted Woods rule (pin loop)");
     hook_call(0xa5bba1, RVA_PIN_ROW_SHOWN, (void *)pin_row_shown_hook, "map pins: woods tiles by the Rotted Woods rule (second row loop)");
     {
@@ -2955,8 +3148,10 @@ static void hook_acceptance(void) {
             int hooked = c[0] == 0xE8 && memcmp(c + 1, &rel, 4) != 0;
             if (i < 16) n += hooked; else pins += hooked;
         }
-        logf("no rain: %s (%d of 16 hooks: play-area effect off after both circle updates; edge sound, rain around the player, rain along the edge, border effects and circle notice skipped; health bar circle state 0; weather side inside the circle (4); far asset disabled (2); no character outside the circle)",
-             n == 16 ? "in place" : "NOT complete", n);
+        int want = legacy ? 16 : 8;
+        logf("no rain: %s (%d of %d hooks: circle radius held at %.0f and play-area effect off at both circle updates; edge sound, rain along the edge, border effects and circle notice skipped; far asset disabled (2)%s)",
+             n == want ? "in place" : "NOT complete", n, want, CIRCLE_HELD_RADIUS,
+             legacy ? "; legacy: rain around the player skipped, health bar circle state 0, weather side inside the circle (4), no character outside the circle" : "; rain-hooks-legacy off: the 8 consumer hooks are not installed");
         logf("map pins: %s (%d of 2 hooks: woods tiles 44-45 x 36-37 show the Rotted Woods rows%s)", pins == 2 ? "in place" : "NOT complete", pins,
              g_settings[S_ONE_REGION] >= 1 ? "; off for one-region" : "");
     }
@@ -2969,7 +3164,7 @@ static void hook_acceptance(void) {
         static const unsigned EN[] = {0x6942db, 0x69451e};  // 0x693ae8 / 0x693dc3: hooked always (far asset)
         for (unsigned i = 0; i < 2; i++) hook_call(EN[i], 0x704cd0, (void *)asset_enable_hook, "map-dump: circle asset enable log");
     }
-    if (setting(S_FLAG_LOG) || setting(S_MAP_DUMP)) {
+    {  // always: flag-log / map-dump log every write; otherwise only boss-death flags (flag_note)
         hook_call(0x5e789d, 0x60d330, (void *)flag_store_hook, "flags: storage write (0x5e7740)");
         hook_call(0x5e7ac0, 0x60d330, (void *)flag_store_hook, "flags: storage write (0x5e79f0)");
     }
@@ -3091,9 +3286,9 @@ static void watch_session(void) {
     static unsigned last_players = 0xffffffff;
     char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
     if (!sm) return;
-    // The game allows three players per session (set once, in the manager's constructor). Ours hold a
-    // squad of up to four plus up to two invaders. Seamless Co-op raises the same field to six.
-    if (*(unsigned *)(sm + SM_PLAYER_LIMIT) == 3) {
+    // The game allows three players per session (set once, in the manager's constructor). With the capacity patch
+    // ours hold a squad of up to three plus up to two invaders: one player per remote slot plus the local one.
+    if (*(unsigned *)(sm + SM_PLAYER_LIMIT) == 3 && SESSION_PLAYERS != 3) {
         *(unsigned *)(sm + SM_PLAYER_LIMIT) = SESSION_PLAYERS;
         logf("session: player limit raised from 3 to %u", SESSION_PLAYERS);
     }
@@ -3306,48 +3501,40 @@ static void hook_target_list(void) {
     hook_call(0x9e7fcc, 0x9e9b60, (void *)builder_second_hook, "target list builder (second)");
 }
 
-// --- "Number of Players": a fourth option --------------------------------------------------------
+// --- "Number of Players": only "1 player" and "Team" ---------------------------------------------
 //
 // The option is a CS::ComboItemList<MENU_MATCHING_SORTIE_NUM, 3>: a vtable, three 0x50-byte items
-// stored inline at +8 and the item count at +0x100. There is no room for a fourth item inside it,
-// but the menu reads the list through its virtual methods (1 = count, 2..5 = item by index). So we
-// give the list a vtable of our own that reports one more item and serves it from this DLL.
+// stored inline at +8 and the item count at +0x100; the menu reads it through its virtual methods
+// (1 = count, 2..5 = item by index). The game fills it itself (0x146dbe7b9 -> 0x1409fb0xx): outside its
+// own team session [1 player (value 2), 2 players (1), 3 players (0)]; in a team session [2, 3] or [3],
+// putting the request's value (+0x49) on a remaining item first. Our vtable shows [1 player, 3 players]
+// for the full list and [3 players] for [2, 3]; 130408 reads "Team". Value 1 becomes 0 the same way.
+// The list sits at dialog +0x3f58, the request pointer at dialog +0x3e08 (both from the refresh code); the refresh's
+// own count calls (returns 0x1409fb070 / 0x1409fb175 / 0x1409fb318) get the real count.
 
 #define RVA_COMBO_LIST_VTABLE     0x2c5efe0  // ComboItemList<MENU_MATCHING_SORTIE_NUM,3>
 #define RVA_COMBO_LIST_VTABLE_LEA 0x9f1b7b   // "lea rax,[vtable]" in the dialog's constructor (7 bytes)
-#define RVA_COMBO_ITEM_VTABLE     0x2c5ef88  // ComboItem<MENU_MATCHING_SORTIE_NUM>
-#define RVA_TEXT_STRING_CTOR      0x7ac800   // string* (string *out, int text id): menu text by id
-#define RVA_STRING_COPY_CTOR      0x5bea10   // void (string *dst, string *src)
 #define COMBO_ITEMS   0x08
 #define COMBO_ITEM_SIZE 0x50
 #define COMBO_COUNT   0x100
-#define TEXT_FOUR_PLAYERS 130460             // added to CL_MenuText by build_msg.py / the launcher
-
-// The fourth item: vtable, value byte at +8, text at +0x10. Built once, on first use.
-// Its value is one the game does not know (3); fill_context_hook turns it into a squad of four.
-// The temporary string used to build it is never destroyed (one small leak per game run).
-static char *fourth_item(void) {
-    static _Alignas(16) char item[COMBO_ITEM_SIZE];
-    static int ready;
-    if (!ready) {
-        static _Alignas(16) char tmp[0x100];
-        void *text = ((void *(*)(void *, int))(g_base + RVA_TEXT_STRING_CTOR))(tmp, TEXT_FOUR_PLAYERS);
-        *(void **)item = g_base + RVA_COMBO_ITEM_VTABLE;
-        item[8] = 3;  // PLAYERS_CHOICE_FOUR
-        ((void (*)(void *, void *))(g_base + RVA_STRING_COPY_CTOR))(item + 0x10, text);
-        ready = 1;
-        logf("players option: fourth item built");
-    }
-    return item;
-}
+#define COMBO_REQUEST (0x3e08 - 0x3f58)      // the dialog's request pointer, from the list
 
 static unsigned combo_count(char *list) {
     unsigned n = *(unsigned *)(list + COMBO_COUNT);
-    return n == 3 ? 4 : n;  // only the full one/two/three list gets the extra entry
+    // the game's own refresh compares the real count (3 / 2 / 1) to decide whether to rebuild the list
+    unsigned from = (unsigned)((char *)__builtin_return_address(0) - g_base);
+    if (from == 0x9fb070 || from == 0x9fb175 || from == 0x9fb318) return n;
+    if (n == 2 || n == 3) {
+        char *req = *(char **)(list + COMBO_REQUEST);
+        if (req && !IsBadReadPtr(req + 0x49, 1) && (req[0x49] == 1 || req[0x49] == 3)) req[0x49] = 0;  // not shown (3: the old fourth option): "Team"
+    }
+    return n == 3 ? 2 : n == 2 ? 1 : n;
 }
 
 static char *combo_item(char *list, int index) {
-    if (index == 3 && *(unsigned *)(list + COMBO_COUNT) == 3) return fourth_item();
+    unsigned n = *(unsigned *)(list + COMBO_COUNT);
+    if (n == 3 && index == 1) index = 2;  // [1 player, 3 players]
+    else if (n == 2 && index == 0) index = 1;  // [3 players]
     char *items = list + COMBO_ITEMS;
     return items + ((0 - (unsigned)(SIZE_T)items) & 7) + (long long)index * COMBO_ITEM_SIZE;
 }
@@ -3370,6 +3557,59 @@ static void hook_players_option(void) {
     vt[1 + 2] = vt[1 + 3] = vt[1 + 4] = vt[1 + 5] = (void *)combo_item;
     if (patch_rel32(lea + 3, lea + 7, (unsigned char *)(vt + 1))) logf("players option: hooked (vtable at %p)", (void *)(vt + 1));
     else logf("players option: cannot patch the constructor");
+}
+
+// --- "No. of Password Players": the row is left out ------------------------------------------------
+//
+// MatchingDialog's constructor 0x1409f1960 adds its rows one after another (0x1409f0470 and others): a row's place
+// and widget come from its index (the grid at dialog +0xde8, 0x140781b00). In the usual layout (0x140f8be90 false):
+// 0 Number of Players, 1 team session, 2 (0x14092ae10), 3 password, 4 No. of Password Players (add at 0x1409f35ab),
+// 5..9 group passwords (icon "Item_%d_0/Widgets/TextInput/Icon" at index i+5, 0x1409f387a), 10 the optional +0x4a
+// row (only when [+0x3df8]+0x1d1). We skip the add at 0x1409f35ab and the icon index becomes i+4. The dialog's own
+// code reads the cursor (grid +0xd4, 0x140781a50) at the sites below and compares it with fixed old indices (2, 3,
+// 4, 5..9 with -5 for the group-password slots, 10); there the cursor is given back in the old numbering (>= 4 ->
+// +1). Every other user of the grid (input, drawing, rows by index) sees the real rows. The other layout (add at
+// 0x1409f2562) is left as the game builds it. request +0x48 keeps the value the game holds; our team ignores it.
+static const unsigned MD_CURSOR_SITES[] = {0x9f7995, 0x9f79a6, 0x9f79b7, 0x9f7af0, 0x9f7b46, 0x9f7f91, 0x9f8251,
+                                           0x9f899c, 0x9f8bad, 0x9f8bbe, 0x9f99b0, 0x9facbc, 0x9fae27, 0x9faf18};
+static char *g_md_without_row;  // the dialog built without the row
+static int md_cursor_old(char *grid) {
+    int i = *(int *)(grid + 0xd4);
+    return grid == g_md_without_row + 0xde8 && i >= 4 ? i + 1 : i;
+}
+static void *md_skip_row(char *dialog) {  // in place of 0x1409f0470 for the No. of Password Players row
+    g_md_without_row = dialog;
+    logf("menu: \"No. of Password Players\" row left out");
+    return dialog;
+}
+static void *md_other_layout_row(char *dialog, void *a, void *b, void *c, void *d, void *e, void *f, unsigned long long g) {
+    if (g_md_without_row == dialog) g_md_without_row = NULL;
+    return ((void *(*)(char *, void *, void *, void *, void *, void *, void *, unsigned long long))(g_base + 0x9f0470))(dialog, a, b, c, d, e, f, g);
+}
+static void hook_password_players_row(void) {
+    unsigned char *icon = (unsigned char *)g_base + 0x9f387a;
+    int ok = !memcmp(icon, "\x44\x8d\x4b\x05", 4);
+    unsigned sites[2] = {0x9f35ab, 0x9f2562};
+    for (int i = 0; i < 2; i++) {
+        int rel = (int)(0x9f0470 - (sites[i] + 5));
+        ok = ok && g_base[sites[i]] == (char)0xE8 && !memcmp(g_base + sites[i] + 1, &rel, 4);
+    }
+    for (unsigned i = 0; i < sizeof MD_CURSOR_SITES / sizeof *MD_CURSOR_SITES; i++) {
+        int rel = (int)(0x781a50 - (MD_CURSOR_SITES[i] + 5));
+        ok = ok && g_base[MD_CURSOR_SITES[i]] == (char)0xE8 && !memcmp(g_base + MD_CURSOR_SITES[i] + 1, &rel, 4);
+    }
+    DWORD old;
+    if (!ok || !VirtualProtect(icon, 4, PAGE_EXECUTE_READWRITE, &old)) {
+        logf("menu: password players row: code not as expected, row kept");
+        return;
+    }
+    icon[3] = 4;
+    VirtualProtect(icon, 4, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), icon, 4);
+    for (unsigned i = 0; i < sizeof MD_CURSOR_SITES / sizeof *MD_CURSOR_SITES; i++)
+        hook_call(MD_CURSOR_SITES[i], 0x781a50, (void *)md_cursor_old, "menu: dialog cursor (old row numbers)");
+    hook_call(0x9f2562, 0x9f0470, (void *)md_other_layout_row, "menu: password players row (other layout, kept)");
+    hook_call(0x9f35ab, 0x9f0470, (void *)md_skip_row, "menu: password players row (left out)");
 }
 
 // --- entry -----------------------------------------------------------------------------------------
@@ -3492,7 +3732,7 @@ static DWORD g_request_tick;  // when the last start request arrived
 // invader with one more string filter in lobby_search_frame; lobbies without it stay open to all.
 #define LOBBY_MARK_KEY   "nrpvp"         // "1" on every mod host lobby
 #define LOBBY_PROTO_KEY  "nrpvp_proto"
-#define LOBBY_PROTO      "1"             // bump when what a joiner expects changes
+#define LOBBY_PROTO      "2"             // 2: with nrpvp_ver (proto-1 clients filter on "1" and never see these lobbies)
 #define LOBBY_GAME_KEY   "nrpvp_game"
 #define LOBBY_GAME       "1.3.3"         // GAME_TIMESTAMP's build
 #define LOBBY_SQUAD_KEY  "nrpvp_squad"
@@ -3503,6 +3743,10 @@ static DWORD g_request_tick;  // when the last start request arrived
 #define LOBBY_START_KEY  "nrpvp_start"   // host's expedition start block (game manager +0xa74), 8 hex digits
 #define LOBBY_ALLY_FREE_KEY "nrpvp_ally_free"  // free places in the host's squad for allies (squad of three)
 #define LOBBY_ROLE_KEY   "nrpvp_role"    // a joiner's own lobby member data: "ally" or "invader"
+#define LOBBY_VER_KEY    "nrpvp_ver"     // the mod version (MOD_VERSION); only the same version pairs up
+#define LOBBY_LEVEL_KEY  "nrpvp_lvl"     // host's level (player data +0x68)
+#define LOBBY_PHASE_KEY  "nrpvp_phase"   // host's expedition phase: "hub", "field", "boss" (a night boss fight), "late" (day-2 boss beaten)
+#define LOBBY_BORN_KEY   "nrpvp_born"    // when the lobby was marked: seconds since 2026-01-01 UTC (its age for the pick order)
 #define SQUAD_MAX        3               // the game's squad
 #define LOBBY_EQUAL      0               // ELobbyComparison
 #define LOBBY_WORLDWIDE  3               // ELobbyDistanceFilter
@@ -3535,6 +3779,7 @@ static struct {  // optional, for steam_watch
 } g_diag;
 static int steam_ready(void) {
     static int state;  // 0 not tried, 1 ready, -1 failed
+    if (g_steam_down) return 0;
     if (state) return state > 0;
     HMODULE m = GetModuleHandleA("steam_api64.dll");
     void *(*mm)(void) = m ? (void *(*)(void))GetProcAddress(m, "SteamAPI_SteamMatchmaking_v009") : NULL;
@@ -3803,13 +4048,13 @@ static void name_watch(char *sm, const char *side, int fill) {
 // sides: each slot's handle and HP, and the HP of the character with that handle as this machine sees it.
 static void slot_hp_watch(const char *side) {
     static DWORD next;
-    static int last[2][2] = {{-9, -9}, {-9, -9}};
+    static int last[4][2] = {{-9, -9}, {-9, -9}, {-9, -9}, {-9, -9}};
     if ((int)(GetTickCount() - next) < 0) return;
     next = GetTickCount() + 2000;
     char *ps = *(char **)(g_base + 0x3c078d0), *wcm = *(char **)(g_base + 0x3c0f0a8);
     char *slots = ps ? *(char **)(ps + 0x10) : NULL;
-    if (!slots || !wcm || IsBadReadPtr(slots, 2 * 0x8a0)) return;
-    for (int i = 0; i < 2; i++) {
+    if (!slots || !wcm || IsBadReadPtr(slots, g_cap_remote * 0x8a0)) return;
+    for (int i = 0; i < g_cap_remote; i++) {
         char *sl = slots + i * 0x8a0;
         int hp = *(int *)(sl + 0x10), chp = -1;
         unsigned long long h = *(unsigned long long *)(sl + 8);  // run 19: the player number, not a handle
@@ -4012,11 +4257,25 @@ static void lag_log(u64 lobby, u64 me, double window) {
         p->max_gap = 0, p->rtt_n = p->rtt_sum = p->rtt_max = p->sent = 0, p->rtt_min = 1 << 30;
     }
 }
+static void lag_step(double *next_ping_, double *next_log_, double *window_from_);
 static DWORD WINAPI lag_thread(LPVOID unused) {
     (void)unused;
     double next_ping = 0, next_log = lag_ms() + LAG_LOG_MS, window_from = lag_ms();
     for (;;) {
         Sleep(2);
+        InterlockedIncrement(&g_steam_busy);
+        if (g_steam_down) {  // Steam is being shut down (process exit): no more Steam calls from this thread
+            InterlockedDecrement(&g_steam_busy);
+            logf("lag: echo thread stopped (Steam shutting down)");
+            return 0;
+        }
+        lag_step(&next_ping, &next_log, &window_from);
+        InterlockedDecrement(&g_steam_busy);
+    }
+}
+static void lag_step(double *next_ping_, double *next_log_, double *window_from_) {
+    double next_ping = *next_ping_, next_log = *next_log_, window_from = *window_from_;
+    do {
         u64 lobby = our_lobby(), me = g_diag.self ? g_diag.self(g_diag.user) : 0;
         double now = lag_ms();
         struct { unsigned magic, type, seq, t; } pk;
@@ -4068,7 +4327,8 @@ static DWORD WINAPI lag_thread(LPVOID unused) {
             lag_log(lobby, me, now - window_from);
             next_log = now + LAG_LOG_MS, window_from = now;
         }
-    }
+    } while (0);  // ("continue" above ends the step)
+    *next_ping_ = next_ping, *next_log_ = next_log, *window_from_ = window_from;
 }
 
 // Ping at the party bars (show-ping, default on): the party panel's 7 slots (CSFeMan +0xcf28, 0x98 each) are filled
@@ -4101,6 +4361,44 @@ static void **name_hook(void **out, char *chr, unsigned char flag, void *a4) {  
     r[0] = g_name_buf;
     return r;
 }
+// Ping in the enemy tag (show-ping): the tag over a hostile player (CSFeMan +0xca60, 8 entries of 0x70) is added
+// when it takes damage (0x1407c5710 -> 0x1407dd3f0, which also sets +0x2c to 0) and dropped by the per-frame update
+// 0x1407d8c40 once +0x2c, the time since the last hit, reaches 1.5 s (0x142be32b4). The view 0x1407c8a90 (from
+// 0x1407c8f83) rebuilds the eight tags each frame and gets each name with 0x7aa960(out, chr, 0) at 0x7c8cb4; it keeps
+// out[0] as the text pointer, so the tag's text lives in a buffer per character here. Only for a member of the
+// other side (lobby member data: owner and "ally" = host's side) and while its echo answers ("name  N ms").
+static void **tag_name_hook(void **out, char *chr, unsigned char flag, void *a4) {
+    void **r = ((void **(*)(void **, char *, unsigned char, void *))(g_base + 0x7aa960))(out, chr, flag, a4);
+    if (!r || !chr || !g_in_exped || !setting(S_SHOW_PING) || IsBadReadPtr(chr, 0x600)) return r;
+    int no = -1;
+    ((int *(*)(char *, int *))(g_base + 0x66c6f0))(chr, &no);
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
+    char *b = sm ? *(char **)(sm + SM_PLAYERS_BEGIN) : NULL, *e = sm ? *(char **)(sm + SM_PLAYERS_BEGIN + 8) : NULL;
+    u64 id = 0, lobby = our_lobby(), owner = lobby && g_steam.mm && g_diag.owner ? g_diag.owner(g_steam.mm, lobby) : 0;
+    for (char *m = b; no != -1 && b && m < e && !IsBadReadPtr(m, SM_PLAYER_SIZE); m += SM_PLAYER_SIZE)
+        if (*(int *)(m + 0xd4) == no && !m[0xe1]) id = *(u64 *)(m + 0x10);
+    if (!id || !owner) return r;
+    int invader = id != owner && !member_ally(lobby, id), we_invader = g_join == 4 && !g_as_ally;
+    struct lag_peer *p = invader != we_invader ? lag_find(id) : NULL;
+    if (!p || !p->rtt_last_ok) return r;
+    static char *who[8];
+    static unsigned short buf[8][96];
+    int k = 0;
+    while (k < 8 && who[k] != chr) k++;
+    if (k == 8) {
+        static int next;
+        k = next, next = (next + 1) % 8, who[k] = chr;
+    }
+    const unsigned short *name = r[0] ? (const unsigned short *)r[0] : (const unsigned short *)r[2];
+    int n = 0;
+    while (name && !IsBadReadPtr(name + n, 2) && name[n] && n < 64) buf[k][n] = name[n], n++;
+    char tail[24];
+    snprintf(tail, sizeof tail, "  %d ms", p->rtt_shown);
+    for (int i = 0; tail[i] && n < 95; i++) buf[k][n++] = (unsigned char)tail[i];
+    buf[k][n] = 0;
+    r[0] = buf[k];
+    return r;
+}
 static void lag_tick(void) {  // run thread; once Steam is ready: hooks and the echo thread
     static int done;
     if (done || !steam_ready() || !g_diag.net || !g_diag.member || !g_diag.self || !g_diag.user) return;
@@ -4117,6 +4415,7 @@ static void lag_tick(void) {  // run thread; once Steam is ready: hooks and the 
     CreateThread(NULL, 0, lag_thread, NULL, 0, NULL);
     logf("lag: measuring (echo on P2P channel %d, game packets counted per member, a line every %d s)", LAG_CHANNEL, LAG_LOG_MS / 1000);
     hook_call(0x7dab36, 0x7aa960, (void *)name_hook, "lag: party bar name (ping after it)");
+    hook_call(0x7c8cb4, 0x7aa960, (void *)tag_name_hook, "lag: enemy tag name (ping after it)");
 }
 // Remote session members other than the session host (the lobby owner): allies (want_allies 1) or invaders (0;
 // a member without a role is an invader). Recounted at most every 250 ms.
@@ -4174,6 +4473,7 @@ static void lobby_mark(void) {
         lobby_set(LOBBY_MARK_KEY, "1");
         lobby_set(LOBBY_PROTO_KEY, LOBBY_PROTO);
         lobby_set(LOBBY_GAME_KEY, LOBBY_GAME);
+        lobby_set(LOBBY_VER_KEY, MOD_VERSION);
         {  // the expedition's start block: what a solo start put in the pending block (SingleStart ->
            // context vt+8 0xb44630 -> 0xb47470), kept by the game manager for the whole expedition
             char *gm = *(char **)(g_base + 0x3c13258), text[16];
@@ -4190,6 +4490,29 @@ static void lobby_mark(void) {
         }
         g_squad = g_party_host ? 1 : members;  // a party host's squad mates are allies (their member data says so)
         g_list_tick = GetTickCount();  // self-check one period after marking
+    }
+    {  // team play: level, phase and age for the joiners' pick order (no personal data)
+        static DWORD next;
+        static u64 born_for;
+        if (born_for != g_lobby) {
+            born_for = g_lobby;
+            FILETIME ft;
+            GetSystemTimeAsFileTime(&ft);
+            unsigned long long t = ((unsigned long long)ft.dwHighDateTime << 32 | ft.dwLowDateTime) / 10000000ull;
+            char text[24];
+            snprintf(text, sizeof text, "%llu", t > 13410806400ull ? t - 13410806400ull : 0);  // FILETIME seconds of 2026-01-01
+            lobby_set(LOBBY_BORN_KEY, text);
+        }
+        if ((int)(GetTickCount() - next) >= 0) {
+            next = GetTickCount() + 2000;
+            char *gdm = *(char **)(g_base + 0x3c078d0), *pd = gdm ? *(char **)(gdm + 8) : NULL, text[16];
+            snprintf(text, sizeof text, "%d", pd && !IsBadReadPtr(pd + 0x68, 4) ? *(int *)(pd + 0x68) : 0);
+            lobby_set(LOBBY_LEVEL_KEY, text);
+            // EventFlag.txt names: 7504 / 7509 night boss fight of day 1 / 2, 7502 / 7507 that boss beaten
+            const char *phase = !g_in_expedition ? "hub" : two_flag(7507, 0, 0) ? "late"
+                              : (two_flag(7504, 0, 0) && !two_flag(7502, 0, 0)) || two_flag(7509, 0, 0) ? "boss" : "field";
+            lobby_set(LOBBY_PHASE_KEY, phase);
+        }
     }
     // Squad: the session's members when the lobby was first marked (the expedition's own players are
     // all in it by InGame). Session members beyond it are invaders; Steam lobby members beyond the
@@ -4213,7 +4536,10 @@ static void lobby_mark(void) {
     if (key == g_marked_squad) return;
     g_marked_squad = key;
     unsigned squad = g_squad + allies, allowed = invaders_allowed(squad);
+    unsigned room = SESSION_PLAYERS_MAX > squad + others ? SESSION_PLAYERS_MAX - squad - others : 0;  // places left in the session
     unsigned free_slots = allowed > others ? allowed - others : 0, ally_free = SQUAD_MAX > squad ? SQUAD_MAX - squad : 0;
+    if (free_slots > room) free_slots = room;
+    if (ally_free > room) ally_free = room;
     if (g_party_host && !g_in_expedition) free_slots = 0;  // no invaders before the host is in its expedition
     char text[16];
     snprintf(text, sizeof text, "%u", squad);
@@ -4229,6 +4555,68 @@ static void lobby_mark(void) {
 
 // One lobby list request at a time, every SEARCH_PERIOD_MS: the invader every idle frame while
 // searching, the host once (who = "host self-check"). Returns 1 when a request has finished.
+// Version notice (131170 newer release seen, 131171 the team with our password plays another version). The text is
+// the launcher's FMG line with "%s"; the notice path copies a MenuString's first field (the text pointer) as is
+// (0x1405bea10 in the summon-message record 0x1408b3240), so the line is built with the game's ctor and its pointer
+// is set to our formatted copy, like the ping after a name. Once per hub visit and once per search start.
+static int g_ver_notice_armed = 1;
+static char g_ver_newest[24], g_ver_team[24];
+static int version_parse(const char *v, int out[3]) {  // a release is "a.b.c", digits only
+    if (!v) return 0;
+    int n = 0, k = 0;
+    out[0] = out[1] = out[2] = 0;
+    for (const char *c = v; *c; c++) {
+        if (*c == '.') { if (++k > 2) return 0; n = 0; continue; }
+        if (*c < '0' || *c > '9' || ++n > 6) return 0;
+        out[k] = out[k] * 10 + (*c - '0');
+    }
+    return k == 2 && n > 0;
+}
+static int version_newer(const char *a, const char *b) {  // a newer release than b (both releases)
+    int x[3], y[3];
+    if (!version_parse(a, x) || !version_parse(b, y)) return 0;
+    for (int i = 0; i < 3; i++) if (x[i] != y[i]) return x[i] > y[i];
+    return 0;
+}
+static void version_seen(const char *ver, int party) {
+    if (!ver || !*ver || !strcmp(ver, MOD_VERSION)) return;
+    if (version_newer(ver, MOD_VERSION) && (!*g_ver_newest || version_newer(ver, g_ver_newest)))
+        snprintf(g_ver_newest, sizeof g_ver_newest, "%s", ver);
+    if (party && !*g_ver_team) snprintf(g_ver_team, sizeof g_ver_team, "%s", ver);  // same password key, other version
+}
+static void notice_with(int id, const char *arg) {
+    static _Alignas(16) char text[2][0x100];
+    static unsigned short line[2][256];
+    int k = id == 131171;
+    char *t = ((char *(*)(void *, int))(g_base + RVA_MENU_TEXT_CTOR))(text[k], id);
+    const unsigned short *tpl = t && *(unsigned short **)t ? *(unsigned short **)t : t ? *(unsigned short **)(t + 0x10) : NULL;
+    int n = 0;
+    for (int i = 0; tpl && !IsBadReadPtr(tpl + i, 2) && tpl[i] && i < 200 && n < 250; i++) {
+        if (tpl[i] == '%' && tpl[i + 1] == 's') {
+            for (const char *a = arg; *a && n < 250; a++) line[k][n++] = (unsigned char)*a;
+            i++;
+        } else line[k][n++] = tpl[i];
+    }
+    line[k][n] = 0;
+    if (!n || !t) return;
+    *(unsigned short **)t = line[k];
+    ((unsigned char (*)(void *))(g_base + RVA_SUMMON_MESSAGE))(t);
+}
+static void version_result(int found_same) {
+    if (g_ver_notice_armed && *g_ver_newest) {
+        g_ver_notice_armed = 0;
+        logf("version: a newer mod version %s is in use (ours %s): notice shown", g_ver_newest, MOD_VERSION);
+        notice_with(131170, g_ver_newest);
+    } else if (g_ver_notice_armed && g_party && !found_same && *g_ver_team) {
+        g_ver_notice_armed = 0;
+        logf("version: the team with our password plays %s (ours %s): notice shown", g_ver_team, MOD_VERSION);
+        notice_with(131171, g_ver_team);
+    }
+    g_ver_newest[0] = g_ver_team[0] = 0;
+}
+static int counts_in_hub(void);
+static void counts_from_list(unsigned n);
+static u64 g_count_call;
 static void lobby_search_reset(void) {
     if (g_list_call) logf("search: request %u abandoned", g_list_count);
     g_list_call = 0;
@@ -4239,8 +4627,11 @@ static int lobby_search_frame(const char *who) {
     DWORD now = GetTickCount();
     if (!g_list_call) {
         if (g_list_tick && now - g_list_tick < SEARCH_PERIOD_MS) return 0;
+        if (g_count_call) return 0;  // the counts' own request first (one list at a time)
         g_steam.string_filter(g_steam.mm, LOBBY_MARK_KEY, "1", LOBBY_EQUAL);
-        g_steam.string_filter(g_steam.mm, LOBBY_PROTO_KEY, LOBBY_PROTO, LOBBY_EQUAL);
+        // no proto / version filter: lobbies of other versions are listed too, so an older client learns of a
+        // newer release (one request per period as before). ponytail: Steam returns at most 50 lobbies; with many
+        // lobbies of other versions ours could fall out of the list — a version filter then, and a second request.
         if (g_party) g_steam.string_filter(g_steam.mm, LOBBY_PARTY_KEY, g_party_code, LOBBY_EQUAL);
         g_steam.distance_filter(g_steam.mm, LOBBY_WORLDWIDE);
         g_list_call = g_steam.request_list(g_steam.mm);
@@ -4275,7 +4666,10 @@ static int lobby_search_frame(const char *who) {
         logf("%s:   lobby %llu: host block '%s' pos '%s'", who, id, block ? block : "?", pos ? pos : "?");
         const char *afree = g_steam.get_data(g_steam.mm, id, LOBBY_ALLY_FREE_KEY);
         int own = id == g_lobby && g_lobby, slots = g_as_ally ? (afree ? atoi(afree) : 0) : free ? atoi(free) : 0;
-        int fits = !own && slots > 0 && game && !strcmp(game, LOBBY_GAME);
+        const char *ver = g_steam.get_data(g_steam.mm, id, LOBBY_VER_KEY);
+        int same = proto && !strcmp(proto, LOBBY_PROTO) && ver && !strcmp(ver, MOD_VERSION);
+        version_seen(ver, g_party != 0);
+        int fits = same && !own && slots > 0 && game && !strcmp(game, LOBBY_GAME);
         // GetLobbyData gives "" for a key that is not set.
         logf("%s:   lobby %llu: proto '%s' game '%s' squad '%s' free '%s', members %d of %d -> %s", who, id, proto ? proto : "?",
              game ? game : "?", squad ? squad : "?", free ? free : "?", g_steam.members(g_steam.mm, id),
@@ -4284,10 +4678,23 @@ static int lobby_search_frame(const char *who) {
         if (fits && !(g_party && id == g_party_old_lobby)) fit[nfit++] = id;
         if (g_party && !own && id != g_party_old_lobby && (!g_party_lowest || id < g_party_lowest)) g_party_lowest = id;
     }
-    if (g_party) {  // the pool: a random host among those with a free place (our own old lobby left out)
-        chosen = nfit ? fit[(GetTickCount() ^ (DWORD)(uintptr_t)&nfit) % (unsigned)nfit] : 0;
-        if (nfit > 1) logf("%s: %d hosts with a free place, one taken at random", who, nfit);
+    if (g_party) {  // team play: lowest host level, then the oldest lobby; never in a night boss fight or after day 2's
+        chosen = 0;
+        long best_lvl = 0, best_born = 0;
+        for (int i = 0; i < nfit; i++) {
+            const char *ph = g_steam.get_data(g_steam.mm, fit[i], LOBBY_PHASE_KEY), *lv = g_steam.get_data(g_steam.mm, fit[i], LOBBY_LEVEL_KEY);
+            const char *bo = g_steam.get_data(g_steam.mm, fit[i], LOBBY_BORN_KEY);
+            if (ph && (!strcmp(ph, "boss") || !strcmp(ph, "late"))) {
+                logf("%s:   lobby %llu left out: phase %s", who, fit[i], ph);
+                continue;
+            }
+            long l = lv && *lv ? atol(lv) : 0, b = bo && *bo ? atol(bo) : 0;
+            if (!chosen || l < best_lvl || (l == best_lvl && b < best_born)) chosen = fit[i], best_lvl = l, best_born = b;
+        }
+        if (nfit > 1 && chosen) logf("%s: %d hosts with a free place: lobby %llu taken (host level %ld)", who, nfit, chosen, best_lvl);
     }
+    version_result(chosen != 0);
+    if (counts_in_hub()) counts_from_list(result.matching);
     if (chosen) logf("%s: %s lobby %llu", who, g_join_test ? "candidate" : "would join (join-test is off)", chosen);
     else logf("%s: no lobby to join", who);
     g_candidate = chosen;
@@ -4336,8 +4743,8 @@ static void join_test_start(void) {
     g_join = 0;
     g_candidate = 0;
     g_join_test = g_enter_test = g_move_test = 1;  // "Invasion" always joins (no switches since 14c271a)
-    g_as_ally = setting(S_ALLY) != 0;
-    logf("join: search started as %s, the first candidate is joined; controller +0x10d %d", g_as_ally ? "an ALLY (setting ally)" : "an invader",
+    g_as_ally = 0;  // the menu's "team" sets it after this (party_frame); "Invasion" is always an invader
+    logf("join: search started as %s, the first candidate is joined; controller +0x10d %d", g_as_ally ? "an ally" : "an invader",
          g_qm_ctrl ? (unsigned char)g_qm_ctrl[QM_CTRL_REFUSED] : -1);
 }
 // Every frame while joining: one line per change of the session's state, with ms since the call.
@@ -4462,6 +4869,7 @@ static void level_restore(void) {
 }
 static void join_over(const char *why) {
     level_restore();
+    g_ver_notice_armed = 1;  // back in the hub: the version notice may show once more
     if (g_as_ally) {  // the ally's gold look (row 90071611) has no time limit: it goes when our part ends
         char *me = local_player();
         // 0x3cdd40 (chr, id): SpecialEffect remove by id, the shape of Elden Ring's ChrIns remove_speffect
@@ -4609,6 +5017,7 @@ static void join_frame(void) {
             g_join_tick = GetTickCount();
             if (g_diag.set_member && g_steam.mm) {
                 g_diag.set_member(g_steam.mm, g_candidate, LOBBY_ROLE_KEY, g_as_ally ? "ally" : "invader");
+                g_diag.set_member(g_steam.mm, g_candidate, LOBBY_VER_KEY, MOD_VERSION);
                 logf("join: lobby member data %s=%s set", LOBBY_ROLE_KEY, g_as_ally ? "ally" : "invader");
             }
             if (g_enter_test) {
@@ -4845,6 +5254,49 @@ static void remote_tags_hook(void *a, void *b, void *c, void *d) {
         }
     }
 }
+
+// Stage 1 (team play): invaders do not count toward enemy scaling. The game's count 0x140519660 = DAT_143c0f320 if > 0
+// (debug), else max(1, members of the session, gm+0xdf6); 0x1403db250 applies MultiPlayCorrectionParam client1/2
+// (n = 2 / 3) or removes the correction (n = 1, or 4+ where client3 is -1 in every row). Its only callers:
+// 0x1403db2b9 (apply), 0x1403c7ee8 (0x1403c7e50: re-apply check against chr+0x238), 0x1403d2d3d (0x1403d27b0). The
+// frame code 0x140521ff0 (0x140522180-0x14052229c) recomputes the same count inline and, when it differs from
+// WCM+0x17558, re-applies to every character (ChrFinder -> 0x1405186a0 -> 0x1403c7e50) and stores it there.
+// Our count: the session members on the host's side (the lobby owner and members with role "ally"), the same on
+// every machine (the member list and the lobby data are the same everywhere); the debug value is kept. When it
+// changes we set WCM+0x17558 to -1 (written only by 0x140515058 at creation and 0x140522295), so the game's own
+// frame code re-applies with it.
+static int g_squad_n;  // 0 = not computed (no lobby): the game's own count
+static void squad_count_tick(void) {  // game thread (step hook), every 500 ms
+    static DWORD next;
+    if ((int)(GetTickCount() - next) < 0) return;
+    next = GetTickCount() + 500;
+    u64 lobby = our_lobby();
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
+    int n = 0;
+    if (lobby && sm && g_diag.owner && g_steam.mm) {
+        u64 owner = g_diag.owner(g_steam.mm, lobby);
+        char *b = *(char **)(sm + SM_PLAYERS_BEGIN), *e = *(char **)(sm + SM_PLAYERS_BEGIN + 8);
+        for (char *m = b; b && m < e && !IsBadReadPtr(m, SM_PLAYER_SIZE); m += SM_PLAYER_SIZE) {
+            u64 id = *(u64 *)(m + 0x10);
+            int invader = m[0xe1] ? (g_join == 4 && !g_as_ally) : (id != owner && !member_ally(lobby, id));
+            if (!invader) n++;
+        }
+        if (n < 1) n = 1;
+    }
+    if (n != g_squad_n) {
+        // 0x140519660 ends in the game's fatal-error path (write to 0) when its manager 0x143c0f338 is not there
+        // yet / any more (crash of a Windows invader, exe+0x214e298 from here): read the count only when it is.
+        int real = *(void **)(g_base + 0x3c0f338) ? ((int (*)(void))(g_base + 0x519660))() : -1;
+        logf("scaling: squad of %d for enemy scaling (game's count with invaders %d)", n ? n : real, real);
+        g_squad_n = n;
+        char *wcm = *(char **)(g_base + 0x3c0f0a8);
+        if (wcm && !IsBadReadPtr(wcm + 0x17558, 4)) *(int *)(wcm + 0x17558) = -1;  // the game re-applies next frame
+    }
+}
+static int squad_count_hook(void) {
+    if (*(int *)(g_base + 0x3c0f320) > 0 || !g_squad_n) return ((int (*)(void))(g_base + 0x519660))();
+    return g_squad_n;
+}
 static void act_wrap_tick(void) {  // run thread: put the wrapper in (again, if the game set the pointer anew)
     void **slot = (void **)(g_base + 0x467afe8), **eslot = (void **)(g_base + 0x467afe0);
     if (*slot == (void *)(g_base + 0xd40310)) {
@@ -4980,7 +5432,7 @@ static void crash_watch_members(void) {
         if (st == 0x1f && (last_state[i] != 0x1f || last_no[i] != no))
             logf("crash watch: member player %d (slot %d) state 1f: its character is made now (we are the %s)", no, slot, role);
         last_state[i] = st, last_no[i] = no;
-        char *sd = !m[0xe1] && pd && slot >= 0 && slot < 2 && *(char **)(pd + 0x10) ? *(char **)(pd + 0x10) + slot * 0x8a0 : NULL;
+        char *sd = !m[0xe1] && pd && slot >= 0 && slot < g_cap_remote && *(char **)(pd + 0x10) ? *(char **)(pd + 0x10) + slot * 0x8a0 : NULL;
         if (sd && no != -1 && !IsBadReadPtr(sd + 8, 4) && *(int *)(sd + 8) != no) id_stale = no, id_had = *(int *)(sd + 8), id_slot = slot;
     }
     for (; i < 8; i++) last_state[i] = -1;
@@ -5308,7 +5760,7 @@ static void enter_watch(char *sm) {
             ((void (*)(void))(g_base + 0x60ad60))();
             int s0 = slots && !IsBadReadPtr(slots, 2 * 0x8a0) ? (unsigned char)slots[0xff] : -1, s1 = slots && !IsBadReadPtr(slots, 2 * 0x8a0) ? (unsigned char)slots[0x8a0 + 0xff] : -1;
             logf("ally flasks: host has %d HP charges (its lobby); ours %d -> %d (%s), filled | slots +0xff: %d %d", host, before,
-                 (unsigned char)pd[0xff], g_join_cut ? "late summon: host's - 2, at least 1" : "early summon: the host's", s0, s1);
+                 (unsigned char)pd[0xff], g_join_cut ? "late summon: host's - 2, at least 3" : "early summon: the host's, at least 3", s0, s1);
         }
     }
     // decision 24: once the world sync is through and the host's slot holds its level, take that level
@@ -5316,7 +5768,7 @@ static void enter_watch(char *sm) {
         char *ps = *(char **)(g_base + 0x3c078d0);
         char *slots = ps ? *(char **)(ps + 0x10) : NULL, *pd = ps ? *(char **)(ps + 8) : NULL;
         int host_no = g_host_player_no >= 0 ? g_host_player_no : 1;
-        for (int i = 0; slots && pd && !IsBadReadPtr(slots, 2 * 0x8a0) && !IsBadReadPtr(pd, 0x110) && i < 2; i++) {
+        for (int i = 0; slots && pd && !IsBadReadPtr(slots, g_cap_remote * 0x8a0) && !IsBadReadPtr(pd, 0x110) && i < g_cap_remote; i++) {
             char *sl = slots + i * 0x8a0;
             int no = *(int *)(sl + 8), lv = *(int *)(sl + 0x68);
             if (no != host_no || lv < 1 || lv > 15) continue;
@@ -5492,8 +5944,9 @@ static void clock_log(const char *when) {
     char *pa = *(char **)(g_base + RVA_PLAY_AREA_PTR);
     if (!pa) return;
     v = *(unsigned long long *)(pa + PA_TIME);
-    logf("clock: %s: circle clock %02u:%02u:%02u, base rate %.3f, rate %.3f", when, (unsigned)(v >> 34) & 0x1f,
-         (unsigned)(v >> 39) & 0x3f, (unsigned)(v >> 45) & 0x3f, *(float *)(pa + PA_BASE_RATE), *(float *)(pa + PA_RATE));
+    logf("clock: %s: circle clock %02u:%02u:%02u, base rate %.3f, rate %.3f, circle radius %.1f", when, (unsigned)(v >> 34) & 0x1f,
+         (unsigned)(v >> 39) & 0x3f, (unsigned)(v >> 45) & 0x3f, *(float *)(pa + PA_BASE_RATE), *(float *)(pa + PA_RATE),
+         *(float *)(pa + 0x260));
 }
 static void slow_time_frame(int first) {
     if (first) {
@@ -5586,8 +6039,114 @@ static void bf_log(char *pa, const char *what) {
          bf_flag(1029100800), bf_flag(1039100800), bf_flag(1039100801), bf_flag(1056300800), bf_flag(1046300800),
          bf_flag(1047300800), bf_flag(1057300800));
 }
+// boss-flow = 3 (the owner's flow, default): the day runs to 09:00 and holds until a boss is killed, then runs two more
+// hours and holds again: stops 09, 11, ..., 21 and 23 (held at 22:59:00, so the 23:00 world changes and the night
+// come only once the clock really gets there; after the 23 stop it runs on to 23:59 and the night boss comes as in
+// the game). Kills are banked: a kill while the clock runs towards a stop pays for that stop. A boss = a death flag
+// nnn 800..899 with d = 0 turning on in the host's flag storage (flag_note: small maps, tile field bosses, region
+// bosses; joiners' kills arrive synced). Day 2 (7505 on) starts over at 07:00 with the stop 09; after its 23 stop
+// the clock is left alone (night 2 and the final as in the game). Both clocks are held together (circle clock
+// +0x118 / +0x11c and time of day +0x34 / +0x38 rates 0, the 30 min apart kept); joiners take both from the host
+// (0x6987b0 / 0x140ddf130 every 15 s). Phases and flags stay the game's: holding only pauses the clock.
+static volatile LONG g_bf3_kills;          // boss kills not yet seen by the frame (flag_note, any thread)
+static volatile unsigned g_bf3_last_flag;
+static void bf3_kill(unsigned id) { g_bf3_last_flag = id, InterlockedIncrement(&g_bf3_kills); }
+static void bf3_frame(int first) {
+    static int day, stop, banked, held, done;
+    static float base_pa, base_clock;
+    char *pa = *(char **)(g_base + RVA_PLAY_AREA_PTR), *clock = *(char **)(g_base + RVA_CLOCK_PTR);
+    if (first) day = 0, stop = 9, banked = 0, held = 0, done = 0, InterlockedExchange(&g_bf3_kills, 0);
+    if (!pa || !clock || done) return;
+    if (!day) {
+        day = 1, base_pa = *(float *)(pa + PA_BASE_RATE), base_clock = *(float *)(clock + CLOCK_BASE_RATE);
+        logf("clock: boss flow 3: day 1, stops every 2 hours from 09:00 (rates %.3f / %.3f)", base_pa, base_clock);
+    }
+    LONG k = InterlockedExchange(&g_bf3_kills, 0);
+    if (k > 0) {
+        banked += (int)k;
+        int next = stop + 2 * banked;  // held at a stop: the kill pays it; running: it pays the coming one
+        logf("clock: boss killed (flag %u): next stop %02d:00%s", g_bf3_last_flag, next > 23 ? 23 : next, next > 23 ? " (then the night)" : "");
+    }
+    if (day == 1 && bf_flag(7505)) {
+        day = 2, stop = 9, held = 0;
+        logf("clock: boss flow 3: day 2 (7505 on), stops every 2 hours from 09:00 again (%d kill(s) banked)", banked);
+    }
+    unsigned long long v = *(unsigned long long *)(pa + PA_TIME);
+    unsigned secs = (((unsigned)(v >> 34) & 0x1f) * 60 + ((unsigned)(v >> 39) & 0x3f)) * 60 + ((unsigned)(v >> 45) & 0x3f);
+    unsigned at = stop == 23 ? (22 * 60 + 59) * 60 : (unsigned)stop * 3600;
+    if (stop <= 23 && secs >= at && secs < 23 * 3600 + 30 * 60) {  // reached (not the night's 23:59 / after-midnight times)
+        if (banked > 0) {
+            banked--, stop += 2;
+            if (held) {
+                held = 0;
+                *(float *)(pa + PA_RATE) = base_pa, *(float *)(pa + PA_BASE_RATE) = base_pa;
+                *(float *)(clock + CLOCK_RATE) = base_clock, *(float *)(clock + CLOCK_BASE_RATE) = base_clock;
+            }
+            logf("clock: boss flow 3: stop %02d:00 paid, running%s", stop - 2, stop > 23 ? " on to the night" : "");
+            if (stop > 23 && day == 2) done = 1;
+        } else {
+            if (!held) {
+                ((void (*)(char *, int, int, int))(g_base + RVA_PA_SET_TIME))(pa, stop == 23 ? 22 : stop, stop == 23 ? 59 : 0, 0);
+                held = 1, bf_log(pa, stop == 23 ? "22:59 reached (23 stop), held until a boss is killed" : "stop reached, held until a boss is killed");
+            }
+            *(float *)(pa + PA_RATE) = 0.0f, *(float *)(pa + PA_BASE_RATE) = 0.0f;
+            *(float *)(clock + CLOCK_RATE) = 0.0f, *(float *)(clock + CLOCK_BASE_RATE) = 0.0f;
+        }
+    }
+}
+// Night boss active (9019 on: common 1108 holds it from 23:59:00 until 9052, ...): every other living boss is
+// disabled on this machine, as the game's own 23:00 field-boss events do (2004[5] "Change Character Enable State"
+// = 0x608c60(chr, 0): the enable bit at [chr +0x18] +10 bit 0, the mount too; HP untouched), each machine by itself
+// (9019 is driven by the clock, which every machine has). Checked every 500 ms, so a boss loaded later in the window
+// is hidden too; when 9019 goes off the ones disabled here are enabled again. A boss = a character of
+// boss-deaths.txt (entity id -> 0x5190c0, the world character manager's lookup), alive (HP +0x140 of [chr +0x1b8] > 0)
+// and enabled. Not done: the map markers (left as they are).
+static unsigned g_hidden[HIDE_MAX];
+static int g_hidden_n, g_hide_on;
+static char *boss_chr(unsigned ent) {
+    char *wcm = *(char **)(g_base + RVA_WORLD_CHR_MAN);
+    int e = (int)ent;
+    char *c = wcm ? ((char *(*)(void *, int *))(g_base + 0x5190c0))(wcm, &e) : NULL;
+    return c && !IsBadReadPtr(c, 0x1c0) && *(char **)(c + 0x18) && !IsBadReadPtr(*(char **)(c + 0x18), 0x10) ? c : NULL;
+}
+static int chr_enabled(char *c) { return *(unsigned char *)(*(char **)(c + 0x18) + 10) & 1; }
+static void night_hide_frame(int in_world) {
+    static DWORD next;
+    if ((int)(GetTickCount() - next) < 0) return;
+    next = GetTickCount() + 500;
+    int on = in_world && bf_flag(9019);
+    if (on) {
+        int now = 0;
+        for (int i = 0; i < g_hide_n; i++) {
+            char *c = boss_chr(g_hide_ent[i]);
+            if (!c || !chr_enabled(c)) continue;
+            char **pd = *(char ***)(c + 0x1b8);
+            if (!pd || IsBadReadPtr(pd, 8) || !*pd || IsBadReadPtr(*pd, 0x148) || *(int *)(*pd + 0x140) <= 0) continue;
+            int known = 0;
+            for (int k = 0; k < g_hidden_n; k++) known |= g_hidden[k] == g_hide_ent[i];
+            if (!known && g_hidden_n < HIDE_MAX) g_hidden[g_hidden_n++] = g_hide_ent[i];
+            ((char (*)(char *, char))(g_base + 0x608c60))(c, 0);
+            now++;
+        }
+        if (!g_hide_on || now) logf("night boss: 9019 on, %d boss(es) hidden now (%d in all this night)", now, g_hidden_n);
+        g_hide_on = 1;
+    } else if (g_hide_on) {
+        int back = 0;
+        for (int k = 0; k < g_hidden_n; k++) {
+            char *c = in_world ? boss_chr(g_hidden[k]) : NULL;
+            if (c && !chr_enabled(c)) ((char (*)(char *, char))(g_base + 0x608c60))(c, 1), back++;
+        }
+        logf("night boss: 9019 off%s, %d of %d hidden boss(es) enabled again (the rest not loaded)", in_world ? "" : " (out of the world)", back,
+             g_hidden_n);
+        g_hide_on = 0, g_hidden_n = 0;
+    }
+}
 static void boss_flow_frame(int first) {
     if (first) g_bf_state = BF_WAIT, g_bf_held = 0, g_bf_repeats = 0;
+    if (g_settings[S_BOSS_FLOW] == 3) {
+        bf3_frame(first);
+        return;
+    }
     if (!setting(S_BOSS_FLOW) || g_bf_state == BF_NIGHT2) return;
     char *pa = *(char **)(g_base + RVA_PLAY_AREA_PTR);
     if (!pa) return;
@@ -5762,10 +6321,9 @@ static void party_host_over(void) {
     if (g_lobby) g_party_old_lobby = g_lobby;
     g_party = PARTY_OFF, g_party_host = 0;
 }
-// The menu's password (request +0x48 == 1, UTF-16 at *(request +8), else *(request +0x18), as 0xb67cc0 reads
-// it); NULL when none is typed.
+// The menu's password (UTF-16 at *(request +8), else *(request +0x18), as 0xb67cc0 reads it); NULL when none is
+// typed. The game also asks for request +0x48 == 1 ("No. of Password Players": two); our team uses it either way.
 static unsigned short *party_password(char *request) {
-    if (request[0x48] != 1) return NULL;
     unsigned short *w = *(unsigned short **)(request + 8);
     if (!w) w = *(unsigned short **)(request + 0x18);
     return w && !IsBadReadPtr(w, 2) && *w ? w : NULL;
@@ -5775,8 +6333,8 @@ static unsigned short *party_password(char *request) {
 // above 0 (an extra salt, only to keep test runs apart). Only the hash goes into the lobby.
 static unsigned party_key_hash(char *request) {
     unsigned h = 2166136261u;
-    const char *base[3] = {"oisis", LOBBY_GAME, LOBBY_PROTO};
-    for (int k = 0; k < 3; k++)
+    const char *base[2] = {"oisis", LOBBY_GAME};  // no protocol / version: friends on another version share the code
+    for (int k = 0; k < 2; k++)
         for (const char *c = base[k]; *c; c++) h = (h ^ (unsigned char)*c) * 16777619u;
     h = (h ^ '|') * 16777619u;
     unsigned short *w = party_password(request);
@@ -5797,6 +6355,7 @@ static void party_request(char *self, char *request) {
     char *ctx = *(char **)(self + 8);
     snprintf(g_party_code, sizeof g_party_code, "%s", code);
     g_party = PARTY_PENDING, g_party_tick = GetTickCount(), g_party_marked_for = -1, g_party_confirm = 0;
+    g_ver_notice_armed = 1;
     g_as_ally = 1;
     if (!g_network_on) set_network(1);
     logf("party: start request for a squad of %u, pool: %s%s: network %s; looking for a host in it",
@@ -5957,6 +6516,7 @@ static void host_expedition(int step) {
         }
     } else if (g_in_expedition) {
         g_in_expedition = 0;
+        g_ver_notice_armed = 1;  // a new hub visit
         lobby_search_reset();
         logf("host: expedition over (step %s)%s", STEP_NAMES[step], g_host_test == 2 ? ", leaving the session" : "");
         md_end("expedition over");
@@ -5967,9 +6527,86 @@ static void host_expedition(int step) {
     }
 }
 
+
+#include "overlay.h"
+#include "capacity.h"
+// Counts for the overlay (counts only: no names, no ids): our lobbies of our version, by the phase the host publishes.
+// In the hub (the local player's map block 0x0a......, m10 the Roundtable Hold) at most every 30 s through its own
+// list request while no search is running; a running search's result is counted instead (counts_from_list).
+static DWORD g_count_tick;
+static void counts_from_list(unsigned n) {
+    int in_game = 0, looking = 0, waiting = 0;
+    for (unsigned i = 0; i < n && i < 50; i++) {
+        u64 id = g_steam.by_index(g_steam.mm, (int)i);
+        const char *proto = g_steam.get_data(g_steam.mm, id, LOBBY_PROTO_KEY), *ver = g_steam.get_data(g_steam.mm, id, LOBBY_VER_KEY);
+        if (!proto || strcmp(proto, LOBBY_PROTO) || !ver || strcmp(ver, MOD_VERSION) || (id == g_lobby && g_lobby)) continue;
+        const char *ph = g_steam.get_data(g_steam.mm, id, LOBBY_PHASE_KEY), *af = g_steam.get_data(g_steam.mm, id, LOBBY_ALLY_FREE_KEY);
+        int hub = ph && !strcmp(ph, "hub"), late = ph && (!strcmp(ph, "boss") || !strcmp(ph, "late"));
+        if (hub) waiting++;
+        else in_game++;
+        if (!late && af && atoi(af) > 0) looking++;
+    }
+    static int last[3] = {-1, -1, -1};
+    if (in_game == last[0] && looking == last[1] && waiting == last[2]) return;
+    last[0] = in_game, last[1] = looking, last[2] = waiting;
+    static _Alignas(16) char text[3][0x100];
+    static unsigned short line[3][128];
+    const unsigned short *lines[3];
+    int value[3] = {in_game, looking, waiting};
+    for (int k = 0; k < 3; k++) {
+        char *t = ((char *(*)(void *, int))(g_base + RVA_MENU_TEXT_CTOR))(text[k], 131172 + k);
+        const unsigned short *tpl = t && *(unsigned short **)t ? *(unsigned short **)t : t ? *(unsigned short **)(t + 0x10) : NULL;
+        char num[12];
+        snprintf(num, sizeof num, "%d", value[k]);
+        int m = 0;
+        for (int i = 0; tpl && !IsBadReadPtr(tpl + i, 2) && tpl[i] && i < 100 && m < 120; i++) {
+            if (tpl[i] == '%' && tpl[i + 1] == 'd') {
+                for (const char *a = num; *a && m < 120; a++) line[k][m++] = (unsigned char)*a;
+                i++;
+            } else line[k][m++] = tpl[i];
+        }
+        line[k][m] = 0;
+        lines[k] = line[k];
+    }
+    logf("counts: squads in an expedition %d, looking for a player %d, hosts waiting in the hub %d", in_game, looking, waiting);
+    ov_set_lines(lines, 3);
+}
+static int counts_in_hub(void) {
+    char *me = local_player();
+    unsigned blk = me && !IsBadReadPtr(me + CHR_BLOCK_ID, 4) ? *(unsigned *)(me + CHR_BLOCK_ID) : 0;
+    return me && (blk >> 24) == 0x0a && !g_in_expedition && g_join != 4;
+}
+static void counts_tick(void) {  // game thread (step hook)
+    if (!setting(S_SHOW_COUNTS) || g_ov_off) return;
+    if (!counts_in_hub()) {
+        ov_hide();
+        return;
+    }
+    if (!g_ov.shown && g_ov.has_text) g_ov.shown = 1;  // back in the hub: the last counts again
+    if (!steam_ready()) return;
+    DWORD now = GetTickCount();
+    if (!g_count_call) {
+        if (g_list_call || g_searching || g_party || (g_count_tick && now - g_count_tick < 30000)) return;  // a search counts instead
+        g_steam.string_filter(g_steam.mm, LOBBY_MARK_KEY, "1", LOBBY_EQUAL);
+        g_steam.distance_filter(g_steam.mm, LOBBY_WORLDWIDE);
+        g_count_call = g_steam.request_list(g_steam.mm);
+        g_count_tick = now;
+        return;
+    }
+    unsigned char failed = 0;
+    if (!g_steam.completed(g_steam.utils, g_count_call, &failed)) {
+        if (now - g_count_tick > SEARCH_TIMEOUT_MS) g_count_call = 0;
+        return;
+    }
+    struct { unsigned matching; } result = {0};
+    unsigned char got = g_steam.result(g_steam.utils, g_count_call, &result, sizeof result, LOBBY_MATCH_LIST, &failed);
+    g_count_call = 0;
+    if (got && !failed) counts_from_list(result.matching);
+}
 static void toggle_search(const char *where) {
     g_invasion_pending = 0;
     g_searching = !g_searching;
+    if (g_searching) g_ver_notice_armed = 1;
     lobby_search_reset();
     if (g_searching) {
         if (g_stop_pending) finish_pending_stop(1);
@@ -6194,9 +6831,12 @@ static void step_hook(void *ctrl, void *time, int step) {
     }
     no_sprint_frame();
     g_in_exped = step == QM_STEP_INGAME || g_join_in_world();
+    night_hide_frame(g_in_exped);
     if (step == QM_STEP_INGAME || g_join_in_world()) invader_notice_frame();
     summon_kill_reward();
     crash_watch_members();
+    squad_count_tick();
+    counts_tick();
     static int told_invader;
     if (g_join != 4) {
         if (told_invader) told_invader = 0, logf("role: no longer an invader; own expeditions host again");
@@ -6249,7 +6889,7 @@ static void step_hook(void *ctrl, void *time, int step) {
 
 // The menu's start request reaches the context through "fill context" (0xb67cc0, two call sites):
 // u64 (self*, request*), with the context at self+8. In the request: the "Number of Players" choice
-// at +0x49 (0 three, 1 two, 2 one; 3 is our fourth option) and the chosen Target rows as a u32
+// at +0x49 (0 three, 1 two, 2 one) and the chosen Target rows as a u32
 // vector at +0x58 (begin) / +0x60 (end). The function turns rows into boss numbers, where our row
 // becomes boss 0, and the choice into a player count.
 #define RVA_FILL_CONTEXT       0xb67cc0
@@ -6257,7 +6897,7 @@ static void step_hook(void *ctrl, void *time, int step) {
 #define RVA_FILL_CONTEXT_CALL2 0xb671e0  // e8 db 0a 00 00
 #define REQ_PLAYERS_CHOICE     0x49
 #define REQ_ROWS_BEGIN         0x58
-#define PLAYERS_CHOICE_FOUR    3         // value of our combo item
+#define PLAYERS_CHOICE_FOUR    3         // the old fourth option's value; the offline compare below still admits it (harmless)
 static char *g_dialog;                       // defined with the start button code below
 static int cursor_on_invasion(char *dialog);
 static unsigned long long fill_context_hook(char *self, char *request) {
@@ -6267,15 +6907,7 @@ static unsigned long long fill_context_hook(char *self, char *request) {
     // fall back on the chosen rows, where the game itself looks at the last one for its special row.
     int invasion = cursor_on_invasion(g_dialog);
     if (invasion < 0) invasion = count && count <= 64 && begin[count - 1] == INVASION_ROW;
-    // Four players: let the game set everything up as for its largest squad, then correct the count.
-    int four = (unsigned char)request[REQ_PLAYERS_CHOICE] == PLAYERS_CHOICE_FOUR;
-    if (four) request[REQ_PLAYERS_CHOICE] = 0;
     unsigned long long result = ((unsigned long long (*)(char *, char *))(g_base + RVA_FILL_CONTEXT))(self, request);
-    if (four) {
-        request[REQ_PLAYERS_CHOICE] = PLAYERS_CHOICE_FOUR;
-        char *ctx = *(char **)(self + 8);
-        if (ctx && *(char **)ctx == g_base + RVA_QM_CONTEXT_VTABLE) *(unsigned *)(ctx + QM_CTX_PLAYERS) = 4;
-    }
     g_invasion_pending = invasion;
     g_request_tick = GetTickCount();
     unsigned char choice = (unsigned char)request[REQ_PLAYERS_CHOICE];
@@ -6468,8 +7100,9 @@ static void diff_region(diff_t *d, void *base, unsigned bytes) {
 }
 static void level_watch(void) {
     static DWORD next;
-    static diff_t pd, cm, sl[2];
+    static diff_t pd, cm, sl[4];
     pd.name = "player data", cm.name = "character data", sl[0].name = "other slot 0", sl[1].name = "other slot 1";
+    sl[2].name = "other slot 2", sl[3].name = "other slot 3";
     if (!g_debug_log || (int)(GetTickCount() - next) < 0) return;
     next = GetTickCount() + 1000;
     char *ps = *(char **)(g_base + 0x3c078d0);
@@ -6483,7 +7116,7 @@ static void level_watch(void) {
     diff_region(&st, ps, 0x400);
     if (g_join_in_world()) {
         char *slots = *(char **)(ps + 0x10);
-        for (int i = 0; i < 2; i++) diff_region(&sl[i], slots ? slots + i * 0x8a0 : NULL, 0x8a0);
+        for (int i = 0; i < g_cap_remote; i++) diff_region(&sl[i], slots ? slots + i * 0x8a0 : NULL, 0x8a0);
     }
 }
 static DWORD WINAPI run(LPVOID self) {
@@ -6493,8 +7126,9 @@ static DWORD WINAPI run(LPVOID self) {
         logf("unsupported game build (timestamp %08lx), doing nothing", nt->FileHeader.TimeDateStamp);
         return 0;
     }
-    logf("loaded, game base %p", g_base);
+    logf("loaded, game base %p, mod version %s", g_base, MOD_VERSION);
     if (!g_settings_early) settings_load();
+    boss_deaths_load();
     if (g_guard_ok) logf("net guard: installed, %u of %u imports patched (outbound %s)", (unsigned)GUARDED_COUNT,
                          (unsigned)GUARDED_COUNT, NET_GUARD_REFUSE_OUTBOUND ? "refused" : "logged only");
     else logf("net guard: NOT installed (%s); the network will not be started", g_guard_msg);
@@ -6505,6 +7139,7 @@ static DWORD WINAPI run(LPVOID self) {
         hook_target_list();
         hook_map_load();
         hook_players_option();
+        hook_password_players_row();
         hook_expedition_start();
         hook_offline_check();
         hook_network_flow();
@@ -6549,7 +7184,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved) {
         if (dot) strcpy(dot, ".log");
         g_base = (char *)GetModuleHandleA(NULL);
         crash_install(self);
-        if (((IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew))->FileHeader.TimeDateStamp == GAME_TIMESTAMP) fastfail_install();
+        if (((IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew))->FileHeader.TimeDateStamp == GAME_TIMESTAMP) fastfail_install(), ov_install(), capacity_install(), steam_shutdown_install();
         IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew);
         // The guard goes in first, here rather than in run(): this runs before me3 lets the game go
         // on, while run() starts only later, alongside the game's own start-up.
