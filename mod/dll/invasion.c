@@ -2749,6 +2749,17 @@ static unsigned long long pin_row_shown_hook(unsigned long long type, unsigned *
     }
     return ((unsigned long long (*)(unsigned long long, unsigned *))(g_base + RVA_PIN_ROW_SHOWN))(type, id);
 }
+// Map circles: the world map view model update 0x140910300 (every model: map screen and compass) asks the play-area
+// manager for the current circle (0x14068bab0 at 0x14091079b -> model +0x134 shown, +0x138 centre, +0x140 radius) and
+// for the circle of the current phase entry, the next-circle preview (0x14068bcd0 at 0x1409108e6, gated by 0x14068c650
+// "shrinking" -> model +0x14c, +0x150, +0x158); the map screen 0x140ac9410 draws each only while its flag is set
+// (0x140ac9843 / 0x140ac98c6, else 0x140ad3cc0(.., 0) hides it). Both answered "no circle": neither is drawn. The
+// phase-2 marker (+0x168, the final site from manager +0x2f8, 0x14068b8a0 at 0x1409109f6) stays.
+static unsigned long long map_no_circle_hook(void *mgr, void *a, void *b, void *c) {
+    (void)mgr, (void)a, (void)b, (void)c;
+    norain_first(8, "map: circle and next-circle preview not drawn");
+    return 0;
+}
 static unsigned long long hud_circle_state_hook(char *mgr, unsigned long long chr) {
     (void)mgr, (void)chr;
     norain_first(6, "health bar circle state answered 0");
@@ -2992,6 +3003,8 @@ static void hook_acceptance(void) {
     if (legacy) hook_call(0x7cbf86, 0x68c5f0, (void *)hud_circle_state_hook, "no rain: health bar circle state (1)");
     if (legacy) hook_call(0x7cee41, 0x68c5f0, (void *)hud_circle_state_hook, "no rain: health bar circle state (2)");
     hook_call(0x69722c, 0x7c52f0, (void *)hud_circle_notice_hook, "no rain: circle notice skipped");
+    hook_call(0x91079b, 0x68bab0, (void *)map_no_circle_hook, "no rain: map circle not drawn");
+    hook_call(0x9108e6, 0x68bcd0, (void *)map_no_circle_hook, "no rain: map next-circle preview not drawn");
     if (legacy) hook_call(0x65ff39, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (1)");
     if (legacy) hook_call(0x6639c3, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (2)");
     if (legacy) hook_call(0x664170, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (3)");

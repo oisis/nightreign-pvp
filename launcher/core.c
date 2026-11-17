@@ -2639,7 +2639,7 @@ int core_selftest(void) {
                                 "nope = true\r\nloot-test = yes\r\n\r\ndebug-log = false\r\ntest-level = 15\r\nmap-group = 3\r\nult-pvp = 250\r\none-region = 1000";
         short v[SETTINGS_COUNT];
         char bad[64];
-        static const short want[SETTINGS_COUNT] = {1, 1, -1, -1, 0, -1, 15, -1, -1, 3, -1, -1, -1, -1, 250, -1, -1, -1, -1, -1};
+        static const short want[SETTINGS_COUNT] = {1, 1, -1, -1, 0, -1, 15, -1, -1, 3, -1, -1, -1, -1, 250, -1, -1, -1, -1, -1, -1};
         int good = settings_parse(t, sizeof t - 1, v, bad, sizeof bad) == 3 && !memcmp(v, want, sizeof v) &&
                    !strcmp(bad, "nope = true, loot-test = yes, one-region = 1000");
         good = good && !load_settings("/nonexistent/test-settings.toml", v);
