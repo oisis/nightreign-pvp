@@ -2143,20 +2143,33 @@ static void bf3_kill(unsigned id);
 // also sets a flag of its variant (m46_50: 46500830 beside 46500800), which is not listed. Small-map ids of instance
 // n are n * 10^8 + the script's id; tile ids are exact. Without the file: any nnn 800..899 with d = 0 (logged).
 static unsigned *g_boss_death;
-static int g_boss_deaths = -1;  // -1: no list, the fallback rule
+static int g_boss_deaths = -1;
+#define HIDE_MAX 1024
+static unsigned g_hide_ent[HIDE_MAX];  // every listed boss's characters
+static int g_hide_n;  // -1: no list, the fallback rule
 static void boss_deaths_load(void) {
     char path[MAX_PATH];
     next_to_dll(path, sizeof path, "boss-deaths.txt");
     FILE *f = fopen(path, "rb");
     static unsigned list[4096];
     int n = 0;
-    char line[64];
+    char line[256];
     while (f && fgets(line, sizeof line, f))
-        if (line[0] >= '0' && line[0] <= '9' && n < 4096) list[n++] = (unsigned)strtoul(line, NULL, 10);
+        if (line[0] >= '0' && line[0] <= '9' && n < 4096) {
+            char *at = line;
+            list[n++] = (unsigned)strtoul(at, &at, 10);
+            for (;;) {  // then the boss's characters (entity ids, launcher: the event that sets the flag on its death)
+                unsigned e = (unsigned)strtoul(at, &at, 10);
+                if (!e) break;
+                int dup = 0;
+                for (int k = 0; k < g_hide_n; k++) dup |= g_hide_ent[k] == e;
+                if (!dup && g_hide_n < HIDE_MAX) g_hide_ent[g_hide_n++] = e;
+            }
+        }
     if (f) fclose(f);
     for (int i = 1; i < n; i++)  // keep it sorted (the launcher writes it sorted)
         for (int j = i; j > 0 && list[j - 1] > list[j]; j--) { unsigned t = list[j]; list[j] = list[j - 1], list[j - 1] = t; }
-    if (n > 0) g_boss_death = list, g_boss_deaths = n, logf("clock: %d boss death flags loaded", n);
+    if (n > 0) g_boss_death = list, g_boss_deaths = n, logf("clock: %d boss death flags loaded (%d boss characters)", n, g_hide_n);
     else logf("clock: no boss death list (boss-deaths.txt%s): any nnn 800..899 with d = 0 counts as a boss", f ? " empty" : " missing");
 }
 static int boss_death(unsigned id) {
@@ -6044,6 +6057,53 @@ static void bf3_frame(int first) {
         }
     }
 }
+// Night boss active (9019 on: common 1108 holds it from 23:59:00 until 9052, ...): every other living boss is
+// disabled on this machine, as the game's own 23:00 field-boss events do (2004[5] "Change Character Enable State"
+// = 0x608c60(chr, 0): the enable bit at [chr +0x18] +10 bit 0, the mount too; HP untouched), each machine by itself
+// (9019 is driven by the clock, which every machine has). Checked every 500 ms, so a boss loaded later in the window
+// is hidden too; when 9019 goes off the ones disabled here are enabled again. A boss = a character of
+// boss-deaths.txt (entity id -> 0x5190c0, the world character manager's lookup), alive (HP +0x140 of [chr +0x1b8] > 0)
+// and enabled. Not done: the map markers (left as they are).
+static unsigned g_hidden[HIDE_MAX];
+static int g_hidden_n, g_hide_on;
+static char *boss_chr(unsigned ent) {
+    char *wcm = *(char **)(g_base + RVA_WORLD_CHR_MAN);
+    int e = (int)ent;
+    char *c = wcm ? ((char *(*)(void *, int *))(g_base + 0x5190c0))(wcm, &e) : NULL;
+    return c && !IsBadReadPtr(c, 0x1c0) && *(char **)(c + 0x18) && !IsBadReadPtr(*(char **)(c + 0x18), 0x10) ? c : NULL;
+}
+static int chr_enabled(char *c) { return *(unsigned char *)(*(char **)(c + 0x18) + 10) & 1; }
+static void night_hide_frame(int in_world) {
+    static DWORD next;
+    if ((int)(GetTickCount() - next) < 0) return;
+    next = GetTickCount() + 500;
+    int on = in_world && bf_flag(9019);
+    if (on) {
+        int now = 0;
+        for (int i = 0; i < g_hide_n; i++) {
+            char *c = boss_chr(g_hide_ent[i]);
+            if (!c || !chr_enabled(c)) continue;
+            char **pd = *(char ***)(c + 0x1b8);
+            if (!pd || IsBadReadPtr(pd, 8) || !*pd || IsBadReadPtr(*pd, 0x148) || *(int *)(*pd + 0x140) <= 0) continue;
+            int known = 0;
+            for (int k = 0; k < g_hidden_n; k++) known |= g_hidden[k] == g_hide_ent[i];
+            if (!known && g_hidden_n < HIDE_MAX) g_hidden[g_hidden_n++] = g_hide_ent[i];
+            ((char (*)(char *, char))(g_base + 0x608c60))(c, 0);
+            now++;
+        }
+        if (!g_hide_on || now) logf("night boss: 9019 on, %d boss(es) hidden now (%d in all this night)", now, g_hidden_n);
+        g_hide_on = 1;
+    } else if (g_hide_on) {
+        int back = 0;
+        for (int k = 0; k < g_hidden_n; k++) {
+            char *c = in_world ? boss_chr(g_hidden[k]) : NULL;
+            if (c && !chr_enabled(c)) ((char (*)(char *, char))(g_base + 0x608c60))(c, 1), back++;
+        }
+        logf("night boss: 9019 off%s, %d of %d hidden boss(es) enabled again (the rest not loaded)", in_world ? "" : " (out of the world)", back,
+             g_hidden_n);
+        g_hide_on = 0, g_hidden_n = 0;
+    }
+}
 static void boss_flow_frame(int first) {
     if (first) g_bf_state = BF_WAIT, g_bf_held = 0, g_bf_repeats = 0;
     if (g_settings[S_BOSS_FLOW] == 3) {
@@ -6734,6 +6794,7 @@ static void step_hook(void *ctrl, void *time, int step) {
     }
     no_sprint_frame();
     g_in_exped = step == QM_STEP_INGAME || g_join_in_world();
+    night_hide_frame(g_in_exped);
     if (step == QM_STEP_INGAME || g_join_in_world()) invader_notice_frame();
     summon_kill_reward();
     crash_watch_members();

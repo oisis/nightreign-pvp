@@ -39,7 +39,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 24
+#define BUILD_FORMAT 25
 #define BOSS_DEATHS_MIN 100  // the game (1.3.3) has 158 such flags; fewer = its event scripts changed
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
@@ -2503,10 +2503,86 @@ static int emevd_boss_deaths(buf d, u32 *flags, int have, int cap) {
     return have;
 }
 static int cmp_u32(const void *a, const void *b) { u32 x = *(const u32 *)a, y = *(const u32 *)b; return x < y ? -1 : x > y; }
+// The boss character of each death flag (for hiding bosses while the night boss is active): a boss's death is set by
+// the event that watches the boss die, either a common_func template (an instruction "IF Character Dead/Alive"
+// 4[0], "IF Character HP Value" 4[14], "IF Character Ratio Dead/Alive" 4[15] or "IF Character Ratio HP Value" 4[23]
+// on an entity from the caller's arguments, and "Set (Network-Connected) Event Flag" 2003[66] / 2003[69] with a flag
+// from the caller's arguments: 90015002, 90015407, 90035013, 90045002 ...) or a map script's own event with both
+// literal. Parameter table of an event: +0x18 count, +0x20 offset into the table at header +0x58, entries 0x20: index
+// of the instruction u64, offset in its arguments u64, offset in the caller's arguments u64, size u32.
+#define BOSS_TMPL_MAX 8192
+static struct { u32 id; int nf, ne; u32 fsrc[4], esrc[4]; } g_tmpl[BOSS_TMPL_MAX];
+static int g_ntmpl;
+static int is_death_cond(u32 bank, u32 id) { return bank == 4 && (id == 0 || id == 14 || id == 15 || id == 23); }
+static int is_flag_set(u32 bank, u32 id) { return bank == 2003 && (id == 66 || id == 69); }
+static void emevd_templates(buf d) {
+    if (d.n < 0x80 || memcmp(d.p, "EVD", 3)) return;
+    u64 ec = rd64(d.p + 0x10), eo = rd64(d.p + 0x18), io = rd64(d.p + 0x28), po = rd64(d.p + 0x58);
+    for (u64 e = 0; e < ec && eo + (e + 1) * 0x30 <= d.n && g_ntmpl < BOSS_TMPL_MAX; e++) {
+        const u8 *ev = d.p + eo + e * 0x30;
+        u64 ioff = rd64(ev + 0x10), pc = rd64(ev + 0x18), poff = rd64(ev + 0x20);
+        int nf = 0, ne = 0;
+        u32 fsrc[4], esrc[4];
+        for (u64 k = 0; k < pc && po + poff + (k + 1) * 0x20 <= d.n; k++) {
+            const u8 *pe = d.p + po + poff + k * 0x20;
+            u64 idx = rd64(pe), tgt = rd64(pe + 8), src = rd64(pe + 0x10);
+            if (io + ioff + (idx + 1) * 0x20 > d.n || tgt != 4) continue;
+            const u8 *in = d.p + io + ioff + idx * 0x20;
+            if (is_death_cond(rd32(in), rd32(in + 4)) && ne < 4) esrc[ne++] = (u32)src;
+            if (is_flag_set(rd32(in), rd32(in + 4)) && nf < 4) fsrc[nf++] = (u32)src;
+        }
+        if (nf && ne) {
+            g_tmpl[g_ntmpl].id = (u32)rd64(ev), g_tmpl[g_ntmpl].nf = nf, g_tmpl[g_ntmpl].ne = ne;
+            memcpy(g_tmpl[g_ntmpl].fsrc, fsrc, sizeof fsrc), memcpy(g_tmpl[g_ntmpl].esrc, esrc, sizeof esrc), g_ntmpl++;
+        }
+    }
+}
+#define BOSS_ENT_MAX 8
+static u32 g_boss_ent[2048][BOSS_ENT_MAX];
+static int g_boss_nent[2048];
+static void boss_entity_add(const u32 *flags, int have, u32 flag, u32 ent) {
+    const u32 *at = bsearch(&flag, flags, (size_t)have, sizeof *flags, cmp_u32);
+    if (!at || ent < 1000 || ent == 10000 || ent == 20000) return;
+    int i = (int)(at - flags);
+    for (int k = 0; k < g_boss_nent[i]; k++) if (g_boss_ent[i][k] == ent) return;
+    if (g_boss_nent[i] < BOSS_ENT_MAX) g_boss_ent[i][g_boss_nent[i]++] = ent;
+}
+static void emevd_boss_entities(buf d, const u32 *flags, int have) {
+    if (d.n < 0x80 || memcmp(d.p, "EVD", 3)) return;
+    u64 ec = rd64(d.p + 0x10), eo = rd64(d.p + 0x18), io = rd64(d.p + 0x28), ao = rd64(d.p + 0x78);
+    for (u64 e = 0; e < ec && eo + (e + 1) * 0x30 <= d.n; e++) {
+        const u8 *ev = d.p + eo + e * 0x30;
+        u64 n = rd64(ev + 8), ioff = rd64(ev + 0x10);
+        u32 ents[16], fls[16];
+        int ne = 0, nf = 0;
+        for (u64 k = 0; k < n && io + ioff + (k + 1) * 0x20 <= d.n; k++) {
+            const u8 *in = d.p + io + ioff + k * 0x20;
+            u32 bank = rd32(in), id = rd32(in + 4);
+            u64 alen = rd64(in + 8), aoff = rd64(in + 0x10);
+            if (ao + aoff + alen > d.n) continue;
+            const u8 *a = d.p + ao + aoff;
+            if (bank == 2000 && (id == 0 || id == 6) && alen >= 8) {  // a call: through its template
+                u32 ev_id = rd32(a + 4);
+                for (int t = 0; t < g_ntmpl; t++) {
+                    if (g_tmpl[t].id != ev_id) continue;
+                    for (int f = 0; f < g_tmpl[t].nf; f++)
+                        for (int x = 0; x < g_tmpl[t].ne; x++)
+                            if (8 + g_tmpl[t].fsrc[f] + 4 <= alen && 8 + g_tmpl[t].esrc[x] + 4 <= alen)
+                                boss_entity_add(flags, have, rd32(a + 8 + g_tmpl[t].fsrc[f]), rd32(a + 8 + g_tmpl[t].esrc[x]));
+                    break;
+                }
+            } else if (is_death_cond(bank, id) && alen >= 8 && ne < 16) ents[ne++] = rd32(a + 4);
+            else if (is_flag_set(bank, id) && alen >= 8 && nf < 16) fls[nf++] = rd32(a + 4);
+        }
+        for (int f = 0; f < nf; f++)  // the script's own event, both literal
+            for (int x = 0; x < ne; x++) boss_entity_add(flags, have, fls[f], ents[x]);
+    }
+}
 static int build_boss_deaths(const char *game_dir, buf bhd, const char *bdt) {
-    static char names[4096][48];
-    static buf in[4096], out[4096];
+    static char names[1 + 4 * 4 * 6 + 40 * 100][48];
+    static buf in[sizeof names / sizeof names[0]], out[sizeof names / sizeof names[0]];
     int n = 0;
+    snprintf(names[n++], sizeof names[0], "/event/common_func.emevd.dcx");  // the templates (first)
     for (int x = 42; x <= 45; x++)
         for (int y = 36; y <= 39; y++)
             for (int v = 0; v <= 5; v++) snprintf(names[n++], sizeof names[0], "/event/m60_%02d_%02d_%d0.emevd.dcx", x, y, v);
@@ -2525,19 +2601,30 @@ static int build_boss_deaths(const char *game_dir, buf bhd, const char *bdt) {
     for (int i = 0; i < found; i++) {
         if (out[i].p) read++, have = emevd_boss_deaths(out[i], flags, have, 2048);
         else if (failed < 0) failed = i, snprintf(kind, sizeof kind, "%.4s", in[i].p && in[i].n >= 0x2C ? (const char *)in[i].p + 0x28 : "?");
-        free(in[i].p), free(out[i].p);
     }
     if (failed >= 0) logf_("Boss deaths: %s not unpacked (compression %s)", names[failed], kind);
     qsort(flags, (size_t)have, sizeof *flags, cmp_u32);
+    g_ntmpl = 0;
+    memset(g_boss_nent, 0, sizeof g_boss_nent);
+    if (found && out[0].p && strstr(names[0], "common_func")) emevd_templates(out[0]);
+    for (int i = 0; i < found; i++) if (out[i].p) emevd_boss_entities(out[i], flags, have);
+    for (int i = 0; i < found; i++) free(in[i].p), free(out[i].p);
+    int with = 0;
+    for (int i = 0; i < have; i++) with += g_boss_nent[i] > 0;
     char path[1300];
     snprintf(path, sizeof path, "%s" SEP "work" SEP "native" SEP "boss-deaths.txt", g_app);
-    size_t cap = 64 + (size_t)have * 12, at = 0;
+    size_t cap = 128 + (size_t)have * 12 * (1 + BOSS_ENT_MAX), at = 0;
     char *text = xalloc(cap);
-    at += (size_t)snprintf(text + at, cap - at, "# boss death flags: %d\n", have);
-    for (int i = 0; i < have; i++) at += (size_t)snprintf(text + at, cap - at, "%u\n", flags[i]);
+    at += (size_t)snprintf(text + at, cap - at, "# boss death flags: %d (each: flag, then the boss characters' entity ids)\n", have);
+    for (int i = 0; i < have; i++) {
+        at += (size_t)snprintf(text + at, cap - at, "%u", flags[i]);
+        for (int k = 0; k < g_boss_nent[i]; k++) at += (size_t)snprintf(text + at, cap - at, " %u", g_boss_ent[i][k]);
+        at += (size_t)snprintf(text + at, cap - at, "\n");
+    }
     int ok = read == found && have > 0 && write_file(path, (const u8 *)text, at);
     free(text);
-    logf_("Boss deaths for the day clock: %d flags from %d of %d event scripts", have, read, found);
+    logf_("Boss deaths for the day clock: %d flags (%d with their boss character, %d templates) from %d of %d event scripts", have, with,
+          g_ntmpl, read, found);
     return ok ? have : -1;
 }
 
