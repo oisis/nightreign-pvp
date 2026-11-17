@@ -39,7 +39,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 21
+#define BUILD_FORMAT 22
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
                               "porbr", "rusru", "spaar", "spaes", "thath", "zhocn", "zhotw"};
@@ -901,6 +901,20 @@ static int no_rain(buf p) {
     return 1;
 }
 
+// Graces at night (owner's go, 17.11): GameSystemCommonParam row 0 +0x468 nightTimeFlag (9019) is the flag the game's
+// event manager reads each frame (0x1405f7930 -> +0xa1) to refuse every site of grace while it is on; common event
+// 1108 sets 9019 at 23:59 on the circle clock until the night boss is beaten. 0: no flag is read, graces stay usable.
+// In place; 0 if unexpected.
+#define SYSTEM_PARAM "\\GameSystemCommonParam.param"
+static int night_graces(buf p) {
+    const u8 *d = p.p + 0x40;
+    if (rd16(p.p + 0x0A) != 1 || rd32(d) != 0) return 0;
+    u8 *row = p.p + rd64(d + 8);
+    if (rd32(row + 0x468) != 9019) return 0;
+    wr32(row + 0x468, 0);
+    return 1;
+}
+
 // Slow clock (test sessions only): an empty file "slow-time" in work/native/ makes the profile set
 // the game's debug property Game.IngameTime.TimeScale to 7.29, a tenth of the expedition clock's
 // rate (GameSystemCommonParam +0x1bc = 72.9; the game reads the property in 0x140f884b0 and lets it
@@ -1639,7 +1653,7 @@ static int build_regulation(const char *game_dir) {
         return free(enc.p), logf_("regulation.bin is not in the expected format"), 0;
     buf bundle = {xalloc((size_t)usize + (1 << 17)), usize};
     buf patched = {0}, body = {0}, param = {0}, speffect = {0}, speffect2 = {0}, step = {0}, maps[4] = {{0}}, cur = {0};
-    int ok = 0, index, sp_index, npc_index, area_index, map_index[4] = {-1, -1, -1, -1};
+    int ok = 0, index, sp_index, npc_index, area_index, sys_index, map_index[4] = {-1, -1, -1, -1};
     u8 *team_row = NULL, *ally_row = NULL;
     if (nr_zstd_decompress(dcx + 0x4C, csize, bundle.p, (size_t)usize + (1 << 17)) != usize) {
         logf_("regulation.bin could not be unpacked");
@@ -1657,6 +1671,8 @@ static int build_regulation(const char *game_dir) {
         logf_("The game's NpcParam looks different than expected. The game may have been updated; the mod needs an update too.");
     } else if ((area_index = bnd4_find(bundle, PLAY_AREA_PARAM)) < 0 || !no_rain(bnd4_file(bundle, area_index))) {
         logf_("The game's PlayAreaCreateCommonParam looks different than expected. The game may have been updated; the mod needs an update too.");
+    } else if ((sys_index = bnd4_find(bundle, SYSTEM_PARAM)) < 0 || !night_graces(bnd4_file(bundle, sys_index))) {
+        logf_("The game's GameSystemCommonParam looks different than expected. The game may have been updated; the mod needs an update too.");
     } else if (!map_tables(bundle, map_index, maps)) {
         logf_("The game's map pattern tables look different than expected; the two-region maps cannot be built. The game may have been updated; the mod needs an update too.");
     } else {
@@ -1679,6 +1695,7 @@ static int build_regulation(const char *game_dir) {
                                 map_draw_group() >= 0 ? "; test: only one night boss group (map-group)" : "");
         else logf_("Two-region maps: every map is the %s with the %s (200 compositions)%s", pair_a()->name, pair_b()->name,
                    map_draw_group() >= 0 ? "; test: only one night boss group (map-group)" : "");
+        logf_("regulation: sites of grace stay usable at night (GameSystemCommonParam nightTimeFlag 9019 -> 0)");
         step = bnd4_replace(bundle, index, param);
         patched = bnd4_replace(step, sp_index, speffect2);
         for (int t = 0; t < 4; t++)

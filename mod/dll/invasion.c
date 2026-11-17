@@ -2103,10 +2103,11 @@ static double flog_t(void) { return (GetTickCount() - g_flog_layout_tick) / 1000
 static void flag_note(char *man, unsigned id, int on, int before) {
     (void)man;
     if (!setting(S_FLAG_LOG)) {
-        // always (boss-grace check): a boss-death flag (the scripts' nnn 800..899 of a map or small-map block, which
-        // common 9005810 / 90015006 wait for before they enable the site of grace) turned on, or dropped for want
-        // of a block
-        if (on && before != 1 && id >= 10000000u && id % 1000 >= 800 && id % 1000 < 900)
+        // always (boss-grace check): a boss-death flag (the scripts' nnn 800..899 in a block with d = 0, the d digit
+        // being (id / 1000) % 10 in tile ids 10XXYYdnnn / 10XYVddnnn and small-map ids, which common 9005810 / 90015006
+        // wait for before they enable the site of grace) turned on, or dropped for want of a block. Event-end flags
+        // (d = 2) and the like are left out.
+        if (on && before != 1 && id >= 10000000u && id % 1000 >= 800 && id % 1000 < 900 && id / 1000 % 10 == 0)
             logf("flags: boss-family flag %u -> 1%s", id, before < 0 ? " DROPPED, no block" : "");
         return;
     }
