@@ -286,6 +286,42 @@ static void fastfail_install(void) {  // DllMain: import slot and the second poi
         g_ff_hooked |= 1 << i;
     }
 }
+// Steam going away (dev.46 runs 74 / 61: at every game exit our echo thread read a freed Steam interface, "reading
+// 0xbeef" in lsteamclient, after the game's last frame). The game shuts Steam down once, at exit, through its import
+// SteamAPI_Shutdown (steam_api64.dll); going back to the Roundtable Hold does not call it. Our wrapper first stops
+// every Steam use of ours (g_steam_down: the echo thread leaves its loop, steam_ready() answers no) and waits until
+// the echo thread is out of its Steam calls (at most 500 ms), then lets the game's call through.
+static volatile LONG g_steam_down, g_steam_busy;
+static void (*g_steam_shutdown_real)(void);
+static void steam_shutdown_hook(void) {
+    InterlockedExchange(&g_steam_down, 1);
+    for (int i = 0; i < 250 && g_steam_busy; i++) Sleep(2);
+    logf("steam: the game shuts Steam down; our Steam use stopped first%s", g_steam_busy ? " (the echo thread did not finish in 500 ms)" : "");
+    if (g_steam_shutdown_real) g_steam_shutdown_real();
+}
+static void steam_shutdown_install(void) {  // DllMain: the exe's import slot of SteamAPI_Shutdown, only if it holds the real one
+    HMODULE m = GetModuleHandleA("steam_api64.dll");
+    void *real = m ? (void *)GetProcAddress(m, "SteamAPI_Shutdown") : NULL;
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew);
+    IMAGE_DATA_DIRECTORY dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    void **slot = NULL;
+    for (IMAGE_IMPORT_DESCRIPTOR *d = (IMAGE_IMPORT_DESCRIPTOR *)(g_base + dir.VirtualAddress); real && dir.VirtualAddress && d->Name && !slot; d++) {
+        IMAGE_THUNK_DATA64 *names = (IMAGE_THUNK_DATA64 *)(g_base + d->OriginalFirstThunk);
+        for (size_t i = 0; d->OriginalFirstThunk && names[i].u1.Ordinal && !slot; i++)
+            if (!IMAGE_SNAP_BY_ORDINAL64(names[i].u1.Ordinal) &&
+                !strcmp(((IMAGE_IMPORT_BY_NAME *)(g_base + names[i].u1.Ordinal))->Name, "SteamAPI_Shutdown"))
+                slot = (void **)(g_base + d->FirstThunk) + i;
+    }
+    DWORD old;
+    if (!slot || *slot != real || !VirtualProtect(slot, 8, PAGE_READWRITE, &old)) {
+        logf("steam: SteamAPI_Shutdown import not found or not the real one: not wrapped");
+        return;
+    }
+    g_steam_shutdown_real = (void (*)(void))real;
+    *slot = (void *)steam_shutdown_hook;
+    VirtualProtect(slot, 8, old, &old);
+    logf("steam: SteamAPI_Shutdown wrapped (our Steam use stops before it)");
+}
 // Exit line (DLL_PROCESS_DETACH, written the same allocation-free way): process exit or unload. No line and no
 // crash record = the process was ended from outside (TerminateProcess, killed) or died where we cannot see.
 static void exit_line(int process_exit) {
@@ -3660,6 +3696,7 @@ static struct {  // optional, for steam_watch
 } g_diag;
 static int steam_ready(void) {
     static int state;  // 0 not tried, 1 ready, -1 failed
+    if (g_steam_down) return 0;
     if (state) return state > 0;
     HMODULE m = GetModuleHandleA("steam_api64.dll");
     void *(*mm)(void) = m ? (void *(*)(void))GetProcAddress(m, "SteamAPI_SteamMatchmaking_v009") : NULL;
@@ -4137,11 +4174,25 @@ static void lag_log(u64 lobby, u64 me, double window) {
         p->max_gap = 0, p->rtt_n = p->rtt_sum = p->rtt_max = p->sent = 0, p->rtt_min = 1 << 30;
     }
 }
+static void lag_step(double *next_ping_, double *next_log_, double *window_from_);
 static DWORD WINAPI lag_thread(LPVOID unused) {
     (void)unused;
     double next_ping = 0, next_log = lag_ms() + LAG_LOG_MS, window_from = lag_ms();
     for (;;) {
         Sleep(2);
+        InterlockedIncrement(&g_steam_busy);
+        if (g_steam_down) {  // Steam is being shut down (process exit): no more Steam calls from this thread
+            InterlockedDecrement(&g_steam_busy);
+            logf("lag: echo thread stopped (Steam shutting down)");
+            return 0;
+        }
+        lag_step(&next_ping, &next_log, &window_from);
+        InterlockedDecrement(&g_steam_busy);
+    }
+}
+static void lag_step(double *next_ping_, double *next_log_, double *window_from_) {
+    double next_ping = *next_ping_, next_log = *next_log_, window_from = *window_from_;
+    do {
         u64 lobby = our_lobby(), me = g_diag.self ? g_diag.self(g_diag.user) : 0;
         double now = lag_ms();
         struct { unsigned magic, type, seq, t; } pk;
@@ -4193,7 +4244,8 @@ static DWORD WINAPI lag_thread(LPVOID unused) {
             lag_log(lobby, me, now - window_from);
             next_log = now + LAG_LOG_MS, window_from = now;
         }
-    }
+    } while (0);  // ("continue" above ends the step)
+    *next_ping_ = next_ping, *next_log_ = next_log, *window_from_ = window_from;
 }
 
 // Ping at the party bars (show-ping, default on): the party panel's 7 slots (CSFeMan +0xcf28, 0x98 each) are filled
@@ -7000,7 +7052,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved) {
         if (dot) strcpy(dot, ".log");
         g_base = (char *)GetModuleHandleA(NULL);
         crash_install(self);
-        if (((IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew))->FileHeader.TimeDateStamp == GAME_TIMESTAMP) fastfail_install(), ov_install(), capacity_install();
+        if (((IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew))->FileHeader.TimeDateStamp == GAME_TIMESTAMP) fastfail_install(), ov_install(), capacity_install(), steam_shutdown_install();
         IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(g_base + ((IMAGE_DOS_HEADER *)g_base)->e_lfanew);
         // The guard goes in first, here rather than in run(): this runs before me3 lets the game go
         // on, while run() starts only later, alongside the game's own start-up.
