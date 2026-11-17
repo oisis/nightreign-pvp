@@ -16,3 +16,4 @@ party = 0                 # test only: a number mixed into the squad matchmaking
 show-ping = true          # the round trip to each other player (ms) after its name on the party bars; false hides it
 show-counts = true        # in the Roundtable Hold: how many mod squads are in an expedition / looking for a player, top right; false hides it
 slot-test = false         # test: new session members take the highest free player slot first (3 machines reach slots 3 and 2)
+rain-hooks-legacy = true  # test: also the 8 older rain hooks the held circle radius makes unnecessary; false = the radius alone (confirmation run)

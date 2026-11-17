@@ -2620,11 +2620,13 @@ static DWORD g_expedition_start_tick;  // defined with g_expedition_tick below
 static DWORD g_norain_seen[13];
 static DWORD g_enter_tick, g_enter_world;  // joiner: join time, in the host's world (defined with the join code)
 static int g_join;
+static DWORD norain_key(void) {  // the host's own expedition, or a joiner's stay in the host's world (0: neither)
+    return g_join == 4 && g_enter_world ? g_enter_tick | 1 : g_expedition_start_tick;
+}
 static void norain_first(int k, const char *what) {
     if (k < 0 || k >= (int)(sizeof g_norain_seen / sizeof *g_norain_seen)) return;
-    // the host's own expedition, or a joiner's stay in the host's world (until 17.11 joiners never logged: the
-    // key was the host-only expedition start, 0 on a joiner)
-    DWORD key = g_join == 4 && g_enter_world ? g_enter_tick | 1 : g_expedition_start_tick;
+    // (until 17.11 joiners never logged: the key was the host-only expedition start, 0 on a joiner)
+    DWORD key = norain_key();
     if (g_debug_log && key && g_norain_seen[k] != key) {
         g_norain_seen[k] = key;
         logf("no rain: %s (first time this expedition%s)", what, key == g_expedition_start_tick ? "" : ", joined");
@@ -2640,8 +2642,31 @@ static void norain_effect_off(void) {
     char *sr = stage_rend();
     if (sr) sr[0xc553] = 0;
 }
+// The circle held at full size (owner's go, 17.11): the play-area manager's three phase entries (0x20 each from
+// +0x190: +0x10 radius, so +0x1a0 / +0x1c0 / +0x1e0) and the three pending ones the update copies in (+0x200 /
+// +0x220 / +0x240) get radius 5000 before each circle update (0x696170 / 0x698c90, our wrappers below), on every
+// machine (a joiner's entries come from the host; the update runs everywhere). The current radius +0x260 is the
+// update's interpolation of those, so every test of the circle (character outside bit, player inside, the
+// per-character map, the phase effect on characters, EcTestIsInsidePlayArea, the map) answers "inside" by the game's
+// own geometry. Written only while +0x159 says a circle exists; nothing else is touched. Phases and the clock are
+// time-driven and unchanged.
+#define CIRCLE_HELD_RADIUS 5000.0f
+static void circle_hold(char *mgr) {
+    if (!mgr || IsBadReadPtr(mgr, 0x264) || !mgr[0x159]) return;
+    static const int OFF[6] = {0x1a0, 0x1c0, 0x1e0, 0x200, 0x220, 0x240};
+    static DWORD told_for, next;
+    DWORD key = norain_key();
+    if (key && told_for != key) {
+        told_for = key, next = GetTickCount() + 30000;
+        logf("no rain: circle radius held at %.0f (phase radii were %.1f/%.1f/%.1f, current +0x260 %.1f)", CIRCLE_HELD_RADIUS,
+             *(float *)(mgr + 0x1a0), *(float *)(mgr + 0x1c0), *(float *)(mgr + 0x1e0), *(float *)(mgr + 0x260));
+    } else if (key && (int)(GetTickCount() - next) >= 0)
+        next = GetTickCount() + 30000, logf("no rain: circle radius now %.1f (every 30 s)", *(float *)(mgr + 0x260));
+    for (int i = 0; i < 6; i++) *(float *)(mgr + OFF[i]) = CIRCLE_HELD_RADIUS;
+}
 static volatile int g_c553_pre = -1;  // measurement: StageRend +0xc553 just before the circle update (after last frame's clear)
 static void norain_circle_hook(char *mgr, float dt, unsigned long long c) {
+    circle_hold(mgr);
     char *sr = stage_rend();
     g_c553_pre = sr ? (unsigned char)sr[0xc553] : -1;
     ((void (*)(char *, float, unsigned long long))(g_base + 0x696170))(mgr, dt, c);
@@ -2649,6 +2674,7 @@ static void norain_circle_hook(char *mgr, float dt, unsigned long long c) {
     norain_first(0, "circle update 0x696170, effect switched off");
 }
 static void norain_circle2_hook(char *mgr, float dt) {
+    circle_hold(mgr);
     ((void (*)(char *, float))(g_base + 0x698c90))(mgr, dt);
     norain_effect_off();
     norain_first(1, "circle update 0x698c90, effect switched off");
@@ -2954,22 +2980,25 @@ static void hook_acceptance(void) {
     if (g_settings[S_PAIR] >= 1)
         for (unsigned i = 0; i < sizeof VARIANT_SITES / sizeof *VARIANT_SITES; i++)
             hook_call(VARIANT_SITES[i], 0x6ab7a0, (void *)variant_hook, "pair: per-tile variant");
-    hook_call(0x68e1d2, 0x696170, (void *)norain_circle_hook, "no rain: play-area effect off after the circle update");
+    // rain-hooks-legacy (test, default on): the 8 hooks the held radius makes the game answer by itself (rain around
+    // the player, health bar circle state x2, weather side x4, no character outside); off = the radius alone
+    int legacy = setting(S_RAIN_HOOKS_LEGACY);
+    hook_call(0x68e1d2, 0x696170, (void *)norain_circle_hook, "no rain: circle radius held, play-area effect off after the circle update");
     hook_call(0x68e1ea, 0x698c90, (void *)norain_circle2_hook, "no rain: play-area effect off after the second circle update");
     hook_call(0x68e229, 0x6953b0, (void *)norain_sound_hook, "no rain: circle edge sound skipped");
-    hook_call(0x68e208, 0x695f80, (void *)norain_player_rain_hook, "no rain: rain around the player skipped");
+    if (legacy) hook_call(0x68e208, 0x695f80, (void *)norain_player_rain_hook, "no rain: rain around the player skipped");
     hook_call(0x68e213, 0x692350, (void *)norain_edge_rain_hook, "no rain: rain along the circle edge skipped");
     hook_call(0x68e21e, 0x694580, (void *)norain_border_hook, "no rain: circle border effects skipped");
-    hook_call(0x7cbf86, 0x68c5f0, (void *)hud_circle_state_hook, "no rain: health bar circle state (1)");
-    hook_call(0x7cee41, 0x68c5f0, (void *)hud_circle_state_hook, "no rain: health bar circle state (2)");
+    if (legacy) hook_call(0x7cbf86, 0x68c5f0, (void *)hud_circle_state_hook, "no rain: health bar circle state (1)");
+    if (legacy) hook_call(0x7cee41, 0x68c5f0, (void *)hud_circle_state_hook, "no rain: health bar circle state (2)");
     hook_call(0x69722c, 0x7c52f0, (void *)hud_circle_notice_hook, "no rain: circle notice skipped");
-    hook_call(0x65ff39, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (1)");
-    hook_call(0x6639c3, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (2)");
-    hook_call(0x664170, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (3)");
-    hook_call(0xef5cdd, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (4)");
+    if (legacy) hook_call(0x65ff39, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (1)");
+    if (legacy) hook_call(0x6639c3, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (2)");
+    if (legacy) hook_call(0x664170, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (3)");
+    if (legacy) hook_call(0xef5cdd, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (4)");
     hook_call(0x693ae8, 0x704cd0, (void *)asset_enable_hook, "no rain: circle far asset disabled (1)");
     hook_call(0x693dc3, 0x704cd0, (void *)asset_enable_hook, "no rain: circle far asset disabled (2)");
-    hook_call(0x3e2a16, 0x68c500, (void *)outside_circle_hook, "no rain: no character outside the circle");
+    if (legacy) hook_call(0x3e2a16, 0x68c500, (void *)outside_circle_hook, "no rain: no character outside the circle");
     hook_call(0x911081, RVA_PIN_ROW_SHOWN, (void *)pin_row_shown_hook, "map pins: woods tiles by the Rotted Woods rule (pin loop)");
     hook_call(0xa5bba1, RVA_PIN_ROW_SHOWN, (void *)pin_row_shown_hook, "map pins: woods tiles by the Rotted Woods rule (second row loop)");
     {
@@ -2984,8 +3013,10 @@ static void hook_acceptance(void) {
             int hooked = c[0] == 0xE8 && memcmp(c + 1, &rel, 4) != 0;
             if (i < 16) n += hooked; else pins += hooked;
         }
-        logf("no rain: %s (%d of 16 hooks: play-area effect off after both circle updates; edge sound, rain around the player, rain along the edge, border effects and circle notice skipped; health bar circle state 0; weather side inside the circle (4); far asset disabled (2); no character outside the circle)",
-             n == 16 ? "in place" : "NOT complete", n);
+        int want = legacy ? 16 : 8;
+        logf("no rain: %s (%d of %d hooks: circle radius held at %.0f and play-area effect off at both circle updates; edge sound, rain along the edge, border effects and circle notice skipped; far asset disabled (2)%s)",
+             n == want ? "in place" : "NOT complete", n, want, CIRCLE_HELD_RADIUS,
+             legacy ? "; legacy: rain around the player skipped, health bar circle state 0, weather side inside the circle (4), no character outside the circle" : "; rain-hooks-legacy off: the 8 consumer hooks are not installed");
         logf("map pins: %s (%d of 2 hooks: woods tiles 44-45 x 36-37 show the Rotted Woods rows%s)", pins == 2 ? "in place" : "NOT complete", pins,
              g_settings[S_ONE_REGION] >= 1 ? "; off for one-region" : "");
     }
@@ -5762,8 +5793,9 @@ static void clock_log(const char *when) {
     char *pa = *(char **)(g_base + RVA_PLAY_AREA_PTR);
     if (!pa) return;
     v = *(unsigned long long *)(pa + PA_TIME);
-    logf("clock: %s: circle clock %02u:%02u:%02u, base rate %.3f, rate %.3f", when, (unsigned)(v >> 34) & 0x1f,
-         (unsigned)(v >> 39) & 0x3f, (unsigned)(v >> 45) & 0x3f, *(float *)(pa + PA_BASE_RATE), *(float *)(pa + PA_RATE));
+    logf("clock: %s: circle clock %02u:%02u:%02u, base rate %.3f, rate %.3f, circle radius %.1f", when, (unsigned)(v >> 34) & 0x1f,
+         (unsigned)(v >> 39) & 0x3f, (unsigned)(v >> 45) & 0x3f, *(float *)(pa + PA_BASE_RATE), *(float *)(pa + PA_RATE),
+         *(float *)(pa + 0x260));
 }
 static void slow_time_frame(int first) {
     if (first) {
