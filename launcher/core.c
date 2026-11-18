@@ -39,7 +39,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 26
+#define BUILD_FORMAT 27
 #define BOSS_DEATHS_MIN 100  // the game (1.3.3) has 158 such flags; fewer = its event scripts changed
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
@@ -1033,9 +1033,8 @@ static buf param_insert_range(buf p, int template_id, int first_id, u32 n, u64 s
 //   applies refId_default +0x04 as a SpEffect, refCategory 2): +0x04 our marker, +0x30 iconId, +0xb8 / +0xc0 its
 //   level-2 / 3 SpEffects off (-1).
 // - ShopLineupParam (0x40): the field merchant (talk t800006000: 3000-3499, 3500-3999 with 7800) sells it as its
-//   fixed rows 3000-3007 (release 0): a copy of 3007 (Small Pouch) at 3349 / 3849 (after the groups' last rows):
-//   +0x04 equipId, +0x08 price, +0x10 stock flag (90990: in no shop row, script or talk script), +0x14 release 0,
-//   +0x18 quantity 1.
+//   fixed rows 3000-3007 (release 0): 3007 / 3507 (the Small Pouch) sell it instead: +0x04 equipId, +0x08 price,
+//   +0x14 release 0, +0x18 quantity 1 (the pouch's own stock flag 90470 stays).
 #define GOODS_PARAM "\\EquipParamGoods.param"
 #define SHOP_PARAM "\\ShopLineupParam.param"
 #define CHALLENGE_SPEFFECT 90071612
@@ -1043,7 +1042,6 @@ static buf param_insert_range(buf p, int template_id, int first_id, u32 n, u64 s
 #define TIER_COUNT 200
 #define CHALLENGE_ICON 21990
 #define CHALLENGE_PRICE 15000
-#define CHALLENGE_STOCK_FLAG 90990
 static int day_flow_rows(buf *sp, buf *goods, buf *shop) {
     u8 *row = NULL;
     buf a = param_insert_sorted(*sp, SPEFFECT_TEMPLATE, CHALLENGE_SPEFFECT, SPEFFECT_SIZE, &row);
@@ -1068,16 +1066,30 @@ static int day_flow_rows(buf *sp, buf *goods, buf *shop) {
     wr32(row + 0x04, CHALLENGE_SPEFFECT);
     wr16(row + 0x30, CHALLENGE_ICON);
     wr32(row + 0xb8, 0xFFFFFFFF), wr32(row + 0xc0, 0xFFFFFFFF);
-    buf h = param_insert_sorted(*shop, 3007, 3349, 0x40, &row), i = {0};
-    if (h.p && rd32(row + 0x04) == 10050) {
-        wr32(row + 0x04, CHALLENGE_GOODS), wr32(row + 0x08, CHALLENGE_PRICE), wr32(row + 0x10, CHALLENGE_STOCK_FLAG), wr32(row + 0x14, 0);
-        wr16(row + 0x18, 1);
-        i = param_insert_sorted(h, 3349, 3849, 0x40, &row);
+    // the merchant's fixed Small Pouch rows (3007 / 3507) sell our item instead: with 8 item slots from the start
+    // (PlayerCommonParam, below) the pouch has nothing left to add
+    int replaced = 0;
+    for (u32 k = 0; k < rd16(shop->p + 0x0A); k++) {
+        int id = (int)rd32(shop->p + 0x40 + k * 24);
+        u8 *r = shop->p + rd64(shop->p + 0x40 + k * 24 + 8);
+        if ((id == 3007 || id == 3507) && rd32(r + 0x04) == 10050) {
+            wr32(r + 0x04, CHALLENGE_GOODS), wr32(r + 0x08, CHALLENGE_PRICE), wr16(r + 0x18, 1), wr32(r + 0x14, 0);
+            replaced++;
+        }
     }
-    free(h.p);
-    if (!i.p) return free(b.p), free(g.p), 0;
-    free(sp->p), free(goods->p), free(shop->p);
-    *sp = b, *goods = g, *shop = i;
+    if (replaced != 2) return free(b.p), free(g.p), 0;
+    free(sp->p), free(goods->p);
+    *sp = b, *goods = g;
+    return 1;
+}
+// PlayerCommonParam row 0: +0xe item slots at the start (4), +0xf the most pouches can reach (8); the count is
+// 0x1401f2370(PlayerGameData + 0x1d8) = min(+0xe + pouches, +0xf) + extra, at most 10 (a constant in the code).
+// Both 8: every slot from the start, a count the game already reaches with pouches. In place.
+static int player_common_slots(buf p) {
+    if (p.n < 0x40 + 24 || rd16(p.p + 0x0A) < 1 || rd32(p.p + 0x40) != 0) return 0;
+    u8 *r = p.p + rd64(p.p + 0x48);
+    if ((u64)(r - p.p) + 0x10 > p.n || r[0xe] != 4 || r[0xf] != 8) return 0;
+    r[0xe] = 8, r[0xf] = 8;
     return 1;
 }
 
@@ -1807,6 +1819,158 @@ static void chest_group_report(buf flags) {
     logf_("%s", line);
 }
 // The map-test tables, changed (maps[t].p stays empty for a table left alone); 0 if one fails.
+// Rows added to a pattern-keyed table (rows of one pattern stay together, in the game's row order): each extra
+// row goes after the last row of its pattern; ids are kept and moved up just enough to stay increasing (as
+// copy_pattern_rows; the ids of these tables are not referenced anywhere we know of). The extra rows' name
+// offsets are those of the row they follow. Empty buf if the table is not a plain fixed-size param.
+typedef struct { int pattern; u8 data[0x20]; } extra_row;
+static buf param_add_pattern_rows(buf p, const extra_row *extra, int n_extra) {
+    buf out = {0};
+    u32 strings_off = rd32(p.p), count = rd16(p.p + 0x0A);
+    u64 size = param_row_size(p), data_start = rd64(p.p + 0x48);
+    if (!size || size > 0x20 || data_start != 0x40 + (u64)count * 24 || strings_off != data_start + count * size || count + n_extra > 0xffff)
+        return out;
+    u32 total = count + (u32)n_extra;
+    u64 shift = (u64)n_extra * (24 + size), new_start = 0x40 + (u64)total * 24;
+    out.n = p.n + shift;
+    out.p = xalloc(out.n);
+    memcpy(out.p, p.p, 0x40);
+    wr32(out.p, (u32)(strings_off + shift));
+    wr16(out.p + 0x0A, total);
+    wr64(out.p + 0x10, rd64(p.p + 0x10) + shift);
+    wr64(out.p + 0x30, new_start);
+    char *used = xalloc((size_t)n_extra + 1);
+    memset(used, 0, (size_t)n_extra + 1);
+    u32 j = 0;
+    int last_id = -1;
+    for (u32 i = 0; i < count; i++) {
+        const u8 *d = p.p + 0x40 + i * 24, *row = p.p + rd64(d + 8);
+        int id = (int)rd32(d) > last_id ? (int)rd32(d) : last_id + 1, pat = (int)rd32(row + 4);
+        u8 *e = out.p + 0x40 + j * 24;
+        wr32(e, (u32)id), wr32(e + 4, 0), wr64(e + 8, new_start + j * size), wr64(e + 16, rd64(d + 16) + shift);
+        memcpy(out.p + new_start + j * size, row, size);
+        j++, last_id = id;
+        int next_pat = i + 1 < count ? (int)rd32(p.p + rd64(p.p + 0x40 + (i + 1) * 24 + 8) + 4) : -1;
+        if (next_pat == pat) continue;
+        for (int k = 0; k < n_extra; k++) {
+            if (used[k] || extra[k].pattern != pat) continue;
+            used[k] = 1, last_id++;
+            e = out.p + 0x40 + j * 24;
+            wr32(e, (u32)last_id), wr32(e + 4, 0), wr64(e + 8, new_start + j * size), wr64(e + 16, rd64(d + 16) + shift);
+            memcpy(out.p + new_start + j * size, extra[k].data, size);
+            wr32(out.p + new_start + j * size + 4, (u32)pat);
+            j++;
+        }
+    }
+    free(used);
+    if (j != total) return free(out.p), (buf){0};  // an extra row for a pattern the table does not have
+    memcpy(out.p + strings_off + shift, p.p + strings_off, p.n - strings_off);
+    return out;
+}
+
+// Day flow, the map tables (after the two-region merge):
+// - MapPatternSet +8 / +0xa / +0xc: the weights of 0 / 1 / 2 camps with a Nightfarer-like invader (rolled once in
+//   the generator: 0x1406bb760 from 0x1406aef1a, RNG 0x140f563c0; params by index 0xc6 SmallBaseAndSpotDefine, 0xc9
+//   SmallbaseInvationNpcParam). Every set of the 320 patterns: (0, 0, 100), always two (the DLL opens them one per
+//   boss).
+// - LotResultMapPatternFlag (0x1c: +4 pattern, +8 set, +0xc modifier, +0x10 event flag, +0x14..+0x1b the pattern's
+//   set / night boss / region, as its own rows): every composition gets the day-1 flag of each event family it
+//   lacks, so the family's handler (common 1121 meteorite, 1124 hordes, 1127 frenzy, 1125 the special one) does not
+//   end at map load; the DLL then starts them one by one (8040, 8055, 8060, 8071). Only day-1 flags: a handler
+//   with both day flags waits for day 2 (7505) first (1121 / 1124: SKIP IF 7701 off / IF 7500; SKIP IF 7721 off /
+//   IF 7505). A composition without a special event gets one kind (pattern % 4): its kind row (set 0, modifier
+//   601..604, flag 8075..8079, as the game's) and its small map (m46_78 Fell Omen, m45_52 bubbles, m45_53 locusts,
+//   m45_55 curse) on up to 8 free attach points among those the game uses for it, outside both regions' tiles and
+//   area codes (LotResultSmallBaseAndSpot 0x18: +4 pattern, +8 attach point, +0xc small map, +0x10 instance).
+static const struct { int flag, modifier, map; } DF_KINDS[4] = {{8075, 604, 4678}, {8076, 603, 4552}, {8078, 601, 4553}, {8079, 602, 4555}};
+static const struct { int set, flag, flag2; } DF_FAMILIES[3] = {{3010, 7701, 7721}, {3030, 7704, 7724}, {3080, 7707, 7727}};
+static int point_outside_regions(buf points, int at) {
+    for (u32 i = 0; i < rd16(points.p + 0x0A); i++) {
+        if ((int)rd32(points.p + 0x40 + i * 24) != at) continue;
+        const u8 *r = points.p + rd64(points.p + 0x40 + i * 24 + 8);
+        int code = (int)rd32(r + 0xc), area = r[4], x = r[5], z = r[6];
+        const region_t *g[2] = {pair_a(), pair_b()};
+        for (int k = 0; k < 2; k++)
+            if (code == g[k]->area || (area == 60 && x >= g[k]->x0 && x <= g[k]->x1 && z >= g[k]->z0 && z <= g[k]->z1)) return 0;
+        return 1;
+    }
+    return 0;
+}
+static int day_flow_maps(buf maps[4], buf points) {
+    buf flags = maps[0], bases = maps[2], sets = maps[3];
+    if (!flags.p || !bases.p || !sets.p) return 0;
+    int camps = 0;
+    for (u32 i = 0; i < rd16(sets.p + 0x0A); i++) {
+        u8 *r = sets.p + rd64(sets.p + 0x40 + i * 24 + 8);
+        if ((int)rd32(sets.p + 0x40 + i * 24) >= 1000) continue;
+        wr16(r + 8, 0), wr16(r + 0xa, 0), wr16(r + 0xc, 100), camps++;
+    }
+    static extra_row xf[TWO_PATTERNS * 6], xb[TWO_PATTERNS * 8];
+    int nf = 0, nb = 0, fam_added = 0, kinds_added = 0, sites = 0;
+    u64 fsize = param_row_size(flags), bsize = param_row_size(bases);
+    if (fsize != 0x1c || bsize != 0x18) return 0;
+    for (int pat = 0; pat < TWO_PATTERNS; pat++) {
+        if (!merged_slot(pat)) continue;
+        const u8 *meta = NULL;
+        int has[8000 - 7700] = {0}, special = 0;
+        for (u32 i = 0; i < rd16(flags.p + 0x0A); i++) {
+            const u8 *r = flags.p + rd64(flags.p + 0x40 + i * 24 + 8);
+            if ((int)rd32(r + 4) != pat) continue;
+            if (!meta) meta = r;
+            int f = (int)rd32(r + 0x10);
+            if (f >= 7700 && f < 8000) has[f - 7700] = 1;
+            if (f >= 8075 && f <= 8079) special = 1;
+        }
+        if (!meta) continue;
+        for (int k = 0; k < 3; k++) {
+            if (has[DF_FAMILIES[k].flag - 7700] || has[DF_FAMILIES[k].flag2 - 7700]) continue;
+            u8 *d = xf[nf].data;
+            memset(d, 0, sizeof xf[nf].data);
+            wr32(d + 8, (u32)DF_FAMILIES[k].set), wr32(d + 0xc, 800), wr32(d + 0x10, (u32)DF_FAMILIES[k].flag);
+            memcpy(d + 0x14, meta + 0x14, 8);
+            xf[nf++].pattern = pat, fam_added++;
+        }
+        if (special || has[7705 - 7700] || has[7725 - 7700]) continue;
+        // the kind's small map: free attach points the game uses for it, outside the regions
+        int kind = pat % 4, picked = 0, donor = -1;
+        for (u32 i = 0; i < rd16(bases.p + 0x0A) && picked < 8; i++) {
+            const u8 *r = bases.p + rd64(bases.p + 0x40 + i * 24 + 8);
+            if ((int)rd32(r + 0xc) != DF_KINDS[kind].map) continue;
+            if (donor < 0) donor = (int)i;
+            int at = (int)rd32(r + 8), taken = 0;
+            for (u32 j = 0; j < rd16(bases.p + 0x0A) && !taken; j++) {
+                const u8 *q = bases.p + rd64(bases.p + 0x40 + j * 24 + 8);
+                taken = (int)rd32(q + 4) == pat && (int)rd32(q + 8) == at;
+            }
+            for (int k = nb - picked; k < nb && !taken; k++) taken = xb[k].pattern == pat && (int)rd32(xb[k].data + 8) == at;
+            if (taken || !point_outside_regions(points, at)) continue;
+            memset(xb[nb].data, 0, sizeof xb[nb].data);
+            memcpy(xb[nb].data, r, 0x18);
+            wr32(xb[nb].data + 8, (u32)at), xb[nb].data[0x10] = (u8)picked;
+            xb[nb++].pattern = pat, picked++;
+        }
+        if (!picked) continue;
+        sites += picked, kinds_added++;
+        u8 *d = xf[nf].data;
+        memset(d, 0, sizeof xf[nf].data);
+        wr32(d + 8, 0), wr32(d + 0xc, (u32)DF_KINDS[kind].modifier), wr32(d + 0x10, (u32)DF_KINDS[kind].flag);
+        memcpy(d + 0x14, meta + 0x14, 8);
+        xf[nf++].pattern = pat;
+        d = xf[nf].data;
+        memset(d, 0, sizeof xf[nf].data);
+        wr32(d + 8, 3040), wr32(d + 0xc, 800), wr32(d + 0x10, 7705);
+        memcpy(d + 0x14, meta + 0x14, 8);
+        xf[nf++].pattern = pat;
+    }
+    buf f2 = param_add_pattern_rows(flags, xf, nf), b2 = nb ? param_add_pattern_rows(bases, xb, nb) : bnd4_copy(bases);
+    if (!f2.p || !b2.p) return free(f2.p), free(b2.p), 0;
+    free(maps[0].p), free(maps[2].p);
+    maps[0] = f2, maps[2] = b2;
+    logf_("Day flow: map sets %d with 2 invader camps; %d family day flags added; %d compositions given a special event kind on %d sites",
+          camps, fam_added, kinds_added, sites);
+    return 1;
+}
+
 static int map_tables(buf bundle, int index[4], buf maps[4]) {
     static const char *const NAMES[4] = {"\\LotResultMapPatternFlag.param", "\\LotResultPlayAreaParam.param",
                                          "\\LotResultSmallBaseAndSpot.param", "\\MapPatternSet.param"};
@@ -1824,6 +1988,7 @@ static int map_tables(buf bundle, int index[4], buf maps[4]) {
         if (!g_set[S_PAIR]) chest_group_report(maps[0]);  // its table is the Rotted Woods' sites
         int d = bnd4_find(bundle, "\\SmallBaseAndSpotDefine.param");
         if (d < 0 || !write_churches(bnd4_file(bundle, d), maps[2], bnd4_file(bundle, ap))) return 0;
+        if (!day_flow_maps(maps, bnd4_file(bundle, ap))) return 0;
     }
     return 1;
 }
@@ -1866,7 +2031,8 @@ static int build_regulation(const char *game_dir) {
         logf_("The game's PlayAreaCreateCommonParam looks different than expected. The game may have been updated; the mod needs an update too.");
     } else if ((goods_index = bnd4_find(bundle, GOODS_PARAM)) < 0 || (shop_index = bnd4_find(bundle, SHOP_PARAM)) < 0 ||
                !(goods = bnd4_copy(bnd4_file(bundle, goods_index))).p || !(shop = bnd4_copy(bnd4_file(bundle, shop_index))).p ||
-               !day_flow_rows(&speffect2, &goods, &shop)) {
+               !day_flow_rows(&speffect2, &goods, &shop) || bnd4_find(bundle, "\\PlayerCommonParam.param") < 0 ||
+               !player_common_slots(bnd4_file(bundle, bnd4_find(bundle, "\\PlayerCommonParam.param")))) {
         logf_("The game's goods, shop or SpEffect params look different than expected (day flow rows). The game may have been updated; the mod needs an update too.");
     } else if (!map_tables(bundle, map_index, maps)) {
         logf_("The game's map pattern tables look different than expected; the two-region maps cannot be built. The game may have been updated; the mod needs an update too.");
@@ -1896,7 +2062,7 @@ static int build_regulation(const char *game_dir) {
         patched = bnd4_replace(step, sp_index, speffect2);
         cur = bnd4_replace(patched, goods_index, goods), free(patched.p), patched = cur;
         cur = bnd4_replace(patched, shop_index, shop), free(patched.p), patched = cur;
-        logf_("Day flow: item %d at the field merchant (rows 3349 / 3849, %d runes), %d enemy tiers", CHALLENGE_GOODS, CHALLENGE_PRICE, TIER_COUNT);
+        logf_("Day flow: item %d at the field merchant (rows 3007 / 3507 instead of the Small Pouch, %d runes), 8 item slots from the start, %d enemy tiers", CHALLENGE_GOODS, CHALLENGE_PRICE, TIER_COUNT);
         for (int t = 0; t < 4; t++)
             if (maps[t].p) cur = bnd4_replace(patched, map_index[t], maps[t]), free(patched.p), patched = cur;
         body = dcx_write(patched);

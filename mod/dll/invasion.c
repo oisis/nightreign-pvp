@@ -2605,6 +2605,11 @@ static void md_frame(DWORD expedition) {  // own expedition, InGame, every frame
     LeaveCriticalSection(&g_flog_lock);
 }
 static void flag_store_hook(char *man, unsigned id, int on) {  // replaces the two calls of 0x60d330
+    if (id == 9013 && on && g_settings[S_BOSS_FLOW] == 4) {  // day flow: the game's all-at-once event start (common 1129)
+        static DWORD told;
+        if (GetTickCount() - told > 60000) told = GetTickCount(), logf("day flow: 9013 (the game's start of every event at once) kept off");
+        return;
+    }
     int before = flag_state_in(man, id);
     ((void (*)(char *, unsigned, int))(g_base + 0x60d330))(man, id, on);
     flag_note(man, id, on, before);

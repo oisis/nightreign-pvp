@@ -53,8 +53,48 @@ static int df_is_player(char *chr) {
         if (((char *(*)(void *, unsigned long long))vt[1])(set, (unsigned long long)i) == chr) return 1;
     return 0;
 }
+// --- Nightfarer-like camps (the launcher makes the generator always roll two: MapPatternSet (0, 0, 100)): their
+// invaders (NpcParam 600030010 ... 600030910, step 100; SmallbaseInvationNpcParam) are created when the map loads.
+// Each is kept disabled (0x608c60(chr, 0), as the hidden bosses) until the squad has killed as many bosses as its
+// place in the order they were first seen (one camp per boss), on every machine.
+static char *g_df_inv_rows[10], *g_df_camp[8];
+static int g_df_inv_ready, g_df_camps, g_df_kills_day, g_df_camp_open[8];
+static char *df_param(const char *type);
+static char *df_param_row(char *f, int id);
+static int df_camp_chr(char *chr) {
+    if (!g_df_inv_ready) {
+        char *f = df_param("NPC_PARAM_ST");
+        for (int k = 0; k < 10; k++) g_df_inv_rows[k] = f ? df_param_row(f, 600030010 + 100 * k) : NULL;
+        g_df_inv_ready = f ? 1 : -1;
+        logf("day flow: camps: invader NpcParam rows %s", f ? "found" : "NOT found");
+    }
+    if (g_df_inv_ready < 0 || IsBadReadPtr(*(void **)chr, 0x1a8)) return 0;
+    char **ref = ((char **(*)(char *))(*(void ***)chr)[0x1a0 / 8])(chr);
+    char *row = ref && !IsBadReadPtr(ref, 8) ? *ref : NULL;
+    for (int k = 0; row && k < 10; k++)
+        if (row == g_df_inv_rows[k]) return 1;
+    return 0;
+}
+static void df_camp_control(char *chr) {
+    int i = 0;
+    while (i < g_df_camps && g_df_camp[i] != chr) i++;
+    if (i == g_df_camps) {
+        if (g_df_camps == 8) return;
+        g_df_camp[g_df_camps++] = chr, g_df_camp_open[i] = 0;
+        logf("day flow: camp %d: invader found (block %08x); opens after %d boss(es)", i + 1, *(unsigned *)(chr + CHR_BLOCK_ID), i + 1);
+    }
+    int open = g_df_kills_day > i || g_df_go;
+    if (open && !g_df_camp_open[i]) {
+        g_df_camp_open[i] = 1;
+        ((char (*)(char *, char))(g_base + 0x608c60))(chr, 1);
+        logf("day flow: camp %d opens (block %08x): its invader enabled", i + 1, *(unsigned *)(chr + CHR_BLOCK_ID));
+    } else if (!open && chr_enabled(chr)) {
+        ((char (*)(char *, char))(g_base + 0x608c60))(chr, 0);
+    }
+}
 static void df_tier_apply(char *chr) {
     if (!chr || IsBadReadPtr(chr, 0x200) || df_is_player(chr)) return;
+    if (!IsBadReadPtr(chr + 0x18, 8) && *(char **)(chr + 0x18) && df_camp_chr(chr)) df_camp_control(chr);
     if (!g_df_rows_ready) {
         for (int k = 1; k <= DF_TIER_COUNT; k++) {
             struct { char *row; unsigned id; unsigned char flag; } ref = {0};
@@ -236,6 +276,42 @@ static void df_lobby_watch(void) {
     }
     if (g_join != 4) seen = 0;
 }
+// --- world events (host): the launcher gives every composition the day-1 flag of each family, so the handlers wait;
+// from the host's level 5 on, every 2 bosses (this day) the next family's start flag goes on as a network flag
+// (0x5e79f0 then 0x5e7470, as 2003[69]): meteorite 8040 (common 1121), hordes 8055 (1124), the special one 8060
+// (1125), frenzy 8071 (1127; only with its tile variants laid out). Each once: the handlers end once started. The
+// game's own all-at-once start 9013 (common 1129, 9:25-16:43) is kept off (flag_store_hook).
+static int g_df_events;
+static DWORD g_df_event_tick;
+static int df_frenzy_tiles(void) {
+    static const unsigned TILES[] = {0x3c2b2640, 0x3c2c2400, 0x3c2c2420, 0x3c2c2440, 0x3c2c2450, 0x3c2c2600, 0x3c2c2630, 0x3c2c2650};
+    char *man = *(char **)(g_base + 0x3c115a8);
+    if (!man) return 0;
+    for (char *e = *(char **)(man + 0x118); e && e < *(char **)(man + 0x120); e += 8)
+        for (unsigned i = 0; i < sizeof TILES / sizeof *TILES; i++)
+            if (*(unsigned *)e == TILES[i]) return 1;
+    return 0;
+}
+static void df_net_flag(int id) {
+    char *man = *(char **)(g_base + 0x3c115a8);
+    if (!man) return;
+    two_flag(id, 1, 1);
+    ((void (*)(char *, int *, char))(g_base + 0x5e7470))(man, &id, 1);
+}
+static void df_events_frame(void) {
+    static const struct { int flag; const char *name; } FAM[4] = {{8040, "meteorite"}, {8055, "hordes"}, {8060, "special event"}, {8071, "frenzy"}};
+    char *gdm = *(char **)(g_base + 0x3c078d0), *pgd = gdm ? *(char **)(gdm + 8) : NULL;
+    int level = pgd && !IsBadReadPtr(pgd, 0x70) ? *(int *)(pgd + 0x68) : 0;
+    if (g_df_events >= 4 || level < 5 || g_df_kills_day < 2 * (g_df_events + 1) || GetTickCount() - g_df_event_tick < 30000) return;
+    int k = g_df_events++;
+    g_df_event_tick = GetTickCount();
+    if (FAM[k].flag == 8071 && !df_frenzy_tiles()) {
+        logf("day flow: event %d (%s) skipped: its tile variants are not laid out", k + 1, FAM[k].name);
+        return;
+    }
+    df_net_flag(FAM[k].flag);
+    logf("day flow: event %d started: %s (flag %d), level %d, %d bosses this day", k + 1, FAM[k].name, FAM[k].flag, level, g_df_kills_day);
+}
 // --- every frame in the field (every machine)
 static void day_flow_frame(int in_world) {
     static int was, marker_was, day2_seen, last_tier = -1, down_last = -1;
@@ -246,17 +322,21 @@ static void day_flow_frame(int in_world) {
     if (!in_world) return;
     if (first) {
         g_df_bosses = g_df_special = g_df_met = g_df_met_at = g_df_after = 0, g_df_day = 1, g_df_go = g_df_used = 0, g_df_seq = 0;
-        g_df_tier = 0, day2_seen = 0, last_tier = -1, marker_was = 0, down_last = -1;
+        g_df_tier = 0, day2_seen = 0, last_tier = -1, marker_was = 0, down_last = -1, g_df_kills_day = 0, g_df_camps = 0;
+        g_df_events = 0, g_df_event_tick = 0;
         InterlockedExchange(&g_df_kills, 0), InterlockedExchange(&g_df_special_kills, 0);
         logf("day flow: expedition start: challenge after %d bosses and the special boss", df_needed());
     }
     if (!day2_seen && bf_flag(7505)) {  // day 2: the game's own day-2 level, our count starts again
         day2_seen = 1, g_df_day = 2;
-        g_df_bosses = g_df_special = g_df_met = g_df_met_at = g_df_after = 0, g_df_go = g_df_used = 0;
+        g_df_bosses = g_df_special = g_df_met = g_df_met_at = g_df_after = 0, g_df_go = g_df_used = 0, g_df_kills_day = 0;
         InterlockedExchange(&g_df_kills, 0), InterlockedExchange(&g_df_special_kills, 0);
-        logf("day flow: day 2 (7505): tier back to 0, count starts again");
+        logf("day flow: day 2 (7505): tier back to 0, count starts again (camps already open stay open; events: each family "
+             "ran at most once, none again)");
     }
     LONG k = InterlockedExchange(&g_df_kills, 0), sk = InterlockedExchange(&g_df_special_kills, 0);
+    g_df_kills_day += (int)(k + sk);
+    if (k > 0 || sk > 0) df_repass("a boss: camps and tier");
     if (k > 0 || sk > 0) {
         if (g_df_met) g_df_after += (int)(k + sk);
         else g_df_bosses += (int)k, g_df_special = g_df_special || sk > 0;
@@ -275,6 +355,7 @@ static void day_flow_frame(int in_world) {
     if (marker && !marker_was) df_item_used();
     marker_was = marker;
     df_lobby_watch();
+    if (g_join != 4) df_events_frame();
     // an ally's final death (downed, then finished or bled out: +0x710 1 -> 0): home, it may join again
     int down = me && !IsBadReadPtr(me, 0x740) ? (unsigned char)me[0x710] : -1;
     if (g_join == 4 && g_as_ally && down_last == 1 && down == 0) join_over("ally's final death");
