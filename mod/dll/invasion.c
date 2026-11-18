@@ -5038,6 +5038,24 @@ static void join_frame(void) {
     steam_watch("join test", g_candidate);
     DWORD waited = GetTickCount() - g_join_tick;
     if (g_join == 1) {
+        // Our role goes into our lobby member data as soon as Steam lists us in the lobby: the host's member
+        // add (and its slot choice, capacity.h slot_alloc) comes only at the session join, ~4 s later (host run
+        // 76: "lobby members 2" at 21:05:57, "got slot" at 21:06:01 with our lobby_state 6). State 6 sets it
+        // again in case the member list was not readable.
+        static DWORD role_for;  // g_join_tick of the join whose role is set
+        if (role_for != g_join_tick && g_diag.set_member && g_diag.member && g_diag.self && g_diag.user && g_steam.mm) {
+            u64 me = g_diag.self(g_diag.user);
+            int n = g_steam.members(g_steam.mm, g_candidate);
+            for (int i = 0; i < n && i < 8; i++)
+                if (g_diag.member(g_steam.mm, g_candidate, i) == me) {
+                    role_for = g_join_tick;
+                    g_diag.set_member(g_steam.mm, g_candidate, LOBBY_ROLE_KEY, g_as_ally ? "ally" : "invader");
+                    g_diag.set_member(g_steam.mm, g_candidate, LOBBY_VER_KEY, MOD_VERSION);
+                    logf("join: in the Steam lobby after %lums, lobby member data %s=%s set", waited, LOBBY_ROLE_KEY,
+                         g_as_ally ? "ally" : "invader");
+                    break;
+                }
+        }
         if (state == 6) {
             g_join = 2;
             g_join_tick = GetTickCount();
