@@ -39,7 +39,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 28
+#define BUILD_FORMAT 29
 #define BOSS_DEATHS_MIN 100  // the game (1.3.3) has 158 such flags; fewer = its event scripts changed
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
@@ -1909,8 +1909,8 @@ static int day_flow_maps(buf maps[4], buf points) {
         if ((int)rd32(sets.p + 0x40 + i * 24) >= 1000) continue;
         wr16(r + 8, 0), wr16(r + 0xa, 0), wr16(r + 0xc, 100), camps++;
     }
-    static extra_row xf[TWO_PATTERNS * 6], xb[TWO_PATTERNS * 8];
-    int nf = 0, nb = 0, fam_added = 0, kinds_added = 0, sites = 0;
+    static extra_row xf[TWO_PATTERNS * 6], xb[TWO_PATTERNS * 40];
+    int nf = 0, nb = 0, fam_added = 0, kinds_added = 0, sites = 0, hordes_added = 0, hordes_sites = 0;
     u64 fsize = param_row_size(flags), bsize = param_row_size(bases);
     if (fsize != 0x1c || bsize != 0x18) return 0;
     for (int pat = 0; pat < TWO_PATTERNS; pat++) {
@@ -1934,10 +1934,52 @@ static int day_flow_maps(buf maps[4], buf points) {
             memcpy(d + 0x14, meta + 0x14, 8);
             xf[nf++].pattern = pat, fam_added++;
         }
+        // the hordes' camps (m46_00..06): the hordes family needs them (common_func 90035040 / 90035045 / 90035042 in
+        // those maps wait for 8055, then a player in the camp's area or 8056; the notice waits for 8057), and the game
+        // places them (32-48, on points 615-662) only in its 16 hordes patterns. A composition without any gets one
+        // camp on each free such point outside the regions, maps 4600..4606 in turn, instances counted per map.
+        int hordes = 0;
+        for (u32 i = 0; i < rd16(bases.p + 0x0A) && !hordes; i++) {
+            const u8 *r = bases.p + rd64(bases.p + 0x40 + i * 24 + 8);
+            hordes = (int)rd32(r + 4) == pat && rd32(r + 0xc) >= 4600 && rd32(r + 0xc) <= 4606;
+        }
+        if (!hordes && nb < TWO_PATTERNS * 40 - 64) {
+            static const u8 *donor_of[7];
+            int seen_pt[64] = {0}, inst[7] = {0}, placed = 0;
+            for (u32 i = 0; i < rd16(bases.p + 0x0A); i++) {
+                const u8 *r = bases.p + rd64(bases.p + 0x40 + i * 24 + 8);
+                int m = (int)rd32(r + 0xc), at = (int)rd32(r + 8);
+                if (m < 4600 || m > 4606) continue;
+                if (!donor_of[m - 4600]) donor_of[m - 4600] = r;
+                if (at < 615 || at > 662 || seen_pt[at - 615]) continue;
+                seen_pt[at - 615] = 1;
+                int taken = 0;
+                for (u32 j = 0; j < rd16(bases.p + 0x0A) && !taken; j++) {
+                    const u8 *q = bases.p + rd64(bases.p + 0x40 + j * 24 + 8);
+                    taken = (int)rd32(q + 4) == pat && (int)rd32(q + 8) == at;
+                }
+                if (taken || !point_outside_regions(points, at)) continue;
+                int mm = placed % 7;
+                const u8 *d = donor_of[mm] ? donor_of[mm] : r;
+                memset(xb[nb].data, 0, sizeof xb[nb].data);
+                memcpy(xb[nb].data, d, 0x18);
+                wr32(xb[nb].data + 8, (u32)at), wr32(xb[nb].data + 0xc, (u32)(4600 + mm)), xb[nb].data[0x10] = (u8)inst[mm]++;
+                xb[nb++].pattern = pat, placed++;
+            }
+            if (placed) hordes_added++, hordes_sites += placed;
+        }
         if (special || has[7705 - 7700] || has[7725 - 7700]) continue;
         // the kind's small map: free attach points the game uses for it, outside the regions
-        int kind = pat % 4, picked = 0, donor = -1;
-        for (u32 i = 0; i < rd16(bases.p + 0x0A) && picked < 8; i++) {
+        // a kind whose small map the composition already has (rows the merge took from the added region's pattern,
+        // without that pattern's flag rows): that kind, its flag rows only
+        int kind = pat % 4, picked = 0, donor = -1, have_map = 0;
+        for (int kk = 0; kk < 4 && !have_map; kk++)
+            for (u32 i = 0; i < rd16(bases.p + 0x0A) && !have_map; i++) {
+                const u8 *r = bases.p + rd64(bases.p + 0x40 + i * 24 + 8);
+                if ((int)rd32(r + 4) == pat && (int)rd32(r + 0xc) == DF_KINDS[kk].map) kind = kk, have_map = 1;
+            }
+        if (have_map) picked = -1;  // no new sites
+        for (u32 i = 0; i < rd16(bases.p + 0x0A) && picked >= 0 && picked < 8; i++) {
             const u8 *r = bases.p + rd64(bases.p + 0x40 + i * 24 + 8);
             if ((int)rd32(r + 0xc) != DF_KINDS[kind].map) continue;
             if (donor < 0) donor = (int)i;
@@ -1954,7 +1996,8 @@ static int day_flow_maps(buf maps[4], buf points) {
             xb[nb++].pattern = pat, picked++;
         }
         if (!picked) continue;
-        sites += picked, kinds_added++;
+        if (picked > 0) sites += picked;
+        kinds_added++;
         u8 *d = xf[nf].data;
         memset(d, 0, sizeof xf[nf].data);
         wr32(d + 8, 0), wr32(d + 0xc, (u32)DF_KINDS[kind].modifier), wr32(d + 0x10, (u32)DF_KINDS[kind].flag);
@@ -1970,8 +2013,8 @@ static int day_flow_maps(buf maps[4], buf points) {
     if (!f2.p || !b2.p) return free(f2.p), free(b2.p), 0;
     free(maps[0].p), free(maps[2].p);
     maps[0] = f2, maps[2] = b2;
-    logf_("Day flow: map sets %d with 2 invader camps; %d family day flags added; %d compositions given a special event kind on %d sites",
-          camps, fam_added, kinds_added, sites);
+    logf_("Day flow: map sets %d with 2 invader camps; %d family day flags added; %d compositions given a special event kind on %d sites; "
+          "%d given hordes camps (%d sites)", camps, fam_added, kinds_added, sites, hordes_added, hordes_sites);
     return 1;
 }
 

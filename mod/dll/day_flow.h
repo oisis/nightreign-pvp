@@ -315,20 +315,12 @@ static void df_lobby_watch(void) {
 }
 // --- world events (host): the launcher gives every composition the day-1 flag of each family, so the handlers wait;
 // from the host's level 5 on, every 2 bosses (this day) the next family's start flag goes on as a network flag
-// (0x5e79f0 then 0x5e7470, as 2003[69]): meteorite 8040 (common 1121), hordes 8055 (1124), the special one 8060
-// (1125), frenzy 8071 (1127; only with its tile variants laid out). Each once: the handlers end once started. The
+// (0x5e79f0 then 0x5e7470, as 2003[69]): meteorite 8040 (common 1121), hordes 8055 (1124: armed; the hordes rise when
+// a player enters one of their camps, m46_00..06, which the launcher adds), the special one 8060 (1125). Each once:
+// the handlers end once started. The
 // game's own all-at-once start 9013 (common 1129, 9:25-16:43) is kept off (flag_store_hook).
 static int g_df_events;
 static DWORD g_df_event_tick;
-static int df_frenzy_tiles(void) {
-    static const unsigned TILES[] = {0x3c2b2640, 0x3c2c2400, 0x3c2c2420, 0x3c2c2440, 0x3c2c2450, 0x3c2c2600, 0x3c2c2630, 0x3c2c2650};
-    char *man = *(char **)(g_base + 0x3c115a8);
-    if (!man) return 0;
-    for (char *e = *(char **)(man + 0x118); e && e < *(char **)(man + 0x120); e += 8)
-        for (unsigned i = 0; i < sizeof TILES / sizeof *TILES; i++)
-            if (*(unsigned *)e == TILES[i]) return 1;
-    return 0;
-}
 static void df_net_flag(int id) {
     char *man = *(char **)(g_base + 0x3c115a8);
     if (!man) return;
@@ -336,16 +328,14 @@ static void df_net_flag(int id) {
     ((void (*)(char *, int *, char))(g_base + 0x5e7470))(man, &id, 1);
 }
 static void df_events_frame(void) {
-    static const struct { int flag; const char *name; } FAM[4] = {{8040, "meteorite"}, {8055, "hordes"}, {8060, "special event"}, {8071, "frenzy"}};
+    // frenzy (8071) is not started here: 8071 is the game's "a player reached the flame" (common_func 90035073: the
+    // player has SpEffect 16611), and the family waits for it by itself once its day flag is on (launcher)
+    static const struct { int flag; const char *name; } FAM[3] = {{8040, "meteorite"}, {8055, "hordes"}, {8060, "special event"}};
     char *gdm = *(char **)(g_base + 0x3c078d0), *pgd = gdm ? *(char **)(gdm + 8) : NULL;
     int level = pgd && !IsBadReadPtr(pgd, 0x70) ? *(int *)(pgd + 0x68) : 0;
-    if (g_df_events >= 4 || level < 5 || g_df_kills_day < 2 * (g_df_events + 1) || GetTickCount() - g_df_event_tick < 30000) return;
+    if (g_df_events >= 3 || level < 5 || g_df_kills_day < 2 * (g_df_events + 1) || GetTickCount() - g_df_event_tick < 30000) return;
     int k = g_df_events++;
     g_df_event_tick = GetTickCount();
-    if (FAM[k].flag == 8071 && !df_frenzy_tiles()) {
-        logf("day flow: event %d (%s) skipped: its tile variants are not laid out", k + 1, FAM[k].name);
-        return;
-    }
     df_net_flag(FAM[k].flag);
     logf("day flow: event %d started: %s (flag %d), level %d, %d bosses this day", k + 1, FAM[k].name, FAM[k].flag, level, g_df_kills_day);
 }
