@@ -207,6 +207,14 @@ static char *df_param_row(char *f, int id) {
     return NULL;
 }
 static float df_abs(float v) { return v < 0 ? -v : v; }
+// The warp fails when the destination is not in the point manager (0x14060b540 returns 0 when
+// 0x1405fc6f0([0x143c11848], entity), a std::map lookup by entity id, gives nothing): deck test of 4665420, final
+// circle at m60_45_39, the player elsewhere. It is retried every second for 2 minutes (the point may appear as the
+// player nears the circle); every attempt says whether the point was found.
+static int df_point_known(int entity) {
+    char *pm = *(char **)(g_base + 0x3c11848);
+    return pm && !IsBadReadPtr(pm + 0x10, 8) && ((char *(*)(char *, unsigned))(g_base + 0x5fc6f0))(pm, (unsigned)entity) != NULL;
+}
 static int df_warp(void) {
     char *pa = *(char **)(g_base + RVA_PLAY_AREA_PTR), *me = local_player();
     char *areas = df_param("PLAY_AREA_CREATE_PARAM_ST"), *points = df_param("SMALLBASE_AND_SPOT_ATTACH_POINT_ST");
@@ -221,10 +229,10 @@ static int df_warp(void) {
     }
     char *pt = row ? df_param_row(points, *(int *)(row + 0x24)) : NULL;
     if (!pt) return logf("day flow: warp: no site for the final circle (block %08x, row %d)", *(unsigned *)fin, row_id), 0;
-    int who = 10000, dest = *(int *)(pt + 0x14);
-    unsigned char got = (unsigned char)((unsigned long long (*)(int *, int *, char))(g_base + 0x5f1a00))(&who, &dest, 1);
-    logf("day flow: warp to the night boss's site (circle row %d, attach point %d, entity %d): %s", row_id, *(int *)(row + 0x24), dest,
-         got ? "done" : "FAILED");
+    int who = 10000, dest = *(int *)(pt + 0x14), known = df_point_known(dest);
+    unsigned char got = known ? (unsigned char)((unsigned long long (*)(int *, int *, char))(g_base + 0x5f1a00))(&who, &dest, 1) : 0;
+    logf("day flow: warp to the night boss's site (circle row %d, attach point %d, entity %d): point %s, %s", row_id, *(int *)(row + 0x24), dest,
+         known ? "known" : "not in the point manager", got ? "done" : "not done");
     return got;
 }
 // --- the clock (host; joiners take it from the host): runs to DF_HOLD_H:00:00 (18:00, the owner: daylight until the challenge) and is held there (both clocks' rates 0,
@@ -263,6 +271,7 @@ static void bf4_frame(int first) {
 // 3 = goods) and the progress is shown. Otherwise the challenge starts: the host publishes it in its lobby; an ally
 // in its member data, which the host takes over.
 static int g_df_seq;  // challenges published / seen this expedition
+static DWORD g_df_warp_until;  // retrying the warp until then (0: done or given up)
 static int g_df_used_here;  // this machine's player used the item for the challenge (the item is removed when it starts)
 static void df_start_local(const char *who) {
     g_df_go = 1, g_df_used = 1;
@@ -274,7 +283,7 @@ static void df_start_local(const char *who) {
     }
     notice_with(131184, NULL);
     logf("day flow: day %d's challenge (%s): warp, night", g_df_day, who);
-    df_warp();
+    g_df_warp_until = df_warp() ? 0 : GetTickCount() + 120000;
     df_repass("challenge: night bosses get the tier");
 }
 static void df_item_used(void) {
@@ -332,7 +341,7 @@ static void df_lobby_watch(void) {
 // a player enters one of their camps, m46_00..06, which the launcher adds), the special one 8060 (1125). Each once:
 // the handlers end once started. The
 // game's own all-at-once start 9013 (common 1129, 9:25-16:43) is kept off (flag_store_hook).
-static int g_df_events;
+static int g_df_events, g_df_started;
 static DWORD g_df_event_tick;
 static void df_net_flag(int id) {
     char *man = *(char **)(g_base + 0x3c115a8);
@@ -346,9 +355,28 @@ static void df_events_frame(void) {
     static const struct { int flag; const char *name; } FAM[3] = {{8040, "meteorite"}, {8055, "hordes"}, {8060, "special event"}};
     char *gdm = *(char **)(g_base + 0x3c078d0), *pgd = gdm ? *(char **)(gdm + 8) : NULL;
     int level = pgd && !IsBadReadPtr(pgd, 0x70) ? *(int *)(pgd + 0x68) : 0;
-    if (g_df_events >= 3 || level < 5 || g_df_kills_day < 2 * (g_df_events + 1) || GetTickCount() - g_df_event_tick < 30000) return;
+    if (g_df_events >= 3 || level < 5 || g_df_kills_day < 2 * (g_df_started + 1) || GetTickCount() - g_df_event_tick < 30000) return;
     int k = g_df_events++;
     g_df_event_tick = GetTickCount();
+    // a family's scripts are in its own small maps (meteorite m20 / m21: one in the game's 19 meteorite patterns, at a
+    // point 100-117; hordes m46_00..06; the special kinds m46_78 / m45_52 / 53 / 55): none on this map, no event
+    static const struct { int lo, hi; } MAPS[3] = {{2000, 2199}, {4600, 4606}, {4500, 4699}};
+    int present = 0;
+    char *lots = df_param("LOT_RESULT_SMALLBASE_AND_SPOT_ST"), *gm = *(char **)(g_base + 0x3c13258);
+    for (int i = 0; lots && gm && i < *(unsigned short *)(lots + 0xa) && !present; i++) {
+        char *r = lots + *(unsigned long long *)(lots + 0x40 + i * 0x18 + 8);
+        unsigned pat = *(unsigned *)(r + 4);
+        int m = *(int *)(r + 0xc);
+        if (pat != *(unsigned *)(gm + 0xb48) && pat != *(unsigned *)(gm + 0xb4c)) continue;
+        if (k == 2) present = m == 4678 || m == 4552 || m == 4553 || m == 4555;
+        else present = m >= MAPS[k].lo && m <= MAPS[k].hi;
+    }
+    if (!present) {
+        logf("day flow: event %d (%s) skipped: its small maps are not on this map", k + 1, FAM[k].name);
+        g_df_event_tick = 0;  // the next family at once, on the same 2 bosses
+        return;
+    }
+    g_df_started++;
     df_net_flag(FAM[k].flag);
     logf("day flow: event %d started: %s (flag %d), level %d, %d bosses this day", k + 1, FAM[k].name, FAM[k].flag, level, g_df_kills_day);
 }
@@ -363,9 +391,12 @@ static void day_flow_frame(int in_world) {
     if (first) {
         g_df_bosses = g_df_special = g_df_met = g_df_met_at = g_df_after = 0, g_df_day = 1, g_df_go = g_df_used = 0, g_df_seq = 0;
         g_df_tier = 0, day2_seen = 0, last_tier = -1, marker_was = 0, down_last = -1, g_df_kills_day = 0, g_df_camps = 0, g_df_ninv = 0, g_df_notice_due = 0;
-        g_df_events = 0, g_df_event_tick = 0;
+        g_df_events = 0, g_df_started = 0, g_df_event_tick = 0;
         InterlockedExchange(&g_df_kills, 0), InterlockedExchange(&g_df_special_kills, 0);
-        logf("day flow: expedition start: challenge after %d bosses and the special boss", df_needed());
+        char *gm0 = *(char **)(g_base + 0x3c13258);
+        logf("day flow: expedition start (pattern %u / %u): challenge after %d bosses and the special boss", gm0 ? *(unsigned *)(gm0 + 0xb48) : 0,
+             gm0 ? *(unsigned *)(gm0 + 0xb4c) : 0, df_needed());
+        g_df_warp_until = 0;
     }
     if (!day2_seen && bf_flag(7505)) {  // day 2: the game's own day-2 level, our count starts again
         day2_seen = 1, g_df_day = 2;
@@ -398,6 +429,11 @@ static void day_flow_frame(int in_world) {
     int marker = me && speffect_on(me, DF_MARKER);
     if (marker && !marker_was) df_item_used();
     marker_was = marker;
+    if (g_df_warp_until) {
+        static DWORD next;
+        if ((int)(GetTickCount() - g_df_warp_until) >= 0) g_df_warp_until = 0, logf("day flow: warp given up after 2 minutes");
+        else if ((int)(GetTickCount() - next) >= 0 && (next = GetTickCount() + 1000, df_warp())) g_df_warp_until = 0;
+    }
     df_lobby_watch();
     if (g_join != 4) df_events_frame();
     // solo (our own expedition, nobody else in the session): every death is final (no downed state, nobody to revive),
