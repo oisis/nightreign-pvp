@@ -577,6 +577,7 @@ static void **session_impl(char *sm) {
 // takes no invader (3:1, 2:2, 3:2 need more slots).
 // With the capacity patch (4 remote slots, 5 players): solo host 1 invader, squad of 2 or 3 up to 2; squad <= 3.
 #define SESSION_PLAYERS_MAX ((unsigned)g_cap_remote + 1)
+static int g_df_used;  // day_flow.h: this day's challenge was taken
 static unsigned invaders_allowed(unsigned squad) {
     static const unsigned table3[] = {0, 1, 1, 0}, table5[] = {0, 1, 2, 2};
     const unsigned *t = g_cap_remote == 4 ? table5 : table3;
@@ -4555,7 +4556,7 @@ static void lobby_mark(void) {
         if (member_ally(g_lobby, id)) allies++;
         else others++;
     }
-    unsigned key = members | (unsigned)(in_lobby & 0xff) << 8 | allies << 16;
+    unsigned key = members | (unsigned)(in_lobby & 0xff) << 8 | allies << 16 | (unsigned)(g_df_used != 0) << 24;
     if (key == g_marked_squad) return;
     g_marked_squad = key;
     unsigned squad = g_squad + allies, allowed = invaders_allowed(squad);
@@ -4564,6 +4565,9 @@ static void lobby_mark(void) {
     if (free_slots > room) free_slots = room;
     if (ally_free > room) ally_free = room;
     if (g_party_host && !g_in_expedition) free_slots = 0;  // no invaders before the host is in its expedition
+    // nor after this day's challenge (day_flow.h: a joining invader leaves at once then, df_lobby_watch); from day 2
+    // (7505) on there is room again, until day 2's challenge
+    if (g_df_used) free_slots = 0;
     char text[16];
     snprintf(text, sizeof text, "%u", squad);
     lobby_set(LOBBY_SQUAD_KEY, text);
