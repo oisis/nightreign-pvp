@@ -1699,9 +1699,13 @@ static void flask_set_logged(unsigned site, unsigned caller, char *pgd, unsigned
     ((void (*)(char *, unsigned, unsigned))(g_base + 0x20d9d0))(pgd, hp, fp);
     if (!pgd || g_flask_lines >= 200) return;
     g_flask_lines++;
-    logf("flasks: set at %x%s%x (%s): HP %u -> %u (asked %u), FP %u -> %u, added in the expedition (+0x1a8) %d -> %d", site,
-         caller ? ", caller " : "", caller, pgd == mine ? "local player" : "other player data", b_hp, (unsigned char)pgd[0xff], hp & 0xff, b_fp,
+    char by[32] = "";
+    if (caller) snprintf(by, sizeof by, ", caller %x", caller);
+    logf("flasks: set at %x%s (%s): HP %u -> %u (asked %u), FP %u -> %u, added in the expedition (+0x1a8) %d -> %d", site, by,
+         pgd == mine ? "local player" : "other player data", b_hp, (unsigned char)pgd[0xff], hp & 0xff, b_fp,
          (unsigned char)pgd[0x100], b_add, *(int *)(pgd + 0x1a8));
+    if (site == 0xfd912e && pgd == mine && (unsigned char)pgd[0xff] > b_hp)
+        logf("flasks: church charge +%u: HP flask charges now %u", (unsigned char)pgd[0xff] - b_hp, (unsigned char)pgd[0xff]);
 }
 static void flask_call_hook(char *pgd, unsigned hp, unsigned fp) {
     flask_set_logged((unsigned)((char *)__builtin_return_address(0) - g_base) - 5, 0, pgd, hp, fp);
@@ -3042,6 +3046,13 @@ static void two_regions_flasks(void) {
     // Churches already taken are in the charges (run 48: one taken before this ran was counted twice). The
     // church script raises +0x1a8 by one for each (0x5fdad0), so: charges now + churches not yet taken >= 7.
     int taken = *(int *)(pgd + 0x1a8), left;
+    // day flow (boss-flow 4, the owner's rule): the start stays the game's (3) and every church gives its +1 through
+    // the game's own church handling (0xfd90e0 -> 0x20d9d0, logged as "church charge"). Deck test of 9330160: this
+    // rule raised 3 -> 6 at the start (1 church counted on pattern 45, the owner found 2), the church then 6 -> 7.
+    if (g_settings[S_BOSS_FLOW] == 4) {
+        logf("two-regions: flasks: %u HP charges at the start, left as the game has it (boss-flow 4: +1 per church)", hp);
+        return;
+    }
     if (churches < 0) { logf("two-regions: flasks: no church count for pattern %u; left alone", pat); return; }
     left = churches - taken > 0 ? churches - taken : 0;
     extra = 7 - hp - left;
