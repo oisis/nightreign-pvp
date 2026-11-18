@@ -215,6 +215,41 @@ static int df_point_known(int entity) {
     char *pm = *(char **)(g_base + 0x3c11848);
     return pm && !IsBadReadPtr(pm + 0x10, 8) && ((char *(*)(char *, unsigned))(g_base + 0x5fc6f0))(pm, (unsigned)entity) != NULL;
 }
+// The game's own way to an unloaded spot: the death restart (CS::CSLuaEventScriptImitation::CSDeathRestartEvent,
+// 0x1405c38f0 -> states 0x1405c3670 / 0x1405c37b0 / 0x1405c4360) asks the world for the respawn block when it is not
+// loaded (0x140639150(mgr [0x143c123f8], &block) false): 0x140639760(mgr, &block, &pos, &rot) with the default
+// position / rotation (0x143ab9b10 / 0x1446a9490), waits until no load is pending ([mgr +0x10] +0x8880 == -1, 0x140639220)
+// and then places the character. The same queue here, without the death and its level setter (0x140729200, the revive's
+// first call): the final circle's tile block as laid out (flag manager's tile list +0x118, the variant included); once
+// the load is done and the site's point is known, the warp below puts the player on it.
+static int df_arena_block(unsigned *block) {
+    char *pa = *(char **)(g_base + RVA_PLAY_AREA_PTR), *man = *(char **)(g_base + 0x3c115a8);
+    if (!pa || !man) return 0;
+    unsigned char *fin = (unsigned char *)(pa + 0x190 + 0x20 * 2);
+    for (char *e = *(char **)(man + 0x118); e && e < *(char **)(man + 0x120); e += 8) {
+        unsigned m = *(unsigned *)e;
+        if (m >> 24 == fin[0] && (m >> 16 & 0xff) == fin[1] && (m >> 8 & 0xff) == fin[2]) return *block = m, 1;
+    }
+    return 0;
+}
+static DWORD g_df_load_until;  // waiting for the arena block's load (0: not waiting)
+static int df_arena_load(void) {
+    char *mgr = *(char **)(g_base + 0x3c123f8);
+    unsigned block;
+    if (!mgr || !df_arena_block(&block)) return logf("day flow: arena load: no world manager or no laid-out tile for the final circle"), 0;
+    unsigned b = block;
+    if (((char (*)(char *, unsigned *))(g_base + 0x639150))(mgr, &b)) return logf("day flow: arena block %08x already loaded", block), 1;
+    b = block;
+    ((void (*)(char *, unsigned *, void *, void *))(g_base + 0x639760))(mgr, &b, (void *)(g_base + 0x3ab9b10), (void *)(g_base + 0x46a9490));
+    char *rp = *(char **)(g_base + 0x3c17c88);
+    logf("day flow: arena block %08x not loaded: load queued as the death restart does (respawn manager's block %08x)", block,
+         rp ? *(unsigned *)(rp + 0x18) : 0);
+    return 1;
+}
+static int df_load_pending(void) {
+    char *mgr = *(char **)(g_base + 0x3c123f8), *w = mgr ? *(char **)(mgr + 0x10) : NULL;
+    return !w || IsBadReadPtr(w + 0x8880, 4) || *(int *)(w + 0x8880) != -1 || *(int *)(mgr + 0xf0) != -1;
+}
 static int df_warp(void) {
     char *pa = *(char **)(g_base + RVA_PLAY_AREA_PTR), *me = local_player();
     char *areas = df_param("PLAY_AREA_CREATE_PARAM_ST"), *points = df_param("SMALLBASE_AND_SPOT_ATTACH_POINT_ST");
@@ -283,7 +318,11 @@ static void df_start_local(const char *who) {
     }
     notice_with(131184, NULL);
     logf("day flow: day %d's challenge (%s): warp, night", g_df_day, who);
-    g_df_warp_until = df_warp() ? 0 : GetTickCount() + 120000;
+    g_df_warp_until = 0, g_df_load_until = 0;
+    if (!df_warp()) {
+        if (df_arena_load()) g_df_load_until = GetTickCount() + 30000;
+        else g_df_warp_until = GetTickCount() + 120000;  // fallback: retry while the player nears the circle
+    }
     df_repass("challenge: night bosses get the tier");
 }
 static void df_item_used(void) {
@@ -396,7 +435,7 @@ static void day_flow_frame(int in_world) {
         char *gm0 = *(char **)(g_base + 0x3c13258);
         logf("day flow: expedition start (pattern %u / %u): challenge after %d bosses and the special boss", gm0 ? *(unsigned *)(gm0 + 0xb48) : 0,
              gm0 ? *(unsigned *)(gm0 + 0xb4c) : 0, df_needed());
-        g_df_warp_until = 0;
+        g_df_warp_until = 0, g_df_load_until = 0;
     }
     if (!day2_seen && bf_flag(7505)) {  // day 2: the game's own day-2 level, our count starts again
         day2_seen = 1, g_df_day = 2;
@@ -429,6 +468,19 @@ static void day_flow_frame(int in_world) {
     int marker = me && speffect_on(me, DF_MARKER);
     if (marker && !marker_was) df_item_used();
     marker_was = marker;
+    if (g_df_load_until) {  // the arena block's load: warp once it is done and the site is known
+        static DWORD next;
+        if ((int)(GetTickCount() - g_df_load_until) >= 0) {
+            char *mgr = *(char **)(g_base + 0x3c123f8);
+            int left = mgr && *(int *)(mgr + 0xf0) != -1;
+            if (left) *(int *)(mgr + 0xf0) = -1;  // not applied: no stale queued position for a later map move
+            g_df_load_until = 0, g_df_warp_until = GetTickCount() + 120000;
+            logf("day flow: arena load not done after 30 s%s: retrying the warp as a fallback", left ? " (queued position dropped)" : "");
+        } else if ((int)(GetTickCount() - next) >= 0 && !df_load_pending()) {
+            next = GetTickCount() + 500;
+            if (df_warp()) g_df_load_until = 0;
+        }
+    }
     if (g_df_warp_until) {
         static DWORD next;
         if ((int)(GetTickCount() - g_df_warp_until) >= 0) g_df_warp_until = 0, logf("day flow: warp given up after 2 minutes");
