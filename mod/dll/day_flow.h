@@ -143,9 +143,10 @@ static int df_warp(void) {
          got ? "done" : "FAILED");
     return got;
 }
-// --- the clock (host; joiners take it from the host): runs to 22:00:00 and is held there (both clocks' rates 0,
+// --- the clock (host; joiners take it from the host): runs to DF_HOLD_H:00:00 (18:00, the owner: daylight until the challenge) and is held there (both clocks' rates 0,
 // as boss-flow 3) until the challenge; then 23:00:00 (0x68ff30, as boss-flow 1) and the game's own night follows.
-// Day 2 (7505): held again at 22:00 until the second challenge.
+// Day 2 (7505): held again at DF_HOLD_H:00 until the second challenge. The jump to 23:00 makes it dark at once.
+#define DF_HOLD_H 18
 static void bf4_frame(int first) {
     static int held, released_day;
     static float base_pa, base_clock;
@@ -164,10 +165,10 @@ static void bf4_frame(int first) {
     if (released_day == g_df_day) return;
     unsigned long long v = *(unsigned long long *)(pa + PA_TIME);
     unsigned secs = (((unsigned)(v >> 34) & 0x1f) * 60 + ((unsigned)(v >> 39) & 0x3f)) * 60 + ((unsigned)(v >> 45) & 0x3f);
-    if (secs >= 22 * 3600 && secs < 23 * 3600) {
+    if (secs >= DF_HOLD_H * 3600 && secs < 23 * 3600) {
         if (!held) {
-            ((void (*)(char *, int, int, int))(g_base + RVA_PA_SET_TIME))(pa, 22, 0, 0);
-            held = 1, logf("clock: boss flow 4: day %d at 22:00:00, held until the challenge", g_df_day);
+            ((void (*)(char *, int, int, int))(g_base + RVA_PA_SET_TIME))(pa, DF_HOLD_H, 0, 0);
+            held = 1, logf("clock: boss flow 4: day %d at %d:00:00, held until the challenge", g_df_day, DF_HOLD_H);
         }
         *(float *)(pa + PA_RATE) = 0.0f, *(float *)(pa + PA_BASE_RATE) = 0.0f;
         *(float *)(clock + CLOCK_RATE) = 0.0f, *(float *)(clock + CLOCK_BASE_RATE) = 0.0f;
