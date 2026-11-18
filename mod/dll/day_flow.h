@@ -1,5 +1,5 @@
 // Day flow (boss-flow 4, the owner's design of 2026-11-18): the day is free play; the night comes when the squad
-// uses our item "Challenge the Night" (goods 1291, sold by the field merchant), which works once 5 bosses and the
+// uses our item "Challenge the Night" (goods 1291, sold by the field merchant), which works once 6 bosses and the
 // region's special boss (the Mountaintop's dragon or the Rotted Woods' Captain) are dead. Each boss makes the
 // enemies stronger: +5 % HP and damage per boss until the condition is met, then +50 % per boss. Rows (launcher,
 // day_flow_rows): SpEffect 90071612 = the item's use marker (1 s), 90071700 + k = an enemy tier of +5 % * k.
@@ -8,7 +8,7 @@
 #define DF_MARKER       90071612
 #define DF_TIER_FIRST   90071700
 #define DF_TIER_COUNT   200
-#define DF_BOSSES       5
+#define DF_BOSSES       6
 #define LOBBY_CHAL_KEY  "nrpvp_chal"   // host lobby: the challenge's number this expedition ("1", "2"); members: the same as member data
 // The special bosses (death flags, 2003[69] after death; see 08-flagi-gry): the Mountaintop's ice dragon
 // (m60_42_38_10, 42_39_10, 43_39_10) and the Captain of the Rotted Woods (m60_45_36_30).
@@ -28,11 +28,37 @@ static int df_target_tier(void) {
     int t = g_df_met ? g_df_met_at * 5 + g_df_after * 50 : g_df_bosses * 5;
     return t > DF_TIER_COUNT * 5 ? DF_TIER_COUNT * 5 : t;
 }
+// The summon message's time on screen is not in its data (SummonMsgData 0x1408b3240: vtable, priority, flag, text;
+// no time field) and the queue's update is protected code, so the owner's ~5 s comes from showing it a second time:
+// once it has left the screen with the queue idle, under 4 s after it was queued (df_notice_frame, which logs how
+// long the first showing was on screen).
+static int g_df_reshow_id, g_df_reshow_seen;
+static char g_df_reshow_arg[24];
+static DWORD g_df_reshow_at;
+static void df_notice_long(int id, const char *arg) {
+    notice_with(id, arg);
+    g_df_reshow_id = id, g_df_reshow_seen = 0, g_df_reshow_at = GetTickCount();
+    snprintf(g_df_reshow_arg, sizeof g_df_reshow_arg, "%s", arg ? arg : "");
+}
+static void df_notice_frame(void) {
+    if (!g_df_reshow_id) return;
+    char *q = summon_queue();
+    int on = q && *(short *)(q + SMQ_CURRENT_PRIORITY) >= 0, idle = q && !on && *(int *)(q + SMQ_WAITING_COUNT) == 0;
+    DWORD t = GetTickCount() - g_df_reshow_at;
+    if (on) g_df_reshow_seen = 1;
+    else if (g_df_reshow_seen && idle) {
+        int id = g_df_reshow_id;
+        g_df_reshow_id = 0;
+        logf("day flow: notice %d left the screen %lu ms after it was queued%s", id, t, t < 4000 ? ": shown once more" : "");
+        if (t < 4000) notice_with(id, *g_df_reshow_arg ? g_df_reshow_arg : NULL);
+    }
+    if (t > 15000) g_df_reshow_id = 0;
+}
 static void df_progress_notice(void) {
-    char arg[16];
-    snprintf(arg, sizeof arg, "%d/%d", g_df_bosses < df_needed() ? g_df_bosses : df_needed(), df_needed());
-    if (g_df_met) notice_with(131182, NULL);
-    else notice_with(g_df_special ? 131181 : 131180, arg);
+    char arg[24];
+    snprintf(arg, sizeof arg, "%d/%d|%d", g_df_bosses < df_needed() ? g_df_bosses : df_needed(), df_needed(), df_needed());
+    if (g_df_met) df_notice_long(131182, NULL);
+    else df_notice_long(g_df_special ? 131181 : 131180, arg);
 }
 // --- enemy tiers: through the game's own re-apply of the player-count correction (ChrFinder -> 0x1405186a0, which
 // calls 0x1403c7e50(chr) for each character at 0x1405186ac; the pass runs when WCM+0x17558 differs from the count,
@@ -56,10 +82,9 @@ static int df_is_player(char *chr) {
 }
 // --- Nightfarer-like camps (the launcher makes the generator always roll two: MapPatternSet (0, 0, 100)): their
 // invaders (NpcParam 600030010 ... 600030910, step 100; SmallbaseInvationNpcParam) are created when the map loads.
-// Each is kept disabled (0x608c60(chr, 0), as the hidden bosses) until the squad has killed as many bosses as its
-// place in the order they were first seen (one camp per boss), on every machine.
+// They are the camp scripts' from the start (df_camp_control); we only find and log them.
 static char *g_df_inv_rows[10];
-static int g_df_inv_ready, g_df_camps, g_df_kills_day, g_df_camp_open[8];
+static int g_df_inv_ready, g_df_camps, g_df_kills_day;
 static char *df_param(const char *type);
 static char *df_param_row(char *f, int id);
 static int df_camp_chr(char *chr) {
@@ -83,9 +108,8 @@ static int df_camp_chr(char *chr) {
 // map, +0x10 instance), and its invaders are the characters the world character manager's lookup (0x5190c0, the
 // one the scripts use) finds under entity ids 50 / 51 / 52 of it. An invader is grouped as soon as one of those ids
 // resolves to it; camps are numbered in the order their first invader is grouped.
-// vetoed: we turned the invader off while its camp was closed (the script's own enable, see df_camp_control);
 // seen: the last logged state (bit 31 set once logged).
-static struct { char *chr; int camp, entity, vetoed; unsigned seen; } g_df_inv[16];
+static struct { char *chr; int camp, entity; unsigned seen; } g_df_inv[16];
 static int g_df_ninv, g_df_camp_key[8];
 static int df_invader_entity(char *chr, int *key) {
     char *lots = df_param("LOT_RESULT_SMALLBASE_AND_SPOT_ST"), *gm = *(char **)(g_base + 0x3c13258);
@@ -113,7 +137,7 @@ static void df_camp_control(char *chr) {
     while (i < g_df_ninv && g_df_inv[i].chr != chr) i++;
     if (i == g_df_ninv) {
         if (g_df_ninv == 16) return;
-        g_df_inv[g_df_ninv].chr = chr, g_df_inv[g_df_ninv].camp = -1, g_df_inv[g_df_ninv].entity = 0, g_df_inv[g_df_ninv].vetoed = 0,
+        g_df_inv[g_df_ninv].chr = chr, g_df_inv[g_df_ninv].camp = -1, g_df_inv[g_df_ninv].entity = 0,
         g_df_inv[g_df_ninv].seen = 0, g_df_ninv++;
         logf("day flow: invader %d found (chr %p, block %08x); its camp is looked up by entity id", i + 1, (void *)chr, *(unsigned *)(chr + CHR_BLOCK_ID));
     }
@@ -124,37 +148,22 @@ static void df_camp_control(char *chr) {
             for (int c = 0; c < g_df_camps && camp < 0; c++)
                 if (g_df_camp_key[c] == key) camp = c;
             if (camp < 0 && g_df_camps < 8) {
-                camp = g_df_camps++, g_df_camp_key[camp] = key, g_df_camp_open[camp] = 0;
-                logf("day flow: camp %d is small map m%02d_%02d instance %d (entities %d..); opens after %d boss(es)", camp + 1,
-                     key / 10000 % 10000 / 100, key / 10000 % 100, key / 100000000, key + 50, camp + 1);
+                camp = g_df_camps++, g_df_camp_key[camp] = key;
+                logf("day flow: camp %d is small map m%02d_%02d instance %d (entities %d..); its invader is left to the camp's script",
+                     camp + 1, key / 10000 % 10000 / 100, key / 10000 % 100, key / 100000000, key + 50);
             }
             g_df_inv[i].camp = camp, g_df_inv[i].entity = e;
             logf("day flow: invader %d: entity %d, camp %d", i + 1, e, camp + 1);
         }
     }
-    // The camp's own script (common 90015310) keeps its invaders off, collision off, until a player enters one of
-    // the camp's areas or flag base+200 is on; then it sets base+200, warps them to their arrival points and turns
-    // them on with collision and the arrival animation 63020 (only one with SpEffect 4450). A non-"Hot Spot"
-    // instance it turns off and backread-removes instead. Closed camp: we turn off an invader the script turned
-    // on (and nothing else). Open camp: the script alone, except that an invader we turned off while closed after
-    // the script's arrival (base+200 on) is turned on again, as the script left it, unless dead (base+202+k).
-    int open = camp >= 0 && (g_df_kills_day > camp || g_df_go);
-    int base = camp >= 0 ? g_df_camp_key[camp] : 0, k = g_df_inv[i].entity - base - 50;
+    // Every camp's invader is there from the start (owner, 2026-11-19: "zawsze jest 1"): the camp's own script
+    // (common 90015310) alone brings it in. It keeps the invader off, collision off, until a player enters one of the
+    // camp's areas or flag base+200 is on; then it sets base+200, warps it to its arrival point and turns it on with
+    // collision and the arrival animation 63020 (only one with SpEffect 4450). A non-"Hot Spot" instance it turns off
+    // and backread-removes instead. We only log the invader's state.
+    int base = camp >= 0 ? g_df_camp_key[camp] : 0, k = g_df_inv[i].entity - base - 50, open = 1;
     int arrived = base ? two_flag(base + 200, 0, 0) : -1, dead = base && k >= 0 ? two_flag(base + 202 + k, 0, 0) : -1;
     int hp = chr_hp(chr);
-    if (open) {
-        if (!g_df_camp_open[camp]) g_df_camp_open[camp] = 1, logf("day flow: camp %d opens: its invaders are left to the camp's script", camp + 1);
-        if (g_df_inv[i].vetoed && arrived == 1 && dead != 1 && hp != 0 && !chr_enabled(chr)) {
-            ((char (*)(char *, char))(g_base + 0x608c60))(chr, 1);
-            logf("day flow: invader %d (entity %d): turned on again (the script's arrival ran while its camp was closed)", i + 1, g_df_inv[i].entity);
-        }
-        g_df_inv[i].vetoed = 0;
-    } else if (chr_enabled(chr)) {
-        ((char (*)(char *, char))(g_base + 0x608c60))(chr, 0);
-        if (!g_df_inv[i].vetoed) logf("day flow: invader %d (entity %d): turned on while camp %d is closed (arrival flag %d): off again",
-                                      i + 1, g_df_inv[i].entity, camp + 1, arrived);
-        g_df_inv[i].vetoed = 1;
-    }
     int on = chr_enabled(chr), sp = speffect_on(chr, 4450);
     unsigned state = 1u << 31 | (unsigned)on | (unsigned)(arrived & 3) << 1 | (unsigned)(dead & 3) << 3 | (unsigned)sp << 5 |
                      (unsigned)(hp > 0) << 6 | (unsigned)open << 7;
@@ -586,8 +595,18 @@ static void day_flow_frame(int in_world) {
         day2_seen = 1, g_df_day = 2;
         g_df_bosses = g_df_special = g_df_met = g_df_met_at = g_df_after = 0, g_df_go = g_df_used = 0, g_df_kills_day = 0;
         InterlockedExchange(&g_df_kills, 0), InterlockedExchange(&g_df_special_kills, 0);
-        logf("day flow: day 2 (7505): tier back to 0, count starts again (camps already open stay open; events: each family "
-             "ran at most once, none again)");
+        logf("day flow: day 2 (7505): tier back to 0, count starts again (events: each family ran at most once, none again)");
+        // The merchant sells the item again: its rows 3007 / 3507 keep the Small Pouch's stock flag 90470 (ShopLineupParam
+        // eventFlag_forStock). The stock rows' flags are 10 apart (90430 .. 90470, 90690, 90700), so 90470..90479 are
+        // taken as this row's sold count; every one that is on goes off (each machine its own merchant).
+        char was[16] = "";
+        for (int f = 0; f < 10; f++)
+            if (two_flag(90470 + f, 0, 0) == 1) {
+                two_flag(90470 + f, 1, 0);
+                size_t n = strlen(was);
+                snprintf(was + n, sizeof was - n, "%d", f);
+            }
+        logf("day flow: day 2: the merchant's item stock reset (flags 90470+ that were on: %s)", *was ? was : "none");
     }
     LONG k = InterlockedExchange(&g_df_kills, 0), sk = InterlockedExchange(&g_df_special_kills, 0);
     g_df_kills_day += (int)(k + sk);
@@ -632,6 +651,7 @@ static void day_flow_frame(int in_world) {
         else if ((int)(GetTickCount() - next) >= 0 && (next = GetTickCount() + 1000, df_warp())) g_df_warp_until = 0;
     }
     df_lobby_watch();
+    df_notice_frame();
     df_track_frame();
     if (g_join != 4) df_events_frame();
     (void)down_last;  // the final death is the death restart's (df_death_restart_hook)

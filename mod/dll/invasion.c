@@ -1385,16 +1385,30 @@ static void finish_event_hook(void *msg, char *chr, unsigned long long kind, uns
     if (chr && chr == g_finish_chr && g_finish_tick && (unsigned char)kind == 2) return;
     ((void (*)(void *, char *, unsigned long long, unsigned long long))(g_base + 0x4f2d50))(msg, chr, kind, arg);
 }
-// Once a second while our local player is down (this thread, reads only): the fields above.
+// Every 250 ms while our local player is down (this thread, reads only): the fields above.
+static int chr_hp(char *c);
 static void finish_tick(void) {
-    static DWORD next;
+    static DWORD next, down_at;
+    static float last_timer, last_grace;
     char *chr = local_player();
-    if (!chr || IsBadReadPtr(chr, 0x740) || (int)(GetTickCount() - next) < 0) return;
+    if (!chr || IsBadReadPtr(chr, 0x740)) return;
+    // Run 65: allies died about 3 s after going down (the hit grace +0x71c is 3.5 s, the timer 15 s). The way out of
+    // the down: one line with the last timer and grace seen, every 250 ms read, to see what ends it.
+    if (chr[0x710] == 1) {
+        if (!down_at) down_at = GetTickCount() | 1;
+        last_timer = *(float *)(chr + 0x718), last_grace = *(float *)(chr + 0x71c);
+    } else if (down_at) {
+        logf("finish test: out of the down after %lu ms: state %u, HP %d, last seen timer %.2f grace %.2f, gauge %.1f (%s)",
+             GetTickCount() - down_at, (unsigned char)chr[0x710], chr_hp(chr), last_timer, last_grace, *(float *)(chr + 0x714),
+             g_as_ally && g_join == 4 ? "ally" : g_join == 4 ? "invader" : "host");
+        down_at = 0;
+    }
+    if ((int)(GetTickCount() - next) < 0) return;
     if (chr[0x710] != 1 && !(g_finish_tick && chr == g_finish_chr)) return;
-    next = GetTickCount() + 1000;
-    logf("finish test: state %u gauge %.1f timer %.2f still-down %u stand-up %u down count %u%s", (unsigned char)chr[0x710],
-         *(float *)(chr + 0x714), *(float *)(chr + 0x718), (unsigned char)chr[0x731], (unsigned char)chr[0x732],
-         (unsigned char)chr[0x730], g_finish_tick && chr == g_finish_chr ? " (stand-up refused)" : "");
+    next = GetTickCount() + 250;
+    logf("finish test: state %u gauge %.1f timer %.2f grace %.2f HP %d still-down %u stand-up %u down count %u%s", (unsigned char)chr[0x710],
+         *(float *)(chr + 0x714), *(float *)(chr + 0x718), *(float *)(chr + 0x71c), chr_hp(chr), (unsigned char)chr[0x731],
+         (unsigned char)chr[0x732], (unsigned char)chr[0x730], g_finish_tick && chr == g_finish_chr ? " (stand-up refused)" : "");
     if (chr == g_finish_chr && chr[0x710] != 1) g_finish_tick = 0, g_finish_chr = NULL;
 }
 // loot-test (logging only): what a killed invader leaves and what the local player can take.
@@ -4618,9 +4632,11 @@ static void notice_with(int id, const char *arg) {
     char *t = ((char *(*)(void *, int))(g_base + RVA_MENU_TEXT_CTOR))(text[k], id);
     const unsigned short *tpl = t && *(unsigned short **)t ? *(unsigned short **)t : t ? *(unsigned short **)(t + 0x10) : NULL;
     int n = 0;
+    const char *a = arg;  // "x|y": the first %s gets x, the next y
     for (int i = 0; tpl && !IsBadReadPtr(tpl + i, 2) && tpl[i] && i < 200 && n < 250; i++) {
         if (tpl[i] == '%' && tpl[i + 1] == 's') {
-            for (const char *a = arg; a && *a && n < 250; a++) line[k][n++] = (unsigned char)*a;
+            for (; a && *a && *a != '|' && n < 250; a++) line[k][n++] = (unsigned char)*a;
+            if (a && *a == '|') a++;
             i++;
         } else line[k][n++] = tpl[i];
     }

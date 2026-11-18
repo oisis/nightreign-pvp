@@ -39,7 +39,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 30
+#define BUILD_FORMAT 31
 #define BOSS_DEATHS_MIN 100  // the game (1.3.3) has 158 such flags; fewer = its event scripts changed
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
@@ -71,10 +71,11 @@ static const struct { u32 id; const char *english, *polish; } OUR_TEXT[] = {
     {131168, "The invader has left", "Naje\xc5\xba" "d\xc5\xba" "ca odszed\xc5\x82"},
     {131169, "You have invaded another squad's expedition!", "Wkroczy\xc5\x82" "e\xc5\x9b do wyprawy innej dru\xc5\xbcyny!"},
     // day flow (boss-flow 4): the challenge's progress and state (%s: the DLL puts "3/5" in)
-    {131180, "Challenge: %s bosses defeated; the special boss (dragon or Captain) not yet",
-             "Wyzwanie: %s boss\xc3\xb3w pokonanych; boss specjalny (smok lub Kapitan) jeszcze nie"},
-    {131181, "Challenge: %s bosses defeated; the special boss is defeated",
-             "Wyzwanie: %s boss\xc3\xb3w pokonanych; boss specjalny pokonany"},
+    // 131180 / 131181: the first %s is "N/M", the second M (M = the bosses needed; owner, 2026-11-19)
+    {131180, "Bosses defeated: %s. Defeat %s bosses and the special boss (the dragon or the Captain) to challenge the night boss.",
+             "Zabi\xc5\x82" "e\xc5\x9b %s boss\xc3\xb3w. Zabij %s boss\xc3\xb3w i bossa specjalnego (smoka lub Kapitana), aby wyzwa\xc4\x87 bossa nocy."},
+    {131181, "Bosses defeated: %s. Defeat %s bosses to challenge the night boss.",
+             "Zabi\xc5\x82" "e\xc5\x9b %s boss\xc3\xb3w. Zabij %s boss\xc3\xb3w, aby wyzwa\xc4\x87 bossa nocy."},
     {131182, "Challenge available: use Challenge the Night to face the night boss",
              "Wyzwanie dost\xc4\x99pne: u\xc5\xbcyj Staw wyzwanie, by stan\xc4\x85\xc4\x87 przed bossem nocy"},
     {131183, "The challenge is not available yet: defeat %s bosses and the special boss (dragon or Captain)",
@@ -88,10 +89,10 @@ static const struct { const char *fmg, *english, *polish; } ITEM_TEXT[] = {
     {"\\GoodsName.fmg", "Challenge the Night", "Staw wyzwanie"},
     {"\\GoodsInfo.fmg", "Takes the whole squad to the night boss", "Przenosi ca\xc5\x82\xc4\x85 dru\xc5\xbcyn\xc4\x99 do bossa nocy"},
     {"\\GoodsCaption.fmg",
-     "Two crossed blades, a call to the Night.\n\nUsable once the squad has defeated five bosses and the special boss of a region "
+     "Two crossed blades, a call to the Night.\n\nUsable once the squad has defeated six bosses and the special boss of a region "
      "(the Mountaintop's dragon or the Rotted Woods' Captain). Takes the whole squad to the night boss's arena, and the night "
      "falls.\n\nUsed too early, it stays in the pouch.",
-     "Dwa skrzy\xc5\xbcowane ostrza, wezwanie Nocy.\n\nMo\xc5\xbcna u\xc5\xbcy\xc4\x87, gdy dru\xc5\xbcyna pokona pi\xc4\x99" "ciu boss\xc3\xb3w "
+     "Dwa skrzy\xc5\xbcowane ostrza, wezwanie Nocy.\n\nMo\xc5\xbcna u\xc5\xbcy\xc4\x87, gdy dru\xc5\xbcyna pokona sze\xc5\x9b" "ciu boss\xc3\xb3w "
      "i bossa specjalnego regionu (smoka Szczytu albo Kapitana Zgni\xc5\x82" "ego Lasu). Przenosi ca\xc5\x82\xc4\x85 dru\xc5\xbcyn\xc4\x99 "
      "na aren\xc4\x99 bossa nocy i zapada noc.\n\nU\xc5\xbcyte za wcze\xc5\x9bnie zostaje w sakwie."},
 };
