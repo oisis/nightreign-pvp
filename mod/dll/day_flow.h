@@ -76,61 +76,62 @@ static int df_camp_chr(char *chr) {
         if (row == g_df_inv_rows[k]) return 1;
     return 0;
 }
-// Grouping (deck test of 5f7bece: four invaders for the two camps on the map): a camp's invaders are the ones
-// in the same map block (+0x38) within 100 m of each other (position getter 0x3d0fd0). At creation the block is
-// ffffffff; an invader is grouped at the first pass that sees it placed, and stays disabled until then.
-static struct { char *chr; int camp; float first[3]; DWORD tick; } g_df_inv[16];
-static int g_df_ninv;
-static unsigned g_df_camp_block[8];
-static float g_df_camp_pos[8][3];
-static int df_chr_pos(char *chr, float out[3]) {
-    char *ctrl = !IsBadReadPtr(chr + 0x60, 8) ? *(char **)(chr + 0x60) : NULL, *a = ctrl && !IsBadReadPtr(ctrl + 0x10, 8) ? *(char **)(ctrl + 0x10) : NULL;
-    char *b = a && !IsBadReadPtr(a + 0x1b8, 8) ? *(char **)(a + 0x1b8) : NULL;
-    if (!b || IsBadReadPtr(b + 0x68, 8) || IsBadReadPtr(*(char **)(b + 0x68), 0x80)) return 0;
-    _Alignas(16) float v[4];
-    ((void *(*)(void *, void *))(g_base + 0x3d0fd0))(chr, v);
-    out[0] = v[0], out[1] = v[1], out[2] = v[2];
-    return 1;
+// Grouping, from the generator (0x1406bb760, the camp roll): for each camp it chose, it pairs an
+// invader row of SmallbaseInvationNpcParam with an entity id made by 0x140207020(small map, instance, k):
+// (instance * 10000 + map) * 10000 + 50 + k (map * 10 if below 1000), k = 0, 1 (at most 2 invaders a camp, from
+// param 0xca). So a camp is a placed small map (LotResultSmallBaseAndSpot of this map's pattern: +4 pattern, +0xc
+// map, +0x10 instance), and its invaders are the characters the world character manager's lookup (0x5190c0, the
+// one the scripts use) finds under entity ids 50 / 51 / 52 of it. An invader is grouped as soon as one of those ids
+// resolves to it; camps are numbered in the order their first invader is grouped.
+static struct { char *chr; int camp, entity; } g_df_inv[16];
+static int g_df_ninv, g_df_camp_key[8];
+static int df_invader_entity(char *chr, int *key) {
+    char *lots = df_param("LOT_RESULT_SMALLBASE_AND_SPOT_ST"), *gm = *(char **)(g_base + 0x3c13258);
+    char *wcm = *(char **)(g_base + RVA_WORLD_CHR_MAN);
+    if (!lots || !gm || !wcm) return 0;
+    unsigned pats[2] = {*(unsigned *)(gm + 0xb48), *(unsigned *)(gm + 0xb4c)};
+    int n = *(unsigned short *)(lots + 0xa);
+    for (int i = 0; i < n; i++) {
+        char *r = lots + *(unsigned long long *)(lots + 0x40 + i * 0x18 + 8);
+        unsigned pat = *(unsigned *)(r + 4);
+        if (pat != pats[0] && pat != pats[1]) continue;
+        int map = *(int *)(r + 0xc), inst = (unsigned char)r[0x10];
+        if (map <= 0 || map >= 10000 || inst >= 10) continue;
+        int base = (inst * 10000 + (map < 1000 ? map * 10 : map)) * 10000;
+        for (int k = 0; k < 3; k++) {
+            int e = base + 50 + k;
+            if (((char *(*)(void *, int *))(g_base + 0x5190c0))(wcm, &e) == chr) return *key = base, e;
+        }
+    }
+    return 0;
 }
 static void df_camp_control(char *chr) {
     int i = 0;
     while (i < g_df_ninv && g_df_inv[i].chr != chr) i++;
-    unsigned block = *(unsigned *)(chr + CHR_BLOCK_ID);
-    float pos[3];
-    int have_pos = df_chr_pos(chr, pos);
     if (i == g_df_ninv) {
         if (g_df_ninv == 16) return;
-        g_df_inv[g_df_ninv].chr = chr, g_df_inv[g_df_ninv].camp = -1, g_df_inv[g_df_ninv].tick = GetTickCount();
-        if (have_pos) memcpy(g_df_inv[g_df_ninv].first, pos, sizeof pos);
-        g_df_ninv++;
-        logf("day flow: invader %d found: block %08x, position %s%.0f %.0f %.0f", i + 1, block, have_pos ? "" : "(none) ", have_pos ? pos[0] : 0,
-             have_pos ? pos[1] : 0, have_pos ? pos[2] : 0);
+        g_df_inv[g_df_ninv].chr = chr, g_df_inv[g_df_ninv].camp = -1, g_df_inv[g_df_ninv].entity = 0, g_df_ninv++;
+        logf("day flow: invader %d found (chr %p, block %08x); its camp is looked up by entity id", i + 1, (void *)chr, *(unsigned *)(chr + CHR_BLOCK_ID));
     }
-    int camp = g_df_inv[i].camp;
-    // Deck test of 4665420: no invader was ever grouped. Detection is the old build's (which found four), and the
-    // grouping waited for +0x38 != ffffffff, the value every log shows for them; so the block no longer gates it.
-    // Grouped by position (within 100 m; same block only when both have one), once the invader has moved from where
-    // it was created (all were created at load at a spot outside the camps: 893 39 -71 in deck-run64) or 60 s later.
-    float mx = have_pos ? pos[0] - g_df_inv[i].first[0] : 0, mz = have_pos ? pos[2] - g_df_inv[i].first[2] : 0;
-    int settled = have_pos && (mx * mx + mz * mz > 1.0f || GetTickCount() - g_df_inv[i].tick > 60000);
-    if (camp < 0 && settled) {
-        for (int c = 0; c < g_df_camps && camp < 0; c++) {
-            float dx = pos[0] - g_df_camp_pos[c][0], dy = pos[1] - g_df_camp_pos[c][1], dz = pos[2] - g_df_camp_pos[c][2];
-            int same_block = g_df_camp_block[c] == block || g_df_camp_block[c] == 0xffffffff || block == 0xffffffff;
-            if (same_block && dx * dx + dy * dy + dz * dz < 100.0f * 100.0f) camp = c;
+    int camp = g_df_inv[i].camp, key = 0;
+    if (camp < 0) {
+        int e = df_invader_entity(chr, &key);
+        if (e) {
+            for (int c = 0; c < g_df_camps && camp < 0; c++)
+                if (g_df_camp_key[c] == key) camp = c;
+            if (camp < 0 && g_df_camps < 8) {
+                camp = g_df_camps++, g_df_camp_key[camp] = key, g_df_camp_open[camp] = 0;
+                logf("day flow: camp %d is small map m%02d_%02d instance %d (entities %d..); opens after %d boss(es)", camp + 1,
+                     key / 10000 % 10000 / 100, key / 10000 % 100, key / 100000000, key + 50, camp + 1);
+            }
+            g_df_inv[i].camp = camp, g_df_inv[i].entity = e;
+            logf("day flow: invader %d: entity %d, camp %d", i + 1, e, camp + 1);
         }
-        if (camp < 0 && g_df_camps < 8) {
-            camp = g_df_camps++;
-            g_df_camp_block[camp] = block, memcpy(g_df_camp_pos[camp], pos, sizeof pos), g_df_camp_open[camp] = 0;
-            logf("day flow: camp %d found (block %08x, position %.0f %.0f %.0f); opens after %d boss(es)", camp + 1, block, pos[0], pos[1], pos[2], camp + 1);
-        }
-        g_df_inv[i].camp = camp;
-        if (camp >= 0) logf("day flow: camp %d: invader %d of its camp placed", camp + 1, i + 1);
     }
     int open = camp >= 0 && (g_df_kills_day > camp || g_df_go);
     if (open) {
         if (!chr_enabled(chr)) ((char (*)(char *, char))(g_base + 0x608c60))(chr, 1);
-        if (!g_df_camp_open[camp]) g_df_camp_open[camp] = 1, logf("day flow: camp %d opens (block %08x): its invaders enabled", camp + 1, block);
+        if (!g_df_camp_open[camp]) g_df_camp_open[camp] = 1, logf("day flow: camp %d opens: its invaders enabled", camp + 1);
     } else if (chr_enabled(chr)) {
         ((char (*)(char *, char))(g_base + 0x608c60))(chr, 0);
     }
