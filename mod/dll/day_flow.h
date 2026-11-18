@@ -250,6 +250,64 @@ static int df_load_pending(void) {
     char *mgr = *(char **)(g_base + 0x3c123f8), *w = mgr ? *(char **)(mgr + 0x10) : NULL;
     return !w || IsBadReadPtr(w + 0x8880, 4) || *(int *)(w + 0x8880) != -1 || *(int *)(mgr + 0xf0) != -1;
 }
+// After the warp (deck test of 9330160: the player fell through the ground 8 s after a successful warp, at the
+// arena block's origin height). Three things:
+// 1. the load we queued (world manager +0xf0 block, +0x100 position = 0x143ab9b10 = (0, 0, 0, 1), the block's origin)
+//    is cleared if still pending: 0x140638d50 applies a pending entry by setting the local player's position to it
+//    (0x1403daa70 ...), which would put him at the origin of the arena tile;
+// 2. our no-fall-damage SpEffect 90071613 (15 s, fallDamageRate +0xdc = 0, launcher);
+// 3. the owner's landing: the site's own position (the point's vfunc +0x18, its rotation +0x20, as 0x14060b540 takes
+//    them) with y + DF_DROP_M, set with the same setter 0x1403daa70, so the player falls onto the arena.
+#define DF_DROP_M 100.0f
+static int df_chr_pos(char *chr, float out[3]) {  // the game's position getter 0x3d0fd0, as player_position
+    char *ctrl = chr && !IsBadReadPtr(chr + 0x60, 8) ? *(char **)(chr + 0x60) : NULL;
+    char *a = ctrl && !IsBadReadPtr(ctrl + 0x10, 8) ? *(char **)(ctrl + 0x10) : NULL;
+    char *b = a && !IsBadReadPtr(a + 0x1b8, 8) ? *(char **)(a + 0x1b8) : NULL;
+    if (!b || IsBadReadPtr(b + 0x68, 8) || IsBadReadPtr(*(char **)(b + 0x68), 0x80)) return 0;
+    _Alignas(16) float v[4];
+    ((void *(*)(void *, void *))(g_base + 0x3d0fd0))(chr, v);
+    out[0] = v[0], out[1] = v[1], out[2] = v[2];
+    return 1;
+}
+static DWORD g_df_track_until, g_df_track_next;
+static void df_after_warp(char *me, int dest) {
+    char *mgr = *(char **)(g_base + 0x3c123f8);
+    if (mgr && *(int *)(mgr + 0xf0) != -1) {
+        logf("day flow: queued arena load still pending after the warp (block %08x): cleared", *(unsigned *)(mgr + 0xf0));
+        *(int *)(mgr + 0xf0) = -1;
+    }
+    ((void (*)(void *, int, unsigned char))(g_base + RVA_ADD_SPEFFECT))(me, 90071613, 0);
+    char *pm = *(char **)(g_base + 0x3c11848);
+    char **pt = pm ? ((char **(*)(char *, unsigned))(g_base + 0x5fc6f0))(pm, (unsigned)dest) : NULL;
+    if (!pt || IsBadReadPtr(pt, 8) || IsBadReadPtr(*(void **)pt, 0x28)) {
+        logf("day flow: landing: site point not found after the warp, left where the warp put him");
+    } else {
+        _Alignas(16) float pos[4], rot[4];
+        ((void (*)(char **, float *))(*(void ***)pt)[0x18 / 8])(pt, pos);
+        memcpy(rot, pos, sizeof rot);  // as 0x14060b540: vfunc +0x20 is called on a copy of the position
+        ((void (*)(char **, float *))(*(void ***)pt)[0x20 / 8])(pt, rot);
+        pos[3] = 1.0f, rot[3] = 0.0f;
+        float site_y = pos[1];
+        pos[1] += DF_DROP_M;
+        ((void (*)(char *, float *, float *))(g_base + 0x3daa70))(me, pos, rot);
+        logf("day flow: landing: set to the site %.1f %.1f %.1f + %.0f m up (the point's own position, setter 0x1403daa70)", pos[0], site_y, pos[2],
+             DF_DROP_M);
+    }
+    g_df_track_until = GetTickCount() + 10000, g_df_track_next = 0;
+}
+static void df_track_frame(void) {
+    if (!g_df_track_until) return;
+    if ((int)(GetTickCount() - g_df_track_until) >= 0) { g_df_track_until = 0; return; }
+    if ((int)(GetTickCount() - g_df_track_next) < 0) return;
+    g_df_track_next = GetTickCount() + 500;
+    char *me = local_player(), *mgr = *(char **)(g_base + 0x3c123f8);
+    float p[3];
+    char **pd = me && !IsBadReadPtr(me + 0x1b8, 8) ? *(char ***)(me + 0x1b8) : NULL;
+    int hp = pd && !IsBadReadPtr(pd, 8) && *pd && !IsBadReadPtr(*pd, 0x148) ? *(int *)(*pd + 0x140) : -1;
+    if (me && df_chr_pos(me, p))
+        logf("day flow: after the warp: block %08x position %.1f %.1f %.1f, HP %d, downed %u, queued load %s", *(unsigned *)(me + CHR_BLOCK_ID), p[0],
+             p[1], p[2], hp, (unsigned char)me[0x710], mgr && *(int *)(mgr + 0xf0) != -1 ? "pending" : "none");
+}
 static int df_warp(void) {
     char *pa = *(char **)(g_base + RVA_PLAY_AREA_PTR), *me = local_player();
     char *areas = df_param("PLAY_AREA_CREATE_PARAM_ST"), *points = df_param("SMALLBASE_AND_SPOT_ATTACH_POINT_ST");
@@ -265,9 +323,13 @@ static int df_warp(void) {
     char *pt = row ? df_param_row(points, *(int *)(row + 0x24)) : NULL;
     if (!pt) return logf("day flow: warp: no site for the final circle (block %08x, row %d)", *(unsigned *)fin, row_id), 0;
     int who = 10000, dest = *(int *)(pt + 0x14), known = df_point_known(dest);
+    float before[3] = {0, 0, 0};
+    int had = df_chr_pos(me, before);
     unsigned char got = known ? (unsigned char)((unsigned long long (*)(int *, int *, char))(g_base + 0x5f1a00))(&who, &dest, 1) : 0;
-    logf("day flow: warp to the night boss's site (circle row %d, attach point %d, entity %d): point %s, %s", row_id, *(int *)(row + 0x24), dest,
-         known ? "known" : "not in the point manager", got ? "done" : "not done");
+    logf("day flow: warp to the night boss's site (circle row %d, attach point %d, entity %d): point %s, %s; before: %s%.1f %.1f %.1f", row_id,
+         *(int *)(row + 0x24), dest, known ? "known" : "not in the point manager", got ? "done" : "not done", had ? "" : "(none) ", before[0],
+         before[1], before[2]);
+    if (got) df_after_warp(me, dest);
     return got;
 }
 // --- the clock (host; joiners take it from the host): runs to DF_HOLD_H:00:00 (18:00, the owner: daylight until the challenge) and is held there (both clocks' rates 0,
@@ -432,6 +494,17 @@ static void df_death_restart_hook(long long *ev, void *sm) {
         ((void (*)(long long *, void *))(g_base + 0x5c38f0))(ev, sm);
         return;
     }
+    char *me = local_player();
+    char **pd = me && !IsBadReadPtr(me + 0x1b8, 8) ? *(char ***)(me + 0x1b8) : NULL;
+    int hp = pd && !IsBadReadPtr(pd, 8) && *pd && !IsBadReadPtr(*pd, 0x148) ? *(int *)(*pd + 0x140) : -1;
+    float p[3] = {0, 0, 0};
+    int have = me && df_chr_pos(me, p);
+    logf("day flow: death restart state: HP %d, downed %u, block %08x, position %s%.1f %.1f %.1f", hp, me ? (unsigned char)me[0x710] : 0,
+         me ? *(unsigned *)(me + CHR_BLOCK_ID) : 0, have ? "" : "(none) ", p[0], p[1], p[2]);
+    if (hp > 0) {  // not a death: the game's own state, unchanged
+        ((void (*)(long long *, void *))(g_base + 0x5c38f0))(ev, sm);
+        return;
+    }
     if (g_df_ended) return;
     g_df_ended = 1;
     if (g_join == 4 && g_as_ally) {
@@ -528,6 +601,7 @@ static void day_flow_frame(int in_world) {
         else if ((int)(GetTickCount() - next) >= 0 && (next = GetTickCount() + 1000, df_warp())) g_df_warp_until = 0;
     }
     df_lobby_watch();
+    df_track_frame();
     if (g_join != 4) df_events_frame();
     (void)down_last;  // the final death is the death restart's (df_death_restart_hook)
 }

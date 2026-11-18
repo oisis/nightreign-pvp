@@ -39,7 +39,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 29
+#define BUILD_FORMAT 30
 #define BOSS_DEATHS_MIN 100  // the game (1.3.3) has 158 such flags; fewer = its event scripts changed
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
@@ -1038,6 +1038,7 @@ static buf param_insert_range(buf p, int template_id, int first_id, u32 n, u64 s
 #define GOODS_PARAM "\\EquipParamGoods.param"
 #define SHOP_PARAM "\\ShopLineupParam.param"
 #define CHALLENGE_SPEFFECT 90071612
+#define CHALLENGE_FALL_SPEFFECT 90071613
 #define TIER_FIRST 90071700
 #define TIER_COUNT 200
 #define CHALLENGE_ICON 21990
@@ -1048,6 +1049,17 @@ static int day_flow_rows(buf *sp, buf *goods, buf *shop) {
     if (!a.p || rd32(row + 0x08) != 0xBF800000) return free(a.p), 0;
     float one = 1.0f;
     memcpy(row + 0x08, &one, 4);
+    // the challenge's landing: no fall damage for 15 s (fallDamageRate +0xdc, read against all 13472 rows of the game's
+    // file; the game has rows with 0, 0.1 and 0.5 there), as the DLL drops the player onto the arena from above
+    {
+        u8 *fr = NULL;
+        buf c = param_insert_sorted(a, SPEFFECT_TEMPLATE, CHALLENGE_FALL_SPEFFECT, SPEFFECT_SIZE, &fr);
+        if (!c.p || rd32(fr + 0x08) != 0xBF800000) return free(a.p), free(c.p), 0;
+        float t = 15.0f, zero = 0.0f;
+        memcpy(fr + 0x08, &t, 4), memcpy(fr + 0xdc, &zero, 4);
+        free(a.p);
+        a = c;
+    }
     buf b = param_insert_range(a, SPEFFECT_TEMPLATE, TIER_FIRST + 1, TIER_COUNT, SPEFFECT_SIZE, &row);
     free(a.p);
     if (!b.p) return 0;
