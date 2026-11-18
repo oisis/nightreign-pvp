@@ -79,7 +79,7 @@ static int df_camp_chr(char *chr) {
 // Grouping (deck test of 5f7bece: four invaders for the two camps on the map): a camp's invaders are the ones
 // in the same map block (+0x38) within 100 m of each other (position getter 0x3d0fd0). At creation the block is
 // ffffffff; an invader is grouped at the first pass that sees it placed, and stays disabled until then.
-static struct { char *chr; int camp; } g_df_inv[16];
+static struct { char *chr; int camp; float first[3]; DWORD tick; } g_df_inv[16];
 static int g_df_ninv;
 static unsigned g_df_camp_block[8];
 static float g_df_camp_pos[8][3];
@@ -95,17 +95,29 @@ static int df_chr_pos(char *chr, float out[3]) {
 static void df_camp_control(char *chr) {
     int i = 0;
     while (i < g_df_ninv && g_df_inv[i].chr != chr) i++;
-    if (i == g_df_ninv) {
-        if (g_df_ninv == 16) return;
-        g_df_inv[g_df_ninv].chr = chr, g_df_inv[g_df_ninv++].camp = -1;
-    }
-    int camp = g_df_inv[i].camp;
     unsigned block = *(unsigned *)(chr + CHR_BLOCK_ID);
     float pos[3];
-    if (camp < 0 && block != 0xffffffff && df_chr_pos(chr, pos)) {  // placed: join a camp, or start one
+    int have_pos = df_chr_pos(chr, pos);
+    if (i == g_df_ninv) {
+        if (g_df_ninv == 16) return;
+        g_df_inv[g_df_ninv].chr = chr, g_df_inv[g_df_ninv].camp = -1, g_df_inv[g_df_ninv].tick = GetTickCount();
+        if (have_pos) memcpy(g_df_inv[g_df_ninv].first, pos, sizeof pos);
+        g_df_ninv++;
+        logf("day flow: invader %d found: block %08x, position %s%.0f %.0f %.0f", i + 1, block, have_pos ? "" : "(none) ", have_pos ? pos[0] : 0,
+             have_pos ? pos[1] : 0, have_pos ? pos[2] : 0);
+    }
+    int camp = g_df_inv[i].camp;
+    // Deck test of 4665420: no invader was ever grouped. Detection is the old build's (which found four), and the
+    // grouping waited for +0x38 != ffffffff, the value every log shows for them; so the block no longer gates it.
+    // Grouped by position (within 100 m; same block only when both have one), once the invader has moved from where
+    // it was created (all were created at load at a spot outside the camps: 893 39 -71 in deck-run64) or 60 s later.
+    float mx = have_pos ? pos[0] - g_df_inv[i].first[0] : 0, mz = have_pos ? pos[2] - g_df_inv[i].first[2] : 0;
+    int settled = have_pos && (mx * mx + mz * mz > 1.0f || GetTickCount() - g_df_inv[i].tick > 60000);
+    if (camp < 0 && settled) {
         for (int c = 0; c < g_df_camps && camp < 0; c++) {
             float dx = pos[0] - g_df_camp_pos[c][0], dy = pos[1] - g_df_camp_pos[c][1], dz = pos[2] - g_df_camp_pos[c][2];
-            if (g_df_camp_block[c] == block && dx * dx + dy * dy + dz * dz < 100.0f * 100.0f) camp = c;
+            int same_block = g_df_camp_block[c] == block || g_df_camp_block[c] == 0xffffffff || block == 0xffffffff;
+            if (same_block && dx * dx + dy * dy + dz * dz < 100.0f * 100.0f) camp = c;
         }
         if (camp < 0 && g_df_camps < 8) {
             camp = g_df_camps++;
