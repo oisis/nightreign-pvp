@@ -4608,9 +4608,12 @@ static void notice_with(int id, const char *arg) {
         } else line[k][n++] = tpl[i];
     }
     line[k][n] = 0;
-    if (!n || !t) return;
+    if (!n || !t) return (void)logf("notice %d: no text (line not in CL_MenuText)", id);
     *(unsigned short **)t = line[k];
-    ((unsigned char (*)(void *))(g_base + RVA_SUMMON_MESSAGE))(t);
+    unsigned char shown = ((unsigned char (*)(void *))(g_base + RVA_SUMMON_MESSAGE))(t);  // 0x86b8d0: queue (priority 99)
+    char *q = summon_queue();
+    logf("notice %d%s%s: queued %s (on screen priority %d, waiting %d)", id, arg ? " " : "", arg ? arg : "", shown ? "yes" : "NO",
+         q ? *(short *)(q + SMQ_CURRENT_PRIORITY) : -2, q ? *(int *)(q + SMQ_WAITING_COUNT) : -1);
 }
 static void version_result(int found_same) {
     if (g_ver_notice_armed && *g_ver_newest) {

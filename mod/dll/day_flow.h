@@ -16,6 +16,7 @@ static const unsigned DF_SPECIAL[] = {1028100800, 1029100800, 1039100800, 103910
 static volatile LONG g_df_kills, g_df_special_kills;
 static int g_df_bosses, g_df_special, g_df_met, g_df_met_at, g_df_after, g_df_day = 1, g_df_go, g_df_used;
 static int g_df_tier;  // percent: 0, 5, 10 ...
+static DWORD g_df_notice_due;  // the progress notice, 6 s after a kill
 static void df_kill(unsigned id) {  // flag_note, any thread: a boss death flag turned on
     for (unsigned i = 0; i < sizeof DF_SPECIAL / sizeof *DF_SPECIAL; i++)
         if (id == DF_SPECIAL[i]) { InterlockedIncrement(&g_df_special_kills); return; }
@@ -57,7 +58,7 @@ static int df_is_player(char *chr) {
 // invaders (NpcParam 600030010 ... 600030910, step 100; SmallbaseInvationNpcParam) are created when the map loads.
 // Each is kept disabled (0x608c60(chr, 0), as the hidden bosses) until the squad has killed as many bosses as its
 // place in the order they were first seen (one camp per boss), on every machine.
-static char *g_df_inv_rows[10], *g_df_camp[8];
+static char *g_df_inv_rows[10];
 static int g_df_inv_ready, g_df_camps, g_df_kills_day, g_df_camp_open[8];
 static char *df_param(const char *type);
 static char *df_param_row(char *f, int id);
@@ -75,20 +76,50 @@ static int df_camp_chr(char *chr) {
         if (row == g_df_inv_rows[k]) return 1;
     return 0;
 }
+// Grouping (deck test of 5f7bece: four invaders for the two camps on the map): a camp's invaders are the ones
+// in the same map block (+0x38) within 100 m of each other (position getter 0x3d0fd0). At creation the block is
+// ffffffff; an invader is grouped at the first pass that sees it placed, and stays disabled until then.
+static struct { char *chr; int camp; } g_df_inv[16];
+static int g_df_ninv;
+static unsigned g_df_camp_block[8];
+static float g_df_camp_pos[8][3];
+static int df_chr_pos(char *chr, float out[3]) {
+    char *ctrl = !IsBadReadPtr(chr + 0x60, 8) ? *(char **)(chr + 0x60) : NULL, *a = ctrl && !IsBadReadPtr(ctrl + 0x10, 8) ? *(char **)(ctrl + 0x10) : NULL;
+    char *b = a && !IsBadReadPtr(a + 0x1b8, 8) ? *(char **)(a + 0x1b8) : NULL;
+    if (!b || IsBadReadPtr(b + 0x68, 8) || IsBadReadPtr(*(char **)(b + 0x68), 0x80)) return 0;
+    _Alignas(16) float v[4];
+    ((void *(*)(void *, void *))(g_base + 0x3d0fd0))(chr, v);
+    out[0] = v[0], out[1] = v[1], out[2] = v[2];
+    return 1;
+}
 static void df_camp_control(char *chr) {
     int i = 0;
-    while (i < g_df_camps && g_df_camp[i] != chr) i++;
-    if (i == g_df_camps) {
-        if (g_df_camps == 8) return;
-        g_df_camp[g_df_camps++] = chr, g_df_camp_open[i] = 0;
-        logf("day flow: camp %d: invader found (block %08x); opens after %d boss(es)", i + 1, *(unsigned *)(chr + CHR_BLOCK_ID), i + 1);
+    while (i < g_df_ninv && g_df_inv[i].chr != chr) i++;
+    if (i == g_df_ninv) {
+        if (g_df_ninv == 16) return;
+        g_df_inv[g_df_ninv].chr = chr, g_df_inv[g_df_ninv++].camp = -1;
     }
-    int open = g_df_kills_day > i || g_df_go;
-    if (open && !g_df_camp_open[i]) {
-        g_df_camp_open[i] = 1;
-        ((char (*)(char *, char))(g_base + 0x608c60))(chr, 1);
-        logf("day flow: camp %d opens (block %08x): its invader enabled", i + 1, *(unsigned *)(chr + CHR_BLOCK_ID));
-    } else if (!open && chr_enabled(chr)) {
+    int camp = g_df_inv[i].camp;
+    unsigned block = *(unsigned *)(chr + CHR_BLOCK_ID);
+    float pos[3];
+    if (camp < 0 && block != 0xffffffff && df_chr_pos(chr, pos)) {  // placed: join a camp, or start one
+        for (int c = 0; c < g_df_camps && camp < 0; c++) {
+            float dx = pos[0] - g_df_camp_pos[c][0], dy = pos[1] - g_df_camp_pos[c][1], dz = pos[2] - g_df_camp_pos[c][2];
+            if (g_df_camp_block[c] == block && dx * dx + dy * dy + dz * dz < 100.0f * 100.0f) camp = c;
+        }
+        if (camp < 0 && g_df_camps < 8) {
+            camp = g_df_camps++;
+            g_df_camp_block[camp] = block, memcpy(g_df_camp_pos[camp], pos, sizeof pos), g_df_camp_open[camp] = 0;
+            logf("day flow: camp %d found (block %08x, position %.0f %.0f %.0f); opens after %d boss(es)", camp + 1, block, pos[0], pos[1], pos[2], camp + 1);
+        }
+        g_df_inv[i].camp = camp;
+        if (camp >= 0) logf("day flow: camp %d: invader %d of its camp placed", camp + 1, i + 1);
+    }
+    int open = camp >= 0 && (g_df_kills_day > camp || g_df_go);
+    if (open) {
+        if (!chr_enabled(chr)) ((char (*)(char *, char))(g_base + 0x608c60))(chr, 1);
+        if (!g_df_camp_open[camp]) g_df_camp_open[camp] = 1, logf("day flow: camp %d opens (block %08x): its invaders enabled", camp + 1, block);
+    } else if (chr_enabled(chr)) {
         ((char (*)(char *, char))(g_base + 0x608c60))(chr, 0);
     }
 }
@@ -219,25 +250,31 @@ static void bf4_frame(int first) {
 // 3 = goods) and the progress is shown. Otherwise the challenge starts: the host publishes it in its lobby; an ally
 // in its member data, which the host takes over.
 static int g_df_seq;  // challenges published / seen this expedition
+static int g_df_used_here;  // this machine's player used the item for the challenge (the item is removed when it starts)
 static void df_start_local(const char *who) {
     g_df_go = 1, g_df_used = 1;
+    if (g_df_used_here) {  // the one who used it: the item goes (0x1405fdb10(goods code, id, -1), 2003[24]'s removal)
+        int code = ((int (*)(int))(g_base + 0x59a7b0))(3);
+        ((void (*)(int, int, int))(g_base + 0x5fdb10))(code, DF_GOODS, -1);
+        g_df_used_here = 0;
+        logf("day flow: the item is used up (removed from the user's inventory)");
+    }
     notice_with(131184, NULL);
     logf("day flow: day %d's challenge (%s): warp, night", g_df_day, who);
     df_warp();
     df_repass("challenge: night bosses get the tier");
 }
 static void df_item_used(void) {
-    if (!g_df_met || g_df_used) {
-        int code = ((int (*)(int))(g_base + 0x59a7b0))(3);
-        ((void (*)(int, int, int))(g_base + 0x5fdb10))(code, DF_GOODS, 1);
+    if (!g_df_met || g_df_used) {  // the item is not consumed (launcher: isConsume off), nothing to give back
         char arg[16];
         snprintf(arg, sizeof arg, "%d", df_needed());
         if (g_df_used) notice_with(131184, NULL);
         else notice_with(131183, arg);
-        logf("day flow: item used %s: given back", g_df_used ? "after this day's challenge" : "before the condition");
+        logf("day flow: item used %s: kept, not consumed", g_df_used ? "after this day's challenge" : "before the condition");
         return;
     }
     char text[8];
+    g_df_used_here = 1;
     snprintf(text, sizeof text, "%d", ++g_df_seq);
     if (g_join != 4) {
         if (g_lobby) lobby_set(LOBBY_CHAL_KEY, text);
@@ -322,7 +359,7 @@ static void day_flow_frame(int in_world) {
     if (!in_world) return;
     if (first) {
         g_df_bosses = g_df_special = g_df_met = g_df_met_at = g_df_after = 0, g_df_day = 1, g_df_go = g_df_used = 0, g_df_seq = 0;
-        g_df_tier = 0, day2_seen = 0, last_tier = -1, marker_was = 0, down_last = -1, g_df_kills_day = 0, g_df_camps = 0;
+        g_df_tier = 0, day2_seen = 0, last_tier = -1, marker_was = 0, down_last = -1, g_df_kills_day = 0, g_df_camps = 0, g_df_ninv = 0, g_df_notice_due = 0;
         g_df_events = 0, g_df_event_tick = 0;
         InterlockedExchange(&g_df_kills, 0), InterlockedExchange(&g_df_special_kills, 0);
         logf("day flow: expedition start: challenge after %d bosses and the special boss", df_needed());
@@ -345,7 +382,11 @@ static void day_flow_frame(int in_world) {
             logf("day flow: condition met (%d bosses and the special boss)", g_df_bosses);
         }
         logf("day flow: boss killed: %d bosses, special %s, after the condition %d", g_df_bosses, g_df_special ? "yes" : "no", g_df_after);
-        df_progress_notice();
+        g_df_notice_due = GetTickCount() + 6000 | 1;  // after the game's own boss banner (deck test: a notice in the same frame was not seen)
+    }
+    if (g_df_notice_due && (int)(GetTickCount() - g_df_notice_due) >= 0) {
+        g_df_notice_due = 0;
+        df_progress_notice();  // the state as it is now: later kills in the 6 s are in it
     }
     g_df_tier = df_target_tier();
     if (g_df_tier != last_tier) last_tier = g_df_tier, df_repass("bosses"), repass_tick = GetTickCount();

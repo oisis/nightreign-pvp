@@ -39,7 +39,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 27
+#define BUILD_FORMAT 28
 #define BOSS_DEATHS_MIN 100  // the game (1.3.3) has 158 such flags; fewer = its event scripts changed
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
@@ -1031,7 +1031,7 @@ static buf param_insert_range(buf p, int template_id, int first_id, u32 n, u64 s
 //   one before).
 // - EquipParamGoods (0xe0): our item CHALLENGE_GOODS, a copy of Starlight Shards 1290 (a consumable whose use
 //   applies refId_default +0x04 as a SpEffect, refCategory 2): +0x04 our marker, +0x30 iconId, +0xb8 / +0xc0 its
-//   level-2 / 3 SpEffects off (-1).
+//   level-2 / 3 SpEffects off (-1), +0x48 bit 7 isConsume off.
 // - ShopLineupParam (0x40): the field merchant (talk t800006000: 3000-3499, 3500-3999 with 7800) sells it as its
 //   fixed rows 3000-3007 (release 0): 3007 / 3507 (the Small Pouch) sell it instead: +0x04 equipId, +0x08 price,
 //   +0x14 release 0, +0x18 quantity 1 (the pouch's own stock flag 90470 stays).
@@ -1066,6 +1066,10 @@ static int day_flow_rows(buf *sp, buf *goods, buf *shop) {
     wr32(row + 0x04, CHALLENGE_SPEFFECT);
     wr16(row + 0x30, CHALLENGE_ICON);
     wr32(row + 0xb8, 0xFFFFFFFF), wr32(row + 0xc0, 0xFFFFFFFF);
+    // isConsume (+0x48 bit 7, read against all 433 rows of the game's file): off, so a use before the condition loses
+    // nothing; the DLL removes the item itself when the challenge starts (deck test: our give-back did not reach it)
+    if (!(row[0x48] & 0x80)) return free(b.p), free(g.p), 0;
+    row[0x48] &= 0x7f;
     // the merchant's fixed Small Pouch rows (3007 / 3507) sell our item instead: with 8 item slots from the start
     // (PlayerCommonParam, below) the pouch has nothing left to add
     int replaced = 0;
