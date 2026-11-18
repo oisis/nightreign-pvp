@@ -8,7 +8,8 @@ full-sync = true    # invader: ask the host for its full world state (enemies, e
 loot-test = false   # logging only: what lies on the ground, every pickup and equipment dialog
 no-host = false           # test: your own expedition opens no host session (nobody can invade you)
 test-level = 0            # test: your own expedition sets your level to this number 5 s after the start (0 = off)
-boss-flow = 3             # the day clock (host): 3 = holds at 09, 11, ..., 21 and 22:59 until a boss is killed, kills banked (default); 0 = the game's clock; 1 / 2 = old tests
+boss-flow = 4             # the day clock (host): 4 = the day flow (held at 22:00 until the squad uses Challenge the Night; enemy tiers per boss; default); 3 = holds at 09, 11, ..., 21 and 22:59 until a boss is killed; 0 = the game's clock; 1 / 2 = old tests
+challenge-bosses = 1      # test: bosses needed before the challenge (the special boss as well); 0 = 5 (default)
 revive-hits = false       # test, invasions: a downed player is finished by the other side in 2 hits, raised by its own side in 5
 no-sprint = true          # the fast run (sprint) is off; false turns it back on
 ult-pvp = 100             # test, invasions: ultimate damage against players of the other side in percent (100 = unchanged, 0..999)

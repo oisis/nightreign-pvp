@@ -90,6 +90,39 @@ def draw_icon(size):
     return draw_master().resize((size, size), Image.LANCZOS)
 
 
+CHALLENGE_ICON = 21990   # item icon of "Challenge the Night" (goods 1291), 160 x 160 like the game's item icons
+
+
+@lru_cache(maxsize=None)
+def draw_swords():
+    """Item icon: two crossed swords, steel with a dark red glow, on a transparent background (drawn at 4x)."""
+    k = 4
+    n = 160 * k
+    img = Image.new("RGBA", (n, n), (0, 0, 0, 0))
+
+    def sword(angle):
+        m = Image.new("L", (n, n), 0)
+        d = ImageDraw.Draw(m)
+        c = n // 2
+        blade = [(c - 7 * k, c + 26 * k), (c - 7 * k, c - 52 * k), (c, c - 66 * k), (c + 7 * k, c - 52 * k), (c + 7 * k, c + 26 * k)]
+        d.polygon(blade, fill=255)
+        d.rounded_rectangle((c - 24 * k, c + 26 * k, c + 24 * k, c + 33 * k), radius=3 * k, fill=255)   # guard
+        d.rectangle((c - 4 * k, c + 33 * k, c + 4 * k, c + 56 * k), fill=255)                          # grip
+        d.ellipse((c - 8 * k, c + 54 * k, c + 8 * k, c + 70 * k), fill=255)                            # pommel
+        return m.rotate(angle, resample=Image.BICUBIC, center=(c, c))
+
+    for angle in (40, -40):
+        body = sword(angle)
+        glow = body.filter(ImageFilter.MaxFilter(6 * k + 1)).filter(ImageFilter.GaussianBlur(5 * k))
+        img.paste(Image.new("RGBA", (n, n), (150, 20, 20, 255)), mask=glow.point(lambda v: v * 3 // 4))
+        img.paste(Image.new("RGBA", (n, n), (40, 34, 30, 255)), mask=body)
+        inner = body.filter(ImageFilter.MinFilter(2 * k + 1))
+        shade = Image.linear_gradient("L").resize((n, n)).rotate(angle)
+        steel = Image.merge("RGB", [shade.point(lambda v: 150 + v * 90 // 255)] * 3).convert("RGBA")
+        img.paste(steel, mask=inner)
+    return img.resize((160, 160), Image.LANCZOS)
+
+
 # --- BC7 -----------------------------------------------------------------------------------------
 
 _WEIGHTS = (0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64)
@@ -223,6 +256,12 @@ if __name__ == "__main__":
                             for by in range(side // 4) for bx in range(side // 4))
             Path(sys.argv[2]).mkdir(parents=True, exist_ok=True)
             Path(sys.argv[2], f"icon_{icon_id}.bc7").write_bytes(data)
+        px = draw_swords().load()
+        data = b"".join(bc7_block(tuple(px[bx * 4 + i % 4, by * 4 + i // 4] for i in range(16)))
+                        for by in range(40) for bx in range(40))
+        Path(sys.argv[2], f"icon_{CHALLENGE_ICON}.bc7").write_bytes(data)
+    elif sys.argv[1] == "--png-swords":
+        draw_swords().save(sys.argv[2])
     elif sys.argv[1] == "--png":
         draw_icon(int(sys.argv[3]) if len(sys.argv) > 3 else 248).save(sys.argv[2])
     else:

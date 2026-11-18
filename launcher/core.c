@@ -39,7 +39,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 25
+#define BUILD_FORMAT 26
 #define BOSS_DEATHS_MIN 100  // the game (1.3.3) has 158 such flags; fewer = its event scripts changed
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
@@ -70,8 +70,31 @@ static const struct { u32 id; const char *english, *polish; } OUR_TEXT[] = {
     {131167, "Waiting for the squad's host...", "Oczekiwanie na hosta dru\xc5\xbcyny..."},
     {131168, "The invader has left", "Naje\xc5\xba" "d\xc5\xba" "ca odszed\xc5\x82"},
     {131169, "You have invaded another squad's expedition!", "Wkroczy\xc5\x82" "e\xc5\x9b do wyprawy innej dru\xc5\xbcyny!"},
+    // day flow (boss-flow 4): the challenge's progress and state (%s: the DLL puts "3/5" in)
+    {131180, "Challenge: %s bosses defeated; the special boss (dragon or Captain) not yet",
+             "Wyzwanie: %s boss\xc3\xb3w pokonanych; boss specjalny (smok lub Kapitan) jeszcze nie"},
+    {131181, "Challenge: %s bosses defeated; the special boss is defeated",
+             "Wyzwanie: %s boss\xc3\xb3w pokonanych; boss specjalny pokonany"},
+    {131182, "Challenge available: use Challenge the Night to face the night boss",
+             "Wyzwanie dost\xc4\x99pne: u\xc5\xbcyj Staw wyzwanie, by stan\xc4\x85\xc4\x87 przed bossem nocy"},
+    {131183, "The challenge is not available yet: defeat %s bosses and the special boss (dragon or Captain)",
+             "Wyzwanie nie jest jeszcze dost\xc4\x99pne: pokonaj %s boss\xc3\xb3w i bossa specjalnego (smok lub Kapitan)"},
+    {131184, "The challenge is taken: the night falls", "Wyzwanie podj\xc4\x99te: zapada noc"},
 };
 #define OUR_TEXT_COUNT (sizeof OUR_TEXT / sizeof *OUR_TEXT)
+// Our item's texts (item_dlc01.msgbnd: GoodsName / GoodsInfo / GoodsCaption, id = the goods id).
+#define CHALLENGE_GOODS 1291
+static const struct { const char *fmg, *english, *polish; } ITEM_TEXT[] = {
+    {"\\GoodsName.fmg", "Challenge the Night", "Staw wyzwanie"},
+    {"\\GoodsInfo.fmg", "Takes the whole squad to the night boss", "Przenosi ca\xc5\x82\xc4\x85 dru\xc5\xbcyn\xc4\x99 do bossa nocy"},
+    {"\\GoodsCaption.fmg",
+     "Two crossed blades, a call to the Night.\n\nUsable once the squad has defeated five bosses and the special boss of a region "
+     "(the Mountaintop's dragon or the Rotted Woods' Captain). Takes the whole squad to the night boss's arena, and the night "
+     "falls.\n\nUsed too early, it stays in the pouch.",
+     "Dwa skrzy\xc5\xbcowane ostrza, wezwanie Nocy.\n\nMo\xc5\xbcna u\xc5\xbcy\xc4\x87, gdy dru\xc5\xbcyna pokona pi\xc4\x99" "ciu boss\xc3\xb3w "
+     "i bossa specjalnego regionu (smoka Szczytu albo Kapitana Zgni\xc5\x82" "ego Lasu). Przenosi ca\xc5\x82\xc4\x85 dru\xc5\xbcyn\xc4\x99 "
+     "na aren\xc4\x99 bossa nocy i zapada noc.\n\nU\xc5\xbcyte za wcze\xc5\x9bnie zostaje w sakwie."},
+};
 
 // --- small utilities ----------------------------------------------------------------------------
 
@@ -681,6 +704,11 @@ static buf bnd4_file(buf b, int i) {
 }
 
 // Copy of the bundle with file `index` replaced. Headers and names are kept, the data area rebuilt.
+static buf bnd4_copy(buf f) {
+    buf c = {xalloc(f.n ? f.n : 1), f.n};
+    memcpy(c.p, f.p, f.n);
+    return c;
+}
 static buf bnd4_replace(buf b, int index, buf replacement) {
     u32 count = rd32(b.p + 0x0C), data_start = 0xFFFFFFFF;
     for (u32 i = 0; i < count; i++) {
@@ -948,6 +976,109 @@ static buf param_insert_sorted(buf p, int template_id, int new_id, u64 size, u8 
     }
     memcpy(out.p + strings_off + shift, p.p + strings_off, p.n - strings_off);
     return out;
+}
+
+// Copy of the param with n rows first_id .. first_id + n - 1 (copies of template_id) inserted in id order; *row
+// points at the first new row's data (the n rows follow each other). Empty buf if the param does not look as
+// expected or one of the ids is taken.
+static buf param_insert_range(buf p, int template_id, int first_id, u32 n, u64 size, u8 **row) {
+    buf out = {0};
+    if (n == 0 || p.n < 0x40 + 48 || !(p.p[0x2D] & 4)) return out;
+    u32 strings_off = rd32(p.p), count = rd16(p.p + 0x0A);
+    if (count < 2 || count + n > 0xffff || 0x40 + (size_t)count * 24 > p.n) return out;
+    u64 data_start = rd64(p.p + 0x48);
+    if (rd64(p.p + 0x40 + 24 + 8) - data_start != size || data_start != 0x40 + (u64)count * 24 ||
+        strings_off != data_start + count * size || strings_off > p.n) return out;
+    const u8 *tmpl = NULL;
+    u32 insert_at = count;
+    for (u32 i = 0; i < count; i++) {
+        const u8 *d = p.p + 0x40 + i * 24;
+        int id = (int)rd32(d);
+        if (rd64(d + 8) != data_start + i * size || (i && id <= (int)rd32(d - 24)) || (id >= first_id && id < first_id + (int)n)) return out;
+        if (id == template_id) tmpl = d;
+        if (id > first_id && insert_at == count) insert_at = i;
+    }
+    if (!tmpl) return out;
+    u64 shift = (24 + size) * n;
+    out.p = xalloc(p.n + shift);
+    out.n = p.n + shift;
+    memcpy(out.p, p.p, 0x40);
+    wr32(out.p, (u32)(strings_off + shift));
+    wr16(out.p + 0x0A, count + n);
+    wr64(out.p + 0x10, rd64(p.p + 0x10) + shift);
+    wr64(out.p + 0x30, data_start + 24 * n);
+    u64 new_start = data_start + 24 * n;
+    for (u32 j = 0, i = 0; j < count + n; j++) {
+        u8 *d = out.p + 0x40 + j * 24, *data = out.p + new_start + j * size;
+        int fresh = j >= insert_at && j < insert_at + n;
+        const u8 *src = fresh ? tmpl : p.p + 0x40 + i++ * 24;
+        wr32(d, fresh ? (u32)(first_id + (int)(j - insert_at)) : rd32(src));
+        wr32(d + 4, 0);
+        wr64(d + 8, new_start + j * size);
+        wr64(d + 16, rd64(src + 16) + shift);
+        memcpy(data, p.p + rd64(src + 8), size);
+        if (j == insert_at) *row = data;
+    }
+    memcpy(out.p + strings_off + shift, p.p + strings_off, p.n - strings_off);
+    return out;
+}
+
+// The day flow's rows (boss-flow 4; DLL: day_flow). Offsets read from the game's own rows (1.3.3):
+// - SpEffectParam (0x400): +0x08 effectEndurance, +0x10 maxHpRate, +0x48 / +0x4c / +0x50 / +0x54 physics / magic /
+//   fire / thunder attack, +0x1e0 dark attack (row 7430, the game's day-2 effect: 1.4 at exactly these fields).
+//   CHALLENGE_SPEFFECT: the item's use marker (template 10101, 1 s). TIER_FIRST + k (k = 1 .. TIER_COUNT): an enemy
+//   tier of +5 % * k HP and damage (template 10101, no time limit; the DLL puts one on each enemy and removes the
+//   one before).
+// - EquipParamGoods (0xe0): our item CHALLENGE_GOODS, a copy of Starlight Shards 1290 (a consumable whose use
+//   applies refId_default +0x04 as a SpEffect, refCategory 2): +0x04 our marker, +0x30 iconId, +0xb8 / +0xc0 its
+//   level-2 / 3 SpEffects off (-1).
+// - ShopLineupParam (0x40): the field merchant (talk t800006000: 3000-3499, 3500-3999 with 7800) sells it as its
+//   fixed rows 3000-3007 (release 0): a copy of 3007 (Small Pouch) at 3349 / 3849 (after the groups' last rows):
+//   +0x04 equipId, +0x08 price, +0x10 stock flag (90990: in no shop row, script or talk script), +0x14 release 0,
+//   +0x18 quantity 1.
+#define GOODS_PARAM "\\EquipParamGoods.param"
+#define SHOP_PARAM "\\ShopLineupParam.param"
+#define CHALLENGE_SPEFFECT 90071612
+#define TIER_FIRST 90071700
+#define TIER_COUNT 200
+#define CHALLENGE_ICON 21990
+#define CHALLENGE_PRICE 15000
+#define CHALLENGE_STOCK_FLAG 90990
+static int day_flow_rows(buf *sp, buf *goods, buf *shop) {
+    u8 *row = NULL;
+    buf a = param_insert_sorted(*sp, SPEFFECT_TEMPLATE, CHALLENGE_SPEFFECT, SPEFFECT_SIZE, &row);
+    if (!a.p || rd32(row + 0x08) != 0xBF800000) return free(a.p), 0;
+    float one = 1.0f;
+    memcpy(row + 0x08, &one, 4);
+    buf b = param_insert_range(a, SPEFFECT_TEMPLATE, TIER_FIRST + 1, TIER_COUNT, SPEFFECT_SIZE, &row);
+    free(a.p);
+    if (!b.p) return 0;
+    static const int RATE_AT[] = {0x10, 0x48, 0x4c, 0x50, 0x54, 0x1e0};
+    for (int k = 1; k <= TIER_COUNT; k++, row += SPEFFECT_SIZE) {
+        float v = 1.0f + 0.05f * (float)k;
+        for (size_t f = 0; f < sizeof RATE_AT / sizeof *RATE_AT; f++) {
+            float old;
+            memcpy(&old, row + RATE_AT[f], 4);
+            if (old != 1.0f) return free(b.p), 0;
+            memcpy(row + RATE_AT[f], &v, 4);
+        }
+    }
+    buf g = param_insert_sorted(*goods, 1290, CHALLENGE_GOODS, 0xe0, &row);
+    if (!g.p || rd32(row + 0x04) != 501290) return free(b.p), free(g.p), 0;
+    wr32(row + 0x04, CHALLENGE_SPEFFECT);
+    wr16(row + 0x30, CHALLENGE_ICON);
+    wr32(row + 0xb8, 0xFFFFFFFF), wr32(row + 0xc0, 0xFFFFFFFF);
+    buf h = param_insert_sorted(*shop, 3007, 3349, 0x40, &row), i = {0};
+    if (h.p && rd32(row + 0x04) == 10050) {
+        wr32(row + 0x04, CHALLENGE_GOODS), wr32(row + 0x08, CHALLENGE_PRICE), wr32(row + 0x10, CHALLENGE_STOCK_FLAG), wr32(row + 0x14, 0);
+        wr16(row + 0x18, 1);
+        i = param_insert_sorted(h, 3349, 3849, 0x40, &row);
+    }
+    free(h.p);
+    if (!i.p) return free(b.p), free(g.p), 0;
+    free(sp->p), free(goods->p), free(shop->p);
+    *sp = b, *goods = g, *shop = i;
+    return 1;
 }
 
 // Scarabs (NpcParam 41900000-41919999, 30 rows, all team 6) to team 17, in place. 0 if unexpected.
@@ -1714,8 +1845,8 @@ static int build_regulation(const char *game_dir) {
     if (memcmp(dcx, "DCX", 3) || memcmp(dcx + 0x28, "ZSTD", 4) || csize > enc.n - 16 - 0x4C)
         return free(enc.p), logf_("regulation.bin is not in the expected format"), 0;
     buf bundle = {xalloc((size_t)usize + (1 << 17)), usize};
-    buf patched = {0}, body = {0}, param = {0}, speffect = {0}, speffect2 = {0}, step = {0}, maps[4] = {{0}}, cur = {0};
-    int ok = 0, index, sp_index, npc_index, area_index, map_index[4] = {-1, -1, -1, -1};
+    buf patched = {0}, body = {0}, param = {0}, speffect = {0}, speffect2 = {0}, step = {0}, maps[4] = {{0}}, cur = {0}, goods = {0}, shop = {0};
+    int ok = 0, index, sp_index, npc_index, area_index, goods_index = -1, shop_index = -1, map_index[4] = {-1, -1, -1, -1};
     u8 *team_row = NULL, *ally_row = NULL;
     if (nr_zstd_decompress(dcx + 0x4C, csize, bundle.p, (size_t)usize + (1 << 17)) != usize) {
         logf_("regulation.bin could not be unpacked");
@@ -1733,6 +1864,10 @@ static int build_regulation(const char *game_dir) {
         logf_("The game's NpcParam looks different than expected. The game may have been updated; the mod needs an update too.");
     } else if ((area_index = bnd4_find(bundle, PLAY_AREA_PARAM)) < 0 || !no_rain(bnd4_file(bundle, area_index))) {
         logf_("The game's PlayAreaCreateCommonParam looks different than expected. The game may have been updated; the mod needs an update too.");
+    } else if ((goods_index = bnd4_find(bundle, GOODS_PARAM)) < 0 || (shop_index = bnd4_find(bundle, SHOP_PARAM)) < 0 ||
+               !(goods = bnd4_copy(bnd4_file(bundle, goods_index))).p || !(shop = bnd4_copy(bnd4_file(bundle, shop_index))).p ||
+               !day_flow_rows(&speffect2, &goods, &shop)) {
+        logf_("The game's goods, shop or SpEffect params look different than expected (day flow rows). The game may have been updated; the mod needs an update too.");
     } else if (!map_tables(bundle, map_index, maps)) {
         logf_("The game's map pattern tables look different than expected; the two-region maps cannot be built. The game may have been updated; the mod needs an update too.");
     } else {
@@ -1746,7 +1881,9 @@ static int build_regulation(const char *game_dir) {
                 r[0x16D] = 16, wr32(r + 0x18C, 300050);
             }
         // effectEndurance stays -1 (the template's): no time limit; the DLL removes it when the ally's part ends
-        wr32(ally_row + 0x18C, ALLY_PHANTOM_VFX);  // vfxId1: gold phantom look; team unchanged
+        for (u32 i = 0; i < rd16(speffect2.p + 0x0A); i++)  // (by id: day_flow_rows made a new copy after ally_row was found)
+            if (rd32(speffect2.p + 0x40 + i * 24) == SPEFFECT_ALLY_ROW)
+                wr32(speffect2.p + rd64(speffect2.p + 0x40 + i * 24 + 8) + 0x18C, ALLY_PHANTOM_VFX);  // vfxId1: gold phantom look; team unchanged
         // Written as a zlib DCX, like our other files (the launcher has no zstd compressor). It has
         // to be compressed: the game crashes at start-up on a 55 MB regulation.bin of stored zstd
         // blocks. ponytail: unlike the game's own file this is not zstd; if the game ever stops
@@ -1757,6 +1894,9 @@ static int build_regulation(const char *game_dir) {
                    map_draw_group() >= 0 ? "; test: only one night boss group (map-group)" : "");
         step = bnd4_replace(bundle, index, param);
         patched = bnd4_replace(step, sp_index, speffect2);
+        cur = bnd4_replace(patched, goods_index, goods), free(patched.p), patched = cur;
+        cur = bnd4_replace(patched, shop_index, shop), free(patched.p), patched = cur;
+        logf_("Day flow: item %d at the field merchant (rows 3349 / 3849, %d runes), %d enemy tiers", CHALLENGE_GOODS, CHALLENGE_PRICE, TIER_COUNT);
         for (int t = 0; t < 4; t++)
             if (maps[t].p) cur = bnd4_replace(patched, map_index[t], maps[t]), free(patched.p), patched = cur;
         body = dcx_write(patched);
@@ -1773,6 +1913,7 @@ static int build_regulation(const char *game_dir) {
         free(out.p);
     }
     free(enc.p); free(bundle.p); free(param.p); free(speffect.p); free(speffect2.p); free(step.p); free(patched.p); free(body.p);
+    free(goods.p); free(shop.p);
     for (int t = 0; t < 4; t++) free(maps[t].p);
     return ok;
 }
@@ -1783,9 +1924,13 @@ static int build_regulation(const char *game_dir) {
 // ("MENU_MenuIcon_<id>.png"). Our two icons go into an unused corner of the DLC atlas and get one
 // layout line each, as in mod/build_icon.py, which also produces their BC7 blocks (data/icon_<id>.bc7).
 
-#define ICON_ATLAS "SB_MenuIcon_DLC01_0"
+// Two atlases: the Target list's icons (menu icons) and our item's icon (item icons, 160 x 160 like the game's).
 #define DDS_HEADER 148
-static const struct { int id, side; } ICONS[] = {{41813, 248}, {41814, 460}};
+static const struct { const char *atlas, *name; int id, side; } ICONS[] = {
+    {"SB_MenuIcon_DLC01_0", "MENU_MenuIcon_%d", 41813, 248},
+    {"SB_MenuIcon_DLC01_0", "MENU_MenuIcon_%d", 41814, 460},
+    {"SB_ItemIcon_DLC01_0", "MENU_ItemIcon_%05d", 21990, 160},  // CHALLENGE_ICON
+};
 #define ICON_COUNT (sizeof ICONS / sizeof *ICONS)
 typedef struct { int x, w, y, h; } rect;
 
@@ -1879,24 +2024,16 @@ static void remove_two_region_map(void) {
     }
 }
 
-static int build_icons(const char *game_dir, buf bhd, const char *bdt, char quality) {
-    char path[1300];
-    snprintf(path, sizeof path, "/menu/21_common_dlc01_%c.sblytbnd.dcx", quality);
-    buf dcx = archive_read(bhd, bdt, path);
-    buf bundle = dcx.p ? dcx_read(game_dir, dcx) : dcx;
-    free(dcx.p);
-    snprintf(path, sizeof path, "/menu/21_common_dlc01_%c.tpf.dcx", quality);
-    dcx = archive_read(bhd, bdt, path);
-    buf tpf = dcx.p ? dcx_read(game_dir, dcx) : dcx;
-    free(dcx.p);
-    char *layout = NULL, *text = NULL;
+static int place_icons(buf *bundle, buf tpf, const char *atlas_name, char quality) {
+    char key[64], path[1300];
+    snprintf(key, sizeof key, "%s.layout", atlas_name);
+    int index = bnd4_find(*bundle, key), ok = 0;
+    if (index < 0) return logf_("menu icon layout %s not found", atlas_name), 0;
+    buf lay = bnd4_file(*bundle, index);
+    char *layout = xalloc(lay.n + 1), *text = NULL;
     rect *used = NULL;
-    int ok = 0, index = bundle.p ? bnd4_find(bundle, ICON_ATLAS ".layout") : -1;
-    if (index < 0 || !tpf.p) { logf_("menu icon files not found in the game archive"); goto done; }
-
-    buf lay = bnd4_file(bundle, index);
-    layout = xalloc(lay.n + 1);
     memcpy(layout, lay.p, lay.n);
+    layout[lay.n] = 0;
     const char *atlas = strstr(layout, "<TextureAtlas "), *close = strstr(layout, "</TextureAtlas>");
     int width = atlas ? attr_int(atlas, " width=\"") : -1, height = atlas ? attr_int(atlas, " height=\"") : -1;
     size_t n = 0, cap = 0;
@@ -1910,32 +2047,32 @@ static int build_icons(const char *game_dir, buf bhd, const char *bdt, char qual
         rect r = {attr_int(t, " x=\""), attr_int(t, " width=\""), attr_int(t, " y=\""), attr_int(t, " height=\"")};
         used[n++] = r;
     }
-
     // The atlas texture inside the TPF: a BC7 DDS without mipmaps.
     u8 *dds = NULL;
     for (u32 i = 0; tpf.n >= 0x10 && i < rd32(tpf.p + 8) && 0x10 + (size_t)(i + 1) * 0x14 <= tpf.n; i++) {
         const u8 *e = tpf.p + 0x10 + i * 0x14;
-        if (rd32(e + 0x0C) < tpf.n && name_ends_with(tpf.p + rd32(e + 0x0C), ICON_ATLAS) &&
+        if (rd32(e + 0x0C) < tpf.n && name_ends_with(tpf.p + rd32(e + 0x0C), atlas_name) &&
             (u64)rd32(e) + rd32(e + 4) <= tpf.n && rd32(e + 4) > DDS_HEADER) dds = tpf.p + rd32(e);
     }
     if (!atlas || !close || width < 0 || height < 0 || !dds || memcmp(dds + 84, "DX10", 4) || rd32(dds + 128) != 98 ||
         (int)rd32(dds + 12) != height || (int)rd32(dds + 16) != width) {
-        logf_("The game's menu icon atlas looks different than expected. The game may have been updated; the mod needs an update too.");
+        logf_("The game's menu icon atlas %s looks different than expected. The game may have been updated; the mod needs an update too.", atlas_name);
         goto done;
     }
-
     char lines[ICON_COUNT * 256];
     size_t len = 0;
     for (size_t i = 0; i < ICON_COUNT; i++) {
+        if (strcmp(ICONS[i].atlas, atlas_name)) continue;
         int side = ICONS[i].side, x, y;
-        char name[64];
-        snprintf(name, sizeof name, "MENU_MenuIcon_%d.", ICONS[i].id);
+        char name[64], probe[72];
+        snprintf(name, sizeof name, ICONS[i].name, ICONS[i].id);
+        snprintf(probe, sizeof probe, "%s.", name);
         snprintf(path, sizeof path, "%s" SEP "data" SEP "icon_%d.bc7", g_app, ICONS[i].id);
         buf blocks = read_file(path);
         size_t per_row = (size_t)side / 4 * 16;
-        if (strstr(layout, name) || blocks.n != per_row * (side / 4) || !free_spot(used, n, side, width, height, &x, &y)) {
+        if (strstr(layout, probe) || blocks.n != per_row * (side / 4) || !free_spot(used, n, side, width, height, &x, &y)) {
             free(blocks.p);
-            logf_("menu icon %d cannot be added", ICONS[i].id);
+            logf_("menu icon %d cannot be added (%s, %c)", ICONS[i].id, atlas_name, quality);
             goto done;
         }
         rect r = {x, side, y, side};
@@ -1944,9 +2081,9 @@ static int build_icons(const char *game_dir, buf bhd, const char *bdt, char qual
             memcpy(dds + DDS_HEADER + ((size_t)(y / 4 + by) * (width / 4) + x / 4) * 16, blocks.p + by * per_row, per_row);
         free(blocks.p);
         len += (size_t)snprintf(lines + len, sizeof lines - len,
-                                "\t<SubTexture name=\"MENU_MenuIcon_%d.png\" x=\"%d\" width=\"%d\" y=\"%d\" height=\"%d\""
+                                "\t<SubTexture name=\"%s.png\" x=\"%d\" width=\"%d\" y=\"%d\" height=\"%d\""
                                 " originalWidth=\"%d\" originalHeight=\"%d\" half=\"0\"/>\r\n",
-                                ICONS[i].id, x, side, y, side, side, side);
+                                name, x, side, y, side, side, side);
     }
     size_t before = (size_t)(close - layout);
     text = xalloc(lay.n + len);
@@ -1954,16 +2091,38 @@ static int build_icons(const char *game_dir, buf bhd, const char *bdt, char qual
     memcpy(text + before, lines, len);
     memcpy(text + before + len, close, lay.n - before);
     buf new_layout = {(u8 *)text, lay.n + len};
-    buf patched = bnd4_replace(bundle, index, new_layout), out = dcx_write(patched);
-    snprintf(path, sizeof path, "%s" SEP "work" SEP "build" SEP "menu" SEP "21_common_dlc01_%c.sblytbnd.dcx", g_app, quality);
-    ok = write_file(path, out.p, out.n);
-    free(patched.p); free(out.p);
-    out = dcx_write(tpf);
-    snprintf(path, sizeof path, "%s" SEP "work" SEP "build" SEP "menu" SEP "21_common_dlc01_%c.tpf.dcx", g_app, quality);
-    ok = ok && write_file(path, out.p, out.n);
-    free(out.p);
+    buf patched = bnd4_replace(*bundle, index, new_layout);
+    free(bundle->p);
+    *bundle = patched;
+    ok = 1;
 done:
-    free(layout); free(text); free(used); free(bundle.p); free(tpf.p);
+    free(layout); free(text); free(used);
+    return ok;
+}
+static int build_icons(const char *game_dir, buf bhd, const char *bdt, char quality) {
+    char path[1300];
+    snprintf(path, sizeof path, "/menu/21_common_dlc01_%c.sblytbnd.dcx", quality);
+    buf dcx = archive_read(bhd, bdt, path);
+    buf bundle = dcx.p ? dcx_read(game_dir, dcx) : dcx;
+    free(dcx.p);
+    snprintf(path, sizeof path, "/menu/21_common_dlc01_%c.tpf.dcx", quality);
+    dcx = archive_read(bhd, bdt, path);
+    buf tpf = dcx.p ? dcx_read(game_dir, dcx) : dcx;
+    free(dcx.p);
+    int ok = 0;
+    if (!bundle.p || !tpf.p) {
+        logf_("menu icon files not found in the game archive");
+    } else if (place_icons(&bundle, tpf, "SB_MenuIcon_DLC01_0", quality) && place_icons(&bundle, tpf, "SB_ItemIcon_DLC01_0", quality)) {
+        buf out = dcx_write(bundle);
+        snprintf(path, sizeof path, "%s" SEP "work" SEP "build" SEP "menu" SEP "21_common_dlc01_%c.sblytbnd.dcx", g_app, quality);
+        ok = write_file(path, out.p, out.n);
+        free(out.p);
+        out = dcx_write(tpf);
+        snprintf(path, sizeof path, "%s" SEP "work" SEP "build" SEP "menu" SEP "21_common_dlc01_%c.tpf.dcx", g_app, quality);
+        ok = ok && write_file(path, out.p, out.n);
+        free(out.p);
+    }
+    free(bundle.p); free(tpf.p);
     return ok;
 }
 
@@ -2148,29 +2307,63 @@ void core_save_lang(const char *code) {
     write_file(path, (const u8 *)code, strlen(code));
 }
 
+// Per language: our menu lines into CL_MenuText (menu_dlc01) and our item's three lines into the goods tables
+// (item_dlc01), both bundles unpacked in one go.
 static int build_text(const char *game_dir, buf bhd, const char *bdt, const char *lang) {
     char path[1300];
+    buf in[2], out[2];
     snprintf(path, sizeof path, "/msg/%s/menu_dlc01.msgbnd.dcx", lang);
-    buf dcx = archive_read(bhd, bdt, path);
-    if (!dcx.p) return -1;  // language not installed
-    buf bundle = dcx_read(game_dir, dcx);
-    free(dcx.p);
-    if (!bundle.p) return 0;
-    int target = bnd4_find(bundle, TEXT_TARGET_FMG);
-    fmg dst = {0};
-    if (target < 0 || !fmg_parse(bnd4_file(bundle, target), &dst))
-        return logf_("%s: unexpected text bundle layout", lang), 0;
-
-    u8 wide[OUR_TEXT_COUNT][512];
-    for (size_t i = 0; i < OUR_TEXT_COUNT; i++) {
-        const char *line = !strcmp(lang, "polpl") ? OUR_TEXT[i].polish : OUR_TEXT[i].english;
-        fmg_set(&dst, OUR_TEXT[i].id, wide[i], utf8_to_utf16(line, wide[i]));
+    in[0] = archive_read(bhd, bdt, path);
+    if (!in[0].p) return -1;  // language not installed
+    snprintf(path, sizeof path, "/msg/%s/item_dlc01.msgbnd.dcx", lang);
+    in[1] = archive_read(bhd, bdt, path);
+    if (!in[1].p) return free(in[0].p), logf_("%s: no item texts in the game archive", lang), 0;
+    dcx_read_many(game_dir, in, out, 2);
+    free(in[0].p), free(in[1].p);
+    int ok = out[0].p && out[1].p;
+    int polish = !strcmp(lang, "polpl");
+    if (ok) {
+        buf bundle = out[0];
+        int target = bnd4_find(bundle, TEXT_TARGET_FMG);
+        fmg dst = {0};
+        if (target < 0 || !fmg_parse(bnd4_file(bundle, target), &dst)) {
+            ok = 0, logf_("%s: unexpected text bundle layout", lang);
+        } else {
+            static u8 wide[OUR_TEXT_COUNT][512];
+            for (size_t i = 0; i < OUR_TEXT_COUNT; i++)
+                fmg_set(&dst, OUR_TEXT[i].id, wide[i], utf8_to_utf16(polish ? OUR_TEXT[i].polish : OUR_TEXT[i].english, wide[i]));
+            buf table = fmg_write(&dst), patched = bnd4_replace(bundle, target, table), dcx = dcx_write(patched);
+            snprintf(path, sizeof path, "%s" SEP "work" SEP "build" SEP "msg" SEP "%s" SEP "menu_dlc01.msgbnd.dcx", g_app, lang);
+            ok = write_file(path, dcx.p, dcx.n);
+            free(table.p); free(patched.p); free(dcx.p);
+        }
+        free(dst.e);
     }
-
-    buf table = fmg_write(&dst), patched = bnd4_replace(bundle, target, table), out = dcx_write(patched);
-    snprintf(path, sizeof path, "%s" SEP "work" SEP "build" SEP "msg" SEP "%s" SEP "menu_dlc01.msgbnd.dcx", g_app, lang);
-    int ok = write_file(path, out.p, out.n);
-    free(dst.e); free(table.p); free(patched.p); free(out.p); free(bundle.p);
+    if (ok) {  // the item's name, info and caption (goods id CHALLENGE_GOODS)
+        buf bundle = bnd4_copy(out[1]);
+        static u8 wide[sizeof ITEM_TEXT / sizeof *ITEM_TEXT][2048];
+        for (size_t t = 0; ok && t < sizeof ITEM_TEXT / sizeof *ITEM_TEXT; t++) {
+            int target = bnd4_find(bundle, ITEM_TEXT[t].fmg);
+            fmg dst = {0};
+            if (target < 0 || !fmg_parse(bnd4_file(bundle, target), &dst)) {
+                ok = 0, logf_("%s: unexpected item text bundle layout (%s)", lang, ITEM_TEXT[t].fmg);
+            } else {
+                fmg_set(&dst, CHALLENGE_GOODS, wide[t], utf8_to_utf16(polish ? ITEM_TEXT[t].polish : ITEM_TEXT[t].english, wide[t]));
+                buf table = fmg_write(&dst), patched = bnd4_replace(bundle, target, table);
+                free(bundle.p), free(table.p);
+                bundle = patched;
+            }
+            free(dst.e);
+        }
+        if (ok) {
+            buf dcx = dcx_write(bundle);
+            snprintf(path, sizeof path, "%s" SEP "work" SEP "build" SEP "msg" SEP "%s" SEP "item_dlc01.msgbnd.dcx", g_app, lang);
+            ok = write_file(path, dcx.p, dcx.n);
+            free(dcx.p);
+        }
+        free(bundle.p);
+    }
+    free(out[0].p), free(out[1].p);
     return ok;
 }
 
@@ -2888,7 +3081,7 @@ int core_selftest(void) {
                                 "nope = true\r\nloot-test = yes\r\n\r\ndebug-log = false\r\ntest-level = 15\r\nmap-group = 3\r\nult-pvp = 250\r\none-region = 1000";
         short v[SETTINGS_COUNT];
         char bad[64];
-        static const short want[SETTINGS_COUNT] = {1, 1, -1, -1, 0, -1, 15, -1, -1, 3, -1, -1, -1, -1, 250, -1, -1, -1, -1, -1, -1};
+        static const short want[SETTINGS_COUNT] = {1, 1, -1, -1, 0, -1, 15, -1, -1, 3, -1, -1, -1, -1, 250, -1, -1, -1, -1, -1, -1, -1};
         int good = settings_parse(t, sizeof t - 1, v, bad, sizeof bad) == 3 && !memcmp(v, want, sizeof v) &&
                    !strcmp(bad, "nope = true, loot-test = yes, one-region = 1000");
         good = good && !load_settings("/nonexistent/test-settings.toml", v);

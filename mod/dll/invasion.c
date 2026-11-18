@@ -2218,9 +2218,11 @@ static int boss_death(unsigned id) {
     }
     return 0;
 }
+static void df_kill(unsigned id);
+static void df_chr_pass_hook(char *chr);
 static void flag_note(char *man, unsigned id, int on, int before) {
     (void)man;
-    if (on && before == 0 && id >= 10000000u && boss_death(id)) bf3_kill(id);
+    if (on && before == 0 && id >= 10000000u && boss_death(id)) bf3_kill(id), df_kill(id);
     if (!setting(S_FLAG_LOG)) {
         // always (boss-grace check): a boss-family flag (nnn 800..899 in a block with d = 0, the d digit being
         // (id / 1000) % 10 in tile ids 10XXYYdnnn / 10XYVddnnn and small-map ids) turned on, or dropped for want of a
@@ -3098,6 +3100,7 @@ static void hook_acceptance(void) {
         if ((g_settings[S_ULT_PVP] && g_settings[S_ULT_PVP] != 100) || g_debug_log) ult_pvp_install();
         rune_install();
         flask_log_install();
+        hook_call(0x5186ac, 0x3c7e50, (void *)df_chr_pass_hook, "day flow: enemy tiers (correction re-apply pass)");
         pkt_guard_install();
         hook_call(0xba0e42, 0xddb9c0, (void *)pin_read_73, "map pin: pin packet read (1)");
         hook_call(0xba11aa, 0xddb9c0, (void *)pin_read_73, "map pin: pin packet read (2)");
@@ -3988,10 +3991,12 @@ static void host_death_watch(void) {
     char *chr = local_player();
     int now = chr && !IsBadReadPtr(chr, 0x740) ? (unsigned char)chr[0x710] : -1;
     // with an ally in the session the squad lives on: left to the game (its own rule for a dead squad member)
-    if (1 && g_host_switched && side_count(0) > 0 && side_count(1) == 0 && last == 1 && now == 0) {
+    // day flow (boss-flow 4, the owner's rule): the host's final death (downed, then finished or bled out) ends the
+    // expedition for the whole squad, whoever is in the session
+    if (last == 1 && now == 0 && (g_settings[S_BOSS_FLOW] == 4 || (g_host_switched && side_count(0) > 0 && side_count(1) == 0))) {
         ((void (*)(void))(g_base + 0x6af8f0))();
         char *gm = *(char **)(g_base + 0x3c13258);
-        logf("finish test: local player died with an invader admitted: expedition end requested (gm+0xaf1 = %u)",
+        logf("finish test: the host's final death: expedition end requested (gm+0xaf1 = %u)",
              gm ? (unsigned char)gm[0xaf1] : 0);
     }
     last = now;
@@ -4585,15 +4590,15 @@ static void version_seen(const char *ver, int party) {
     if (party && !*g_ver_team) snprintf(g_ver_team, sizeof g_ver_team, "%s", ver);  // same password key, other version
 }
 static void notice_with(int id, const char *arg) {
-    static _Alignas(16) char text[2][0x100];
-    static unsigned short line[2][256];
-    int k = id == 131171;
+    static _Alignas(16) char text[8][0x100];  // one slot per line: 131170 / 131171 and the day flow's 131180-131184
+    static unsigned short line[8][256];
+    int k = id & 7;
     char *t = ((char *(*)(void *, int))(g_base + RVA_MENU_TEXT_CTOR))(text[k], id);
     const unsigned short *tpl = t && *(unsigned short **)t ? *(unsigned short **)t : t ? *(unsigned short **)(t + 0x10) : NULL;
     int n = 0;
     for (int i = 0; tpl && !IsBadReadPtr(tpl + i, 2) && tpl[i] && i < 200 && n < 250; i++) {
         if (tpl[i] == '%' && tpl[i + 1] == 's') {
-            for (const char *a = arg; *a && n < 250; a++) line[k][n++] = (unsigned char)*a;
+            for (const char *a = arg; a && *a && n < 250; a++) line[k][n++] = (unsigned char)*a;
             i++;
         } else line[k][n++] = tpl[i];
     }
@@ -6141,10 +6146,15 @@ static void night_hide_frame(int in_world) {
         g_hide_on = 0, g_hidden_n = 0;
     }
 }
+static void bf4_frame(int first);
 static void boss_flow_frame(int first) {
     if (first) g_bf_state = BF_WAIT, g_bf_held = 0, g_bf_repeats = 0;
     if (g_settings[S_BOSS_FLOW] == 3) {
         bf3_frame(first);
+        return;
+    }
+    if (g_settings[S_BOSS_FLOW] == 4) {
+        bf4_frame(first);
         return;
     }
     if (!setting(S_BOSS_FLOW) || g_bf_state == BF_NIGHT2) return;
@@ -6530,6 +6540,7 @@ static void host_expedition(int step) {
 
 #include "overlay.h"
 #include "capacity.h"
+#include "day_flow.h"
 // Counts for the overlay (counts only: no names, no ids): our lobbies of our version, by the phase the host publishes.
 // In the hub (the local player's map block 0x0a......, m10 the Roundtable Hold) at most every 30 s through its own
 // list request while no search is running; a running search's result is counted instead (counts_from_list).
@@ -6832,6 +6843,7 @@ static void step_hook(void *ctrl, void *time, int step) {
     no_sprint_frame();
     g_in_exped = step == QM_STEP_INGAME || g_join_in_world();
     night_hide_frame(g_in_exped);
+    day_flow_frame(g_in_exped);
     if (step == QM_STEP_INGAME || g_join_in_world()) invader_notice_frame();
     summon_kill_reward();
     crash_watch_members();
