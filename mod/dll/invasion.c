@@ -2220,6 +2220,7 @@ static int boss_death(unsigned id) {
 }
 static void df_kill(unsigned id);
 static void df_chr_pass_hook(char *chr);
+static void df_death_restart_install(void);
 static void flag_note(char *man, unsigned id, int on, int before) {
     (void)man;
     if (on && before == 0 && id >= 10000000u && boss_death(id)) bf3_kill(id), df_kill(id);
@@ -3106,6 +3107,7 @@ static void hook_acceptance(void) {
         rune_install();
         flask_log_install();
         hook_call(0x5186ac, 0x3c7e50, (void *)df_chr_pass_hook, "day flow: enemy tiers (correction re-apply pass)");
+        df_death_restart_install();
         pkt_guard_install();
         hook_call(0xba0e42, 0xddb9c0, (void *)pin_read_73, "map pin: pin packet read (1)");
         hook_call(0xba11aa, 0xddb9c0, (void *)pin_read_73, "map pin: pin packet read (2)");

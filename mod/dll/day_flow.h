@@ -419,6 +419,47 @@ static void df_events_frame(void) {
     df_net_flag(FAM[k].flag);
     logf("day flow: event %d started: %s (flag %d), level %d, %d bosses this day", k + 1, FAM[k].name, FAM[k].flag, level, g_df_kills_day);
 }
+// --- the final death (deck test of 07f56eb: ending at HP 0 came before the game's downed countdown). The game's own
+// path after a death that is not revived: CS::CSLuaEventScriptImitation::CSDeathRestartEvent, whose first state
+// 0x1405c38f0 sets the level (0x140729200: the death's -1) and brings the player back (the respawn block, then the
+// placement). It is bound as a state at 0x1405c3ffa (lea rax, 0x1405c38f0, in 0x1405c3f80). Under boss-flow 4 that state
+// is taken over: instead of the revive, our own player's expedition ends: the host (or solo) through the way home
+// of a lost invasion (0x6af8f0, gm+0xaf1), which ends it for the squad; an ally through join_over (it may join again).
+// So the downed state and its countdown stay the game's; only what follows the death changes.
+static int g_df_ended;
+static void df_death_restart_hook(long long *ev, void *sm) {
+    if (!df_on() || !g_in_exped) {
+        ((void (*)(long long *, void *))(g_base + 0x5c38f0))(ev, sm);
+        return;
+    }
+    if (g_df_ended) return;
+    g_df_ended = 1;
+    if (g_join == 4 && g_as_ally) {
+        logf("day flow: final death (the game's death restart, ally): home instead of the revive");
+        join_over("ally's final death");
+    } else if (g_join != 4) {
+        ((void (*)(void))(g_base + 0x6af8f0))();
+        char *gm = *(char **)(g_base + 0x3c13258);
+        logf("day flow: final death (the game's death restart): expedition end requested (gm+0xaf1 = %u) instead of the revive with a level less",
+             gm ? (unsigned char)gm[0xaf1] : 0);
+    } else {
+        g_df_ended = 0;
+        ((void (*)(long long *, void *))(g_base + 0x5c38f0))(ev, sm);  // an invader: the game's own way
+    }
+}
+static void df_death_restart_install(void) {
+    unsigned char *site = (unsigned char *)g_base + 0x5c3ffa, *stub = near_alloc(12);
+    int expected = (int)(0x5c38f0 - (0x5c3ffa + 7));
+    void *hook = (void *)df_death_restart_hook;
+    if (site[0] != 0x48 || site[1] != 0x8d || site[2] != 0x05 || memcmp(site + 3, &expected, 4) || !stub) {
+        logf("day flow: death restart state at 5c3ffa does not look as expected, not hooked");
+        return;
+    }
+    stub[0] = 0x48; stub[1] = 0xB8;
+    memcpy(stub + 2, &hook, 8);
+    stub[10] = 0xFF; stub[11] = 0xE0;
+    if (patch_rel32(site + 3, site + 7, stub)) logf("day flow: death restart state: hooked (5c3ffa)");
+}
 // --- every frame in the field (every machine)
 static void day_flow_frame(int in_world) {
     static int was, marker_was, day2_seen, last_tier = -1, down_last = -1;
@@ -435,7 +476,7 @@ static void day_flow_frame(int in_world) {
         char *gm0 = *(char **)(g_base + 0x3c13258);
         logf("day flow: expedition start (pattern %u / %u): challenge after %d bosses and the special boss", gm0 ? *(unsigned *)(gm0 + 0xb48) : 0,
              gm0 ? *(unsigned *)(gm0 + 0xb4c) : 0, df_needed());
-        g_df_warp_until = 0, g_df_load_until = 0;
+        g_df_warp_until = 0, g_df_load_until = 0, g_df_ended = 0;
     }
     if (!day2_seen && bf_flag(7505)) {  // day 2: the game's own day-2 level, our count starts again
         day2_seen = 1, g_df_day = 2;
@@ -488,25 +529,5 @@ static void day_flow_frame(int in_world) {
     }
     df_lobby_watch();
     if (g_join != 4) df_events_frame();
-    // solo (our own expedition, nobody else in the session): every death is final (no downed state, nobody to revive),
-    // so at HP 0 (+0x140 of [chr+0x1b8], before the game's revive with the level loss) the expedition ends: the way
-    // home of a lost invasion, 0x6af8f0 (gm+0xaf1). In a squad the host's final death is host_death_watch's (+0x710 1 -> 0).
-    {
-        static DWORD ended;
-        static int alive_seen;  // HP above 0 seen in this expedition (no end on a load's empty value)
-        char **pd = me && !IsBadReadPtr(me + 0x1b8, 8) ? *(char ***)(me + 0x1b8) : NULL;
-        int hp = pd && !IsBadReadPtr(pd, 8) && *pd && !IsBadReadPtr(*pd, 0x148) ? *(int *)(*pd + 0x140) : 1;
-        if (first) ended = 0, alive_seen = 0;
-        if (hp > 0 && pd) alive_seen = 1;
-        if (g_join != 4 && hp <= 0 && alive_seen && !ended && side_count(0) == 0 && side_count(1) == 0) {
-            ended = GetTickCount() | 1;
-            ((void (*)(void))(g_base + 0x6af8f0))();
-            char *gm = *(char **)(g_base + 0x3c13258);
-            logf("day flow: solo death: expedition end requested (gm+0xaf1 = %u): back to the Roundtable Hold", gm ? (unsigned char)gm[0xaf1] : 0);
-        }
-    }
-    // an ally's final death (downed, then finished or bled out: +0x710 1 -> 0): home, it may join again
-    int down = me && !IsBadReadPtr(me, 0x740) ? (unsigned char)me[0x710] : -1;
-    if (g_join == 4 && g_as_ally && down_last == 1 && down == 0) join_over("ally's final death");
-    down_last = down;
+    (void)down_last;  // the final death is the death restart's (df_death_restart_hook)
 }
