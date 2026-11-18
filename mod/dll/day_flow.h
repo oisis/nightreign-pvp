@@ -387,6 +387,23 @@ static void day_flow_frame(int in_world) {
     marker_was = marker;
     df_lobby_watch();
     if (g_join != 4) df_events_frame();
+    // solo (our own expedition, nobody else in the session): every death is final (no downed state, nobody to revive),
+    // so at HP 0 (+0x140 of [chr+0x1b8], before the game's revive with the level loss) the expedition ends: the way
+    // home of a lost invasion, 0x6af8f0 (gm+0xaf1). In a squad the host's final death is host_death_watch's (+0x710 1 -> 0).
+    {
+        static DWORD ended;
+        static int alive_seen;  // HP above 0 seen in this expedition (no end on a load's empty value)
+        char **pd = me && !IsBadReadPtr(me + 0x1b8, 8) ? *(char ***)(me + 0x1b8) : NULL;
+        int hp = pd && !IsBadReadPtr(pd, 8) && *pd && !IsBadReadPtr(*pd, 0x148) ? *(int *)(*pd + 0x140) : 1;
+        if (first) ended = 0, alive_seen = 0;
+        if (hp > 0 && pd) alive_seen = 1;
+        if (g_join != 4 && hp <= 0 && alive_seen && !ended && side_count(0) == 0 && side_count(1) == 0) {
+            ended = GetTickCount() | 1;
+            ((void (*)(void))(g_base + 0x6af8f0))();
+            char *gm = *(char **)(g_base + 0x3c13258);
+            logf("day flow: solo death: expedition end requested (gm+0xaf1 = %u): back to the Roundtable Hold", gm ? (unsigned char)gm[0xaf1] : 0);
+        }
+    }
     // an ally's final death (downed, then finished or bled out: +0x710 1 -> 0): home, it may join again
     int down = me && !IsBadReadPtr(me, 0x740) ? (unsigned char)me[0x710] : -1;
     if (g_join == 4 && g_as_ally && down_last == 1 && down == 0) join_over("ally's final death");
