@@ -39,7 +39,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 34
+#define BUILD_FORMAT 35
 #define BOSS_DEATHS_MIN 100  // the game (1.3.3) has 158 such flags; fewer = its event scripts changed
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
@@ -70,16 +70,10 @@ static const struct { u32 id; const char *english, *polish; } OUR_TEXT[] = {
     {131167, "Waiting for the squad's host...", "Oczekiwanie na hosta dru\xc5\xbcyny..."},
     {131168, "The invader has left", "Naje\xc5\xba" "d\xc5\xba" "ca odszed\xc5\x82"},
     {131169, "You have invaded another squad's expedition!", "Wkroczy\xc5\x82" "e\xc5\x9b do wyprawy innej dru\xc5\xbcyny!"},
-    // day flow (boss-flow 4): the challenge's progress and state (%s: the DLL puts "3/5" in)
-    // 131180 / 131181: the first %s is "N/M", the second M (M = the bosses needed; owner, 2026-11-19)
-    {131180, "Bosses defeated: %s. Defeat %s bosses and the special boss (the dragon or the Captain) to challenge the night boss.",
-             "Zabi\xc5\x82" "e\xc5\x9b %s boss\xc3\xb3w. Zabij %s boss\xc3\xb3w i bossa specjalnego (smoka lub Kapitana), aby wyzwa\xc4\x87 bossa nocy."},
-    {131181, "Bosses defeated: %s. Defeat %s bosses to challenge the night boss.",
-             "Zabi\xc5\x82" "e\xc5\x9b %s boss\xc3\xb3w. Zabij %s boss\xc3\xb3w, aby wyzwa\xc4\x87 bossa nocy."},
+    // day flow (boss-flow 4): the challenge's state
+    // 131180 / 131181 / 131183: per pair (pair_texts)
     {131182, "Challenge available: use Challenge the Night to face the night boss",
              "Wyzwanie dost\xc4\x99pne: u\xc5\xbcyj Staw wyzwanie, by stan\xc4\x85\xc4\x87 przed bossem nocy"},
-    {131183, "The challenge is not available yet: defeat %s bosses and the special boss (dragon or Captain)",
-             "Wyzwanie nie jest jeszcze dost\xc4\x99pne: pokonaj %s boss\xc3\xb3w i bossa specjalnego (smok lub Kapitan)"},
     {131184, "The challenge is taken: the night falls", "Wyzwanie podj\xc4\x99te: zapada noc"},
 };
 #define OUR_TEXT_COUNT (sizeof OUR_TEXT / sizeof *OUR_TEXT)
@@ -116,11 +110,14 @@ static int g_pair_given;  // the test settings name a pair (0..3); otherwise it 
 static int pair_now(void);
 // Texts that depend on the pair: 131180 / 131183 (the special boss), 131185 (the map's name, at the expedition start),
 // 131186 + k (a team with our password plays pair k), the item's caption. (id, text) for the language, n of them.
-static int pair_texts(int polish, u32 *ids, char text[][400]) {
+static int pair_texts(int polish, u32 *ids, char text[][400]) {  // up to 8
     int p = pair_now(), l = polish != 0, n = 0;
     const char *sp = PAIR_SPECIAL[p][l];
-    ids[n] = 131180, snprintf(text[n++], 400, l ? "Zabi\xc5\x82" "e\xc5\x9b %%s boss\xc3\xb3w. Zabij %%s boss\xc3\xb3w i bossa specjalnego (%s), aby wyzwa\xc4\x87 bossa nocy."
-                                                  : "Bosses defeated: %%s. Defeat %%s bosses and the special boss (%s) to challenge the night boss.", sp);
+    // 131180 / 131181: %s = "N/6" (always the release target, DF_BOSSES; owner, 2026-11-19); 131183: %s = 6
+    ids[n] = 131180, snprintf(text[n++], 400, l ? "Zabi\xc5\x82" "e\xc5\x9b %%s wymaganych boss\xc3\xb3w, aby wyzwa\xc4\x87 bossa nocy. Zabij te\xc5\xbc bossa specjalnego (%s)."
+                                                  : "Bosses defeated: %%s of those required to challenge the night boss. Defeat the special boss too (%s).", sp);
+    ids[n] = 131181, snprintf(text[n++], 400, l ? "Zabi\xc5\x82" "e\xc5\x9b %%s wymaganych boss\xc3\xb3w, aby wyzwa\xc4\x87 bossa nocy."
+                                                  : "Bosses defeated: %%s of those required to challenge the night boss.");
     ids[n] = 131183, snprintf(text[n++], 400, l ? "Wyzwanie nie jest jeszcze dost\xc4\x99pne: pokonaj %%s boss\xc3\xb3w i bossa specjalnego (%s)"
                                                   : "The challenge is not available yet: defeat %%s bosses and the special boss (%s)", sp);
     ids[n] = 131185, snprintf(text[n++], 400, l ? "Mapa: %s" : "Map: %s", PAIR_NAME[p][l]);
