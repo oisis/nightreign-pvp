@@ -2976,6 +2976,44 @@ static int compose_one_half(const char *game_dir, buf bhd, const char *bdt_path,
                   pair_b()->name, east ? "east" : "west", an, copied, pair_b()->name, pair_a()->of);
     return ok;
 }
+// variant-test (measurement, four pairs side by side): the west half as this start has it (composed on pairs 1 / 3,
+// else the base region's own) is written again under variant 6, m60_10_09_62: the map file, and every file of the
+// half's folder (data2 list, 1.3.3: pieces m60_10_09_V2_<x-40><z-32><xx><zz><nn>, envmap_00..06_{high,middle,low}_00,
+// {high,middle,low}.ivinfobnd) under the new name; pieces of the added region already written for the composed half
+// are taken from work/build. The DLL (same setting) gives the west half variant 6.
+static void variant_test_half(buf bhd, const char *bdt) {
+    char an[24], from[300], to[1300], name[64];
+    int av = pair_a()->kind, copied = 0;
+    snprintf(an, sizeof an, "m60_10_09_%d2", av);
+    snprintf(to, sizeof to, "%s" SEP "work" SEP "build" SEP "map" SEP "mapstudio" SEP "%s.msb.dcx", g_app, an);
+    buf m = read_file(to);
+    if (!m.p) snprintf(from, sizeof from, "/map/mapstudio/%s.msb.dcx", an), m = archive_read(bhd, bdt, from);
+    snprintf(to, sizeof to, "%s" SEP "work" SEP "build" SEP "map" SEP "mapstudio" SEP "m60_10_09_62.msb.dcx", g_app);
+    if (!m.p || !write_file(to, m.p, m.n)) { free(m.p); logf_("variant test: west half %s not written as variant 6", an); return; }
+    free(m.p);
+    for (int k = 0; k < 2 * 4 * 100 + 21 + 3; k++) {
+        if (k < 800) {
+            int x = 42 + k / 400, zz = 36 + (k / 100) % 4, nn = k % 100;
+            snprintf(name, sizeof name, "%d%d%02d%02d%02d", x - 40, zz - 32, x, zz, nn);
+        } else if (k < 821) {
+            static const char *const Q[3] = {"high", "low", "middle"};
+            snprintf(name, sizeof name, "envmap_%02d_%s_00", (k - 800) / 3, Q[(k - 800) % 3]);
+        } else {
+            static const char *const Q[3] = {"high", "low", "middle"};
+            snprintf(name, sizeof name, "%s", Q[k - 821]);
+        }
+        const char *ext = k < 800 ? "mapbnd" : k < 821 ? "tpfbnd" : "ivinfobnd";
+        char sep = k < 821 ? '_' : '_';
+        snprintf(to, sizeof to, "%s" SEP "work" SEP "build" SEP "map" SEP "m60" SEP "%s" SEP "%s%c%s.%s.dcx", g_app, an, an, sep, name, ext);
+        buf p = read_file(to);
+        if (!p.p) snprintf(from, sizeof from, "/map/m60/%s/%s%c%s.%s.dcx", an, an, sep, name, ext), p = archive_read(bhd, bdt, from);
+        if (!p.p) continue;
+        snprintf(to, sizeof to, "%s" SEP "work" SEP "build" SEP "map" SEP "m60" SEP "m60_10_09_62" SEP "m60_10_09_62_%s.%s.dcx", g_app, name, ext);
+        copied += write_file(to, p.p, p.n);
+        free(p.p);
+    }
+    logf_("variant test: west half %s written as variant 6 (m60_10_09_62: map file and %d files of its folder)", an, copied);
+}
 static int build_pair_half(const char *game_dir) {
     char bhd_path[1100], bdt_path[1100];
     snprintf(bhd_path, sizeof bhd_path, "%s" SEP "data2.bhd", game_dir);
@@ -2988,6 +3026,7 @@ static int build_pair_half(const char *game_dir) {
     int ok = 1;
     for (int east = 0; ok && east < 2; east++)
         if (two_pair()->halves >> east & 1) ok = compose_one_half(game_dir, bhd, bdt_path, east);
+    if (ok && setting(S_VARIANT_TEST)) variant_test_half(bhd, bdt_path);
     free(bhd.p);
     return ok;
 }
@@ -3278,6 +3317,13 @@ int core_build(const char *game_dir) {
     ok = ok && build_icons(game_dir, bhd, bdt_path, 'h') && build_icons(game_dir, bhd, bdt_path, 'l');
     if (ok && one_region()) remove_two_region_map(), logf_("one-region (test): region %d only, no two-region map", one_region());
     else if (ok) ok = build_two_region_map(game_dir, bhd, bdt_path);
+    if (ok && setting(S_PACK_TEST)) {  // measurement: the game's plain map screen pack as M06 (the DLL loads M06)
+        buf p = archive_read(bhd, bdt_path, "/menu/71_maptile_m00.tpf.dcx");
+        char path[1300];
+        snprintf(path, sizeof path, "%s" SEP "work" SEP "build" SEP "menu" SEP "71_maptile_m06.tpf.dcx", g_app);
+        logf_("pack test: the game's plain map screen pack %s as 71_maptile_m06", p.p && write_file(path, p.p, p.n) ? "written" : "NOT written");
+        free(p.p);
+    }
     if (ok && build_boss_deaths(game_dir, bhd, bdt_path) < BOSS_DEATHS_MIN)
         ok = 0, logf_("The game's event scripts look different than expected (too few boss deaths). The game may have been updated; the mod needs an update too.");
     if (ok && !build_camp_scripts(game_dir, bhd, bdt_path))
@@ -3506,7 +3552,7 @@ int core_selftest(void) {
                                 "pair = -1\r\nboss-flow = 3";
         short v[SETTINGS_COUNT];
         char bad[96];
-        static const short want[SETTINGS_COUNT] = {-1, 0, -1, 15, -1, -1, 3, -1, -1, -1, 250, -1, -1, -1, -1};
+        static const short want[SETTINGS_COUNT] = {-1, 0, -1, 15, -1, -1, 3, -1, -1, -1, 250, -1, -1, -1, -1, -1, -1};
         int good = settings_parse(t, sizeof t - 1, v, bad, sizeof bad) == 4 && !memcmp(v, want, sizeof v) &&
                    !strcmp(bad, "nope = true, loot-test = yes, one-region = 1000, boss-flow = 3");
         good = good && !load_settings("/nonexistent/test-settings.toml", v);

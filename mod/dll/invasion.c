@@ -923,6 +923,28 @@ static void hook_call(unsigned rva_site, unsigned rva_target, void *hook, const 
     if (patch_rel32(site + 1, site + 5, stub)) logf("%s: hooked (%x)", what, rva_site);
     else logf("%s: cannot patch %x", what, rva_site);
 }
+// pack-test (measurement for four pairs side by side): the map screen's tile pack is loaded by 0x140ec2cc0(obj, u8 map
+// type) as "menu:/71_MapTile_M%02d.tpf" (format at 0x142cb4c48), kept while obj+0xdc8 equals the type; no direct
+// call reaches it (protected callers), so its entry is patched: mov dl, 6, then its first three instructions
+// (mov [rsp+8],rbx / [rsp+0x10],rbp / [rsp+0x18],rsi, 15 bytes) and back. The launcher put the game's plain pack M00
+// there as M06, so the map screen shows the map without its region if the pack loads.
+static void pack_test_install(void) {
+    static const unsigned char head[15] = {0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18};
+    unsigned char *f = (unsigned char *)g_base + 0xec2cc0, *stub = near_alloc(32);
+    if (memcmp(f, head, sizeof head) || !stub) return (void)logf("pack test: 0xec2cc0 does not look as expected, not hooked");
+    stub[0] = 0xb2, stub[1] = 0x06;  // mov dl, 6
+    memcpy(stub + 2, head, sizeof head);
+    stub[17] = 0xe9;
+    int back = (int)((f + 15) - (stub + 22));
+    memcpy(stub + 18, &back, 4);
+    DWORD old;
+    if (!VirtualProtect(f, 15, PAGE_EXECUTE_READWRITE, &old)) return (void)logf("pack test: cannot patch 0xec2cc0");
+    int to = (int)(stub - (f + 5));
+    f[0] = 0xe9, memcpy(f + 1, &to, 4), memset(f + 5, 0x90, 10);
+    VirtualProtect(f, 15, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), f, 15);
+    logf("pack test: map screen pack choice hooked (0xec2cc0): every map type loads menu:/71_MapTile_M06.tpf");
+}
 static void hooks_retry(void) {  // every second for 2 minutes after the start, while some site is still pending
     static DWORD start, next;
     if (!g_hook_retry_n || (int)(GetTickCount() - next) < 0) return;
@@ -2804,6 +2826,14 @@ static unsigned *variant_hook(unsigned *out, unsigned *id, unsigned long long mo
             logf("pair: tile m60_%02u_%02u: variant %u -> %d (%s)", x, z, *out >> 4 & 0xf, TWO_ADDED.variant, TWO_ADDED.name);
         *out = want;
     }
+    // variant-test (measurement for four pairs side by side): the west half (lod2 m60_10_09, low nibble 2) gets variant
+    // 6, a digit no region has; the launcher wrote the composed half there (m60_10_09_62). Shows whether the loaders
+    // take a variant without a region flag.
+    if (setting(S_VARIANT_TEST) && m >> 24 == 60 && x == 10 && z == 9 && (m & 0xf) == 2) {
+        unsigned want = (m & 0xffffff00u) | 0x62;
+        if (*out != want && g_variant_forced++ < 40) logf("variant test: half m60_10_09: variant %u -> 6", *out >> 4 & 0xf);
+        *out = want;
+    }
     // The lod1 quadrant of the added region (2x2 tiles, low nibble 1: m60_21_18 = 42-43 x 36-37, Noklateo's; m60_22_18 =
     // 44-45 x 36-37, the Rotted Woods'; analysis 09 §15): it took the base region's variant too, so the second
     // region's buildings were drawn only by their own near tiles (pair 3, dev.63: Noklateo's walls cut open seen from
@@ -3235,7 +3265,8 @@ static void hook_acceptance(void) {
     }
     hook_call(0xc27a41, 0x6b06f0, (void *)map_request_hook, "two-regions: map request");
     hook_call(0x5e7ff6, 0x6ab300, (void *)tile_flag_space_hook, "two-regions: tile flag space");
-    if (g_settings[S_PAIR] >= 1)
+    if (setting(S_PACK_TEST)) pack_test_install();
+    if (g_settings[S_PAIR] >= 1 || setting(S_VARIANT_TEST))
         for (unsigned i = 0; i < sizeof VARIANT_SITES / sizeof *VARIANT_SITES; i++)
             hook_call(VARIANT_SITES[i], 0x6ab7a0, (void *)variant_hook, "pair: per-tile variant");
     // the held radius makes the game answer the rain around the player, the health bar's circle state, the weather side
