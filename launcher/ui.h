@@ -11,7 +11,7 @@ static const char *const LANG_NAME[LANG_COUNT] = {"English", "Polski", "Deutsch"
 
 enum { T_TITLE, T_GAME_FOLDER, T_BROWSE, T_PLAY, T_BACKUP, T_HELP, T_UNINSTALL, T_CLOSE, T_LANGUAGE, T_NOT_FOUND,
        T_FOUND, T_PICK, T_BAD_FOLDER, T_CONFIRM_UNINSTALL, T_NO_SAVE, T_BACKUP_DONE, T_BACKUP_FAILED, T_HELP_TEXT,
-       T_DEBUG_LOG, T_COUNT };
+       T_DEBUG_LOG, T_SETTINGS, T_MAP, T_MAP_RANDOM, T_SHOW_PING, T_SHOW_COUNTS, T_COUNT };
 
 static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
     [L_EN] = {
@@ -46,7 +46,12 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "when you report a problem, send that file.\n\n"
         "Language: the language of this window. Your choice is remembered.\n\n"
         "Close: closes this window.",
-        "Debug log"
+        "Debug log",
+        "Settings",
+        "Map:",
+        "Random (a new one at every start)",
+        "Show the ping after the other players' names",
+        "Show the squad counts in the Roundtable Hold"
     },
     [L_PL] = {
         "Nightreign Invasions " MOD_VERSION,
@@ -80,7 +85,12 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "wyślij ten plik.\n\n"
         "Język: język tego okna. Wybór jest zapamiętywany.\n\n"
         "Zamknij: zamyka to okno.",
-        "Szczegółowy log"
+        "Szczegółowy log",
+        "Ustawienia",
+        "Mapa:",
+        "Losowa (nowa przy każdym starcie)",
+        "Pokazuj ping po nazwach innych graczy",
+        "Pokazuj liczby drużyn w Twierdzy Okrągłego Stołu"
     },
     [L_DE] = {
         "Nightreign Invasions " MOD_VERSION,
@@ -117,7 +127,12 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "Launchers: wenn du ein Problem meldest, schicke diese Datei.\n\n"
         "Sprache: die Sprache dieses Fensters. Die Wahl wird gespeichert.\n\n"
         "Schließen: schließt dieses Fenster.",
-        "Ausführliches Protokoll"
+        "Ausführliches Protokoll",
+        "Einstellungen",
+        "Karte:",
+        "Zufällig (bei jedem Start neu)",
+        "Ping hinter den Namen der anderen Spieler anzeigen",
+        "Trupp-Zahlen in der Tafelrundfeste anzeigen"
     },
     [L_FR] = {
         "Nightreign Invasions " MOD_VERSION,
@@ -155,7 +170,12 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "dossier du lanceur : pour signaler un problème, envoyez ce fichier.\n\n"
         "Langue : la langue de cette fenêtre. Le choix est mémorisé.\n\n"
         "Fermer : ferme cette fenêtre.",
-        "Journal détaillé"
+        "Journal détaillé",
+        "Paramètres",
+        "Carte :",
+        "Aléatoire (une nouvelle à chaque lancement)",
+        "Afficher le ping après le nom des autres joueurs",
+        "Afficher le nombre d'escouades à la Table ronde"
     },
     [L_ES] = {
         "Nightreign Invasions " MOD_VERSION,
@@ -191,7 +211,12 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "del lanzador: al informar de un problema, envía ese archivo.\n\n"
         "Idioma: el idioma de esta ventana. La elección se recuerda.\n\n"
         "Cerrar: cierra esta ventana.",
-        "Registro detallado"
+        "Registro detallado",
+        "Ajustes",
+        "Mapa:",
+        "Aleatorio (uno nuevo en cada inicio)",
+        "Mostrar el ping tras el nombre de los demás jugadores",
+        "Mostrar el número de escuadras en la Mesa Redonda"
     },
 };
 

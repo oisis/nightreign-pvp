@@ -8,7 +8,7 @@
 
 static const char *const *T = UI_TEXT[L_EN];
 static GtkWidget *g_window, *g_folder, *g_log_view, *g_play, *g_uninstall, *g_backup, *g_help, *g_browse, *g_close, *g_folder_label,
-    *g_lang_label, *g_debug;
+    *g_lang_label, *g_debug, *g_settings;
 
 static void log_line(const char *line) {
     GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(g_log_view));
@@ -82,11 +82,43 @@ static void set_texts(void) {
     gtk_button_set_label(GTK_BUTTON(g_uninstall), T[T_UNINSTALL]);
     gtk_button_set_label(GTK_BUTTON(g_close), T[T_CLOSE]);
     gtk_button_set_label(GTK_BUTTON(g_debug), T[T_DEBUG_LOG]);
+    gtk_button_set_label(GTK_BUTTON(g_settings), T[T_SETTINGS]);
 }
 
 static void on_debug(GtkToggleButton *b, gpointer u) {
     (void)u;
     core_save_debug(gtk_toggle_button_get_active(b));
+}
+
+// Settings: the map (random or one of the four pairs), ping and squad counts; saved when the dialog is closed with OK.
+static void on_settings(GtkButton *b, gpointer u) {
+    (void)b; (void)u;
+    int pl = T == UI_TEXT[L_PL];
+    GtkWidget *d = gtk_dialog_new_with_buttons(T[T_SETTINGS], GTK_WINDOW(g_window), GTK_DIALOG_MODAL, "_OK", GTK_RESPONSE_OK,
+                                               T[T_CLOSE], GTK_RESPONSE_CANCEL, NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(d)), *grid = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(grid), 12);
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8), *map = gtk_combo_box_text_new();
+    gtk_box_pack_start(GTK_BOX(row), gtk_label_new(T[T_MAP]), FALSE, FALSE, 0);
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(map), T[T_MAP_RANDOM]);
+    for (int k = 0; k < 4; k++) gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(map), core_pair_name(k, pl));
+    gtk_combo_box_set_active(GTK_COMBO_BOX(map), core_load_choice(CHOICE_MAP) + 1);
+    gtk_box_pack_start(GTK_BOX(row), map, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(grid), row, FALSE, FALSE, 0);
+    GtkWidget *ping = gtk_check_button_new_with_label(T[T_SHOW_PING]), *counts = gtk_check_button_new_with_label(T[T_SHOW_COUNTS]);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ping), core_load_choice(CHOICE_PING));
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(counts), core_load_choice(CHOICE_COUNTS));
+    gtk_box_pack_start(GTK_BOX(grid), ping, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(grid), counts, FALSE, FALSE, 0);
+    gtk_container_add(GTK_CONTAINER(area), grid);
+    gtk_widget_show_all(d);
+    if (gtk_dialog_run(GTK_DIALOG(d)) == GTK_RESPONSE_OK) {
+        int m = gtk_combo_box_get_active(GTK_COMBO_BOX(map));
+        core_save_choice(CHOICE_MAP, m >= 1 && m <= 4 ? m - 1 : -1);
+        core_save_choice(CHOICE_PING, gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ping)));
+        core_save_choice(CHOICE_COUNTS, gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(counts)));
+    }
+    gtk_widget_destroy(d);
 }
 
 static void on_language(GtkComboBox *c, gpointer u) {
@@ -167,7 +199,9 @@ int main(int argc, char **argv) {
     g_uninstall = gtk_button_new_with_label(T[T_UNINSTALL]);
     g_backup = gtk_button_new_with_label(T[T_BACKUP]);
     g_help = gtk_button_new_with_label(T[T_HELP]);
+    g_settings = gtk_button_new_with_label(T[T_SETTINGS]);
     gtk_box_pack_start(GTK_BOX(buttons), g_play, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(buttons), g_settings, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(buttons), g_backup, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(buttons), g_uninstall, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(buttons), g_help, FALSE, FALSE, 0);
@@ -179,6 +213,7 @@ int main(int argc, char **argv) {
     g_signal_connect(g_browse, "clicked", G_CALLBACK(on_browse), NULL);
     g_signal_connect(g_backup, "clicked", G_CALLBACK(on_backup), NULL);
     g_signal_connect(g_help, "clicked", G_CALLBACK(on_help), NULL);
+    g_signal_connect(g_settings, "clicked", G_CALLBACK(on_settings), NULL);
     g_signal_connect(lang_box, "changed", G_CALLBACK(on_language), NULL);
     g_signal_connect(g_play, "clicked", G_CALLBACK(on_play), NULL);
     g_signal_connect(g_uninstall, "clicked", G_CALLBACK(on_uninstall), NULL);
