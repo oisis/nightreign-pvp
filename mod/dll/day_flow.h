@@ -108,8 +108,10 @@ static int df_camp_chr(char *chr) {
 // map, +0x10 instance), and its invaders are the characters the world character manager's lookup (0x5190c0, the
 // one the scripts use) finds under entity ids 50 / 51 / 52 of it. An invader is grouped as soon as one of those ids
 // resolves to it; camps are numbered in the order their first invader is grouped.
+// vetoed: we turned the camp's second invader off (the script's arrival turned it on before the fifth boss);
 // seen: the last logged state (bit 31 set once logged).
-static struct { char *chr; int camp, entity; unsigned seen; } g_df_inv[16];
+static struct { char *chr; int camp, entity, vetoed; unsigned seen; } g_df_inv[16];
+static int g_df_second;  // the camps' second invaders are let in (the day's fifth boss; then for the expedition)
 static int g_df_ninv, g_df_camp_key[8];
 static int df_invader_entity(char *chr, int *key) {
     char *lots = df_param("LOT_RESULT_SMALLBASE_AND_SPOT_ST"), *gm = *(char **)(g_base + 0x3c13258);
@@ -137,7 +139,7 @@ static void df_camp_control(char *chr) {
     while (i < g_df_ninv && g_df_inv[i].chr != chr) i++;
     if (i == g_df_ninv) {
         if (g_df_ninv == 16) return;
-        g_df_inv[g_df_ninv].chr = chr, g_df_inv[g_df_ninv].camp = -1, g_df_inv[g_df_ninv].entity = 0,
+        g_df_inv[g_df_ninv].chr = chr, g_df_inv[g_df_ninv].camp = -1, g_df_inv[g_df_ninv].entity = 0, g_df_inv[g_df_ninv].vetoed = 0,
         g_df_inv[g_df_ninv].seen = 0, g_df_ninv++;
         logf("day flow: invader %d found (chr %p, block %08x); its camp is looked up by entity id", i + 1, (void *)chr, *(unsigned *)(chr + CHR_BLOCK_ID));
     }
@@ -156,14 +158,30 @@ static void df_camp_control(char *chr) {
             logf("day flow: invader %d: entity %d, camp %d", i + 1, e, camp + 1);
         }
     }
-    // Every camp's invader is there from the start (owner, 2026-11-19: "zawsze jest 1"): the camp's own script
-    // (common 90015310) alone brings it in. It keeps the invader off, collision off, until a player enters one of the
-    // camp's areas or flag base+200 is on; then it sets base+200, warps it to its arrival point and turns it on with
-    // collision and the arrival animation 63020 (only one with SpEffect 4450). A non-"Hot Spot" instance it turns off
-    // and backread-removes instead. We only log the invader's state.
-    int base = camp >= 0 ? g_df_camp_key[camp] : 0, k = g_df_inv[i].entity - base - 50, open = 1;
+    // Owner, 2026-11-19: "1 od poczatku, 2 po zabiciu 5 bossow". Every camp has two invaders (+50, +51; the launcher
+    // makes the 1-invader caves 2, camp_variation_rows / build_camp_scripts). The camp's own script (common 90015310)
+    // brings them in: it keeps them off, collision off, until a player enters one of the camp's areas or flag
+    // base+200 is on; then it sets base+200, warps both to their arrival points and turns them on with collision and
+    // the arrival animation 63020 (only one with SpEffect 4450). A non-"Hot Spot" instance it turns off and
+    // backread-removes instead. The first (+50) is the script's alone. The second (+51) we turn off again while the
+    // day has fewer than 5 bosses (from then on for the rest of the expedition); one we turned off after the arrival
+    // is turned on again then, as the script left it, unless dead (base+202+k).
+    if (!g_df_second && g_df_kills_day >= 5) g_df_second = 1, logf("day flow: 5 bosses this day: the camps' second invaders are let in");
+    int base = camp >= 0 ? g_df_camp_key[camp] : 0, k = g_df_inv[i].entity - base - 50, open = k != 1 || g_df_second;
     int arrived = base ? two_flag(base + 200, 0, 0) : -1, dead = base && k >= 0 ? two_flag(base + 202 + k, 0, 0) : -1;
     int hp = chr_hp(chr);
+    if (!open && chr_enabled(chr)) {
+        ((char (*)(char *, char))(g_base + 0x608c60))(chr, 0);
+        if (!g_df_inv[i].vetoed) logf("day flow: invader %d (entity %d): the second of camp %d, turned on before the fifth boss: off again",
+                                      i + 1, g_df_inv[i].entity, camp + 1);
+        g_df_inv[i].vetoed = 1;
+    } else if (open && g_df_inv[i].vetoed) {
+        g_df_inv[i].vetoed = 0;
+        if (arrived == 1 && dead != 1 && hp != 0 && !chr_enabled(chr)) {
+            ((char (*)(char *, char))(g_base + 0x608c60))(chr, 1);
+            logf("day flow: invader %d (entity %d): turned on again (the camp's arrival ran before the fifth boss)", i + 1, g_df_inv[i].entity);
+        }
+    }
     int on = chr_enabled(chr), sp = speffect_on(chr, 4450);
     unsigned state = 1u << 31 | (unsigned)on | (unsigned)(arrived & 3) << 1 | (unsigned)(dead & 3) << 3 | (unsigned)sp << 5 |
                      (unsigned)(hp > 0) << 6 | (unsigned)open << 7;
@@ -584,6 +602,7 @@ static void day_flow_frame(int in_world) {
     if (first) {
         g_df_bosses = g_df_special = g_df_met = g_df_met_at = g_df_after = 0, g_df_day = 1, g_df_go = g_df_used = 0, g_df_seq = 0;
         g_df_tier = 0, day2_seen = 0, last_tier = -1, marker_was = 0, down_last = -1, g_df_kills_day = 0, g_df_camps = 0, g_df_ninv = 0, g_df_notice_due = 0;
+        g_df_second = 0;
         g_df_events = 0, g_df_started = 0, g_df_event_tick = 0;
         InterlockedExchange(&g_df_kills, 0), InterlockedExchange(&g_df_special_kills, 0);
         char *gm0 = *(char **)(g_base + 0x3c13258);
