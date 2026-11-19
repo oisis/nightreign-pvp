@@ -2797,18 +2797,53 @@ static void norain_effect_off(void) {
 // own geometry. Written only while +0x159 says a circle exists; nothing else is touched. Phases and the clock are
 // time-driven and unchanged.
 #define CIRCLE_HELD_RADIUS 5000.0f
+// The fire ring (owner, BRIEF 2026-11-18: "around the arena the rain comes back as fire"): after this day's challenge
+// (day flow, g_df_used) the radius is no longer held: the entries get back the radii the game gave them (kept here
+// as they were before each first overwrite) and the game's own circle closes around the arena; the circle's border
+// effect 807011 (the one that looked like fire in run 39), its edge sound and the map circle come back; the rain
+// (edge 807421/3/5, around the player 807400/2/4) stays off, and so do the play-area effect, the far asset and the
+// phase notice. Damage is the game's (launcher: PlayAreaCreateCommonParam's 99810 / 99811 kept; by day the held
+// radius leaves nobody outside). Day 2 (7505 clears g_df_used) holds the radius again.
+static int ring_on(void) { return g_settings[S_BOSS_FLOW] == 4 && g_df_used; }
+static float g_circle_orig[6];
+static unsigned char g_circle_have[6];
 static void circle_hold(char *mgr) {
     if (!mgr || IsBadReadPtr(mgr, 0x264) || !mgr[0x159]) return;
     static const int OFF[6] = {0x1a0, 0x1c0, 0x1e0, 0x200, 0x220, 0x240};
     static DWORD told_for, next;
+    static int ring_was;
     DWORD key = norain_key();
+    int ring = ring_on();
+    if (ring != ring_was) {
+        ring_was = ring;
+        if (ring) {
+            int back = 0;
+            for (int i = 0; i < 6; i++)
+                if (g_circle_have[i]) *(float *)(mgr + OFF[i]) = g_circle_orig[i], back++;
+            logf("fire ring: the challenge: radius released (%d entries back to the game's: %.1f/%.1f/%.1f, pending %.1f/%.1f/%.1f; current "
+                 "+0x260 %.1f); border effect 807011, edge sound and map circle on; rain 807400-807425, play-area effect, far asset "
+                 "and phase notice stay off; damage the game's",
+                 back, *(float *)(mgr + 0x1a0), *(float *)(mgr + 0x1c0), *(float *)(mgr + 0x1e0), *(float *)(mgr + 0x200),
+                 *(float *)(mgr + 0x220), *(float *)(mgr + 0x240), *(float *)(mgr + 0x260));
+        } else
+            logf("fire ring: off (day 2 or a new expedition): radius held at %.0f again", CIRCLE_HELD_RADIUS);
+    }
+    if (ring) {
+        if ((int)(GetTickCount() - next) >= 0) next = GetTickCount() + 30000, logf("fire ring: circle radius now %.1f (every 30 s)", *(float *)(mgr + 0x260));
+        return;
+    }
     if (key && told_for != key) {
         told_for = key, next = GetTickCount() + 30000;
+        memset(g_circle_have, 0, sizeof g_circle_have);
         logf("no rain: circle radius held at %.0f (phase radii were %.1f/%.1f/%.1f, current +0x260 %.1f)", CIRCLE_HELD_RADIUS,
              *(float *)(mgr + 0x1a0), *(float *)(mgr + 0x1c0), *(float *)(mgr + 0x1e0), *(float *)(mgr + 0x260));
     } else if (key && (int)(GetTickCount() - next) >= 0)
         next = GetTickCount() + 30000, logf("no rain: circle radius now %.1f (every 30 s)", *(float *)(mgr + 0x260));
-    for (int i = 0; i < 6; i++) *(float *)(mgr + OFF[i]) = CIRCLE_HELD_RADIUS;
+    for (int i = 0; i < 6; i++) {
+        float v = *(float *)(mgr + OFF[i]);
+        if (v != CIRCLE_HELD_RADIUS) g_circle_orig[i] = v, g_circle_have[i] = 1;  // the game's (new phase entries too)
+        *(float *)(mgr + OFF[i]) = CIRCLE_HELD_RADIUS;
+    }
 }
 static volatile int g_c553_pre = -1;  // measurement: StageRend +0xc553 just before the circle update (after last frame's clear)
 static void norain_circle_hook(char *mgr, float dt, unsigned long long c) {
@@ -2826,8 +2861,12 @@ static void norain_circle2_hook(char *mgr, float dt) {
     norain_first(1, "circle update 0x698c90, effect switched off");
 }
 static void norain_sound_hook(char *mgr, float dt) {
-    (void)mgr, (void)dt;
+    if (ring_on()) return ((void (*)(char *, float))(g_base + 0x6953b0))(mgr, dt);
     norain_first(2, "edge sound 0x6953b0 skipped");
+}
+static void norain_player_rain_hook(char *mgr) {  // the fire ring: no rain around a player outside it
+    (void)mgr;
+    norain_first(3, "rain around the player 0x695f80 skipped");
 }
 // The rain itself (run 38, one-region 3: rain only outside the circle = effect 807400/2/4 active, handle +0x428):
 // both circle effects use only s51300_a.tif, the texture of the rain weather effect 806100. 0x695f80 (called
@@ -2845,7 +2884,7 @@ static void norain_edge_rain_hook(char *mgr, float dt) {
 // s34030 / s31031, not the rain texture) at each segment point (0x695123 -> 0xedce20), kept in the container
 // +0x358/+0x360 (else only a clean-up walk); its callees are container helpers and math. Skipped: never created.
 static void norain_border_hook(char *mgr, float dt) {
-    (void)mgr, (void)dt;
+    if (ring_on()) return ((void (*)(char *, float))(g_base + 0x694580))(mgr, dt);  // the fire ring's look
     norain_first(5, "circle border effects 0x694580 skipped");
 }
 // Circle-start notice: when the circle phase (+0x154) changes, 0x696170 calls the HUD (0x3c14a70) at 0x69722c:
@@ -2877,7 +2916,10 @@ static unsigned long long pin_row_shown_hook(unsigned long long type, unsigned *
 // (0x140ac9843 / 0x140ac98c6, else 0x140ad3cc0(.., 0) hides it). Both answered "no circle": neither is drawn. The
 // phase-2 marker (+0x168, the final site from manager +0x2f8, 0x14068b8a0 at 0x1409109f6) stays.
 static unsigned long long map_no_circle_hook(void *mgr, void *a, void *b, void *c) {
-    (void)mgr, (void)a, (void)b, (void)c;
+    if (ring_on()) {  // the fire ring on the map
+        unsigned site = (unsigned)((char *)__builtin_return_address(0) - g_base) - 5;
+        return ((unsigned long long (*)(void *, void *, void *, void *))(g_base + (site == 0x9108e6 ? 0x68bcd0 : 0x68bab0)))(mgr, a, b, c);
+    }
     norain_first(8, "map: circle and next-circle preview not drawn");
     return 0;
 }
@@ -3123,6 +3165,7 @@ static void hook_acceptance(void) {
     hook_call(0x68e1d2, 0x696170, (void *)norain_circle_hook, "no rain: circle radius held, play-area effect off after the circle update");
     hook_call(0x68e1ea, 0x698c90, (void *)norain_circle2_hook, "no rain: play-area effect off after the second circle update");
     hook_call(0x68e229, 0x6953b0, (void *)norain_sound_hook, "no rain: circle edge sound skipped");
+    hook_call(0x68e208, 0x695f80, (void *)norain_player_rain_hook, "no rain: rain around the player skipped (the fire ring)");
     hook_call(0x68e213, 0x692350, (void *)norain_edge_rain_hook, "no rain: rain along the circle edge skipped");
     hook_call(0x68e21e, 0x694580, (void *)norain_border_hook, "no rain: circle border effects skipped");
     hook_call(0x69722c, 0x7c52f0, (void *)hud_circle_notice_hook, "no rain: circle notice skipped");
@@ -3133,18 +3176,19 @@ static void hook_acceptance(void) {
     hook_call(0x911081, RVA_PIN_ROW_SHOWN, (void *)pin_row_shown_hook, "map pins: woods tiles by the Rotted Woods rule (pin loop)");
     hook_call(0xa5bba1, RVA_PIN_ROW_SHOWN, (void *)pin_row_shown_hook, "map pins: woods tiles by the Rotted Woods rule (second row loop)");
     {
-        static const unsigned site[10] = {0x68e1d2, 0x68e1ea, 0x68e229, 0x68e213, 0x68e21e, 0x69722c, 0x693ae8, 0x693dc3, 0x911081, 0xa5bba1},
-                              orig[10] = {0x696170, 0x698c90, 0x6953b0, 0x692350, 0x694580, 0x7c52f0, 0x704cd0, 0x704cd0, RVA_PIN_ROW_SHOWN,
-                                          RVA_PIN_ROW_SHOWN};
+        static const unsigned site[11] = {0x68e1d2, 0x68e1ea, 0x68e229, 0x68e208, 0x68e213, 0x68e21e, 0x69722c, 0x693ae8, 0x693dc3, 0x911081,
+                                         0xa5bba1},
+                              orig[11] = {0x696170, 0x698c90, 0x6953b0, 0x695f80, 0x692350, 0x694580, 0x7c52f0, 0x704cd0, 0x704cd0,
+                                          RVA_PIN_ROW_SHOWN, RVA_PIN_ROW_SHOWN};
         int n = 0, pins = 0;
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < 11; i++) {
             unsigned char *c = (unsigned char *)g_base + site[i];
             int rel = (int)(orig[i] - (site[i] + 5));
             int hooked = c[0] == 0xE8 && memcmp(c + 1, &rel, 4) != 0;
-            if (i < 8) n += hooked; else pins += hooked;
+            if (i < 9) n += hooked; else pins += hooked;
         }
-        logf("no rain: %s (%d of 8 hooks: circle radius held at %.0f and play-area effect off at both circle updates; edge sound, rain along the edge, border effects and circle notice skipped; far asset disabled (2))",
-             n == 8 ? "in place" : "NOT complete", n, CIRCLE_HELD_RADIUS);
+        logf("no rain: %s (%d of 9 hooks: circle radius held at %.0f and play-area effect off at both circle updates; edge sound, rain around the player and along the edge, border effects and circle notice skipped; far asset disabled (2); after the challenge the fire ring)",
+             n == 9 ? "in place" : "NOT complete", n, CIRCLE_HELD_RADIUS);
         logf("map pins: %s (%d of 2 hooks: woods tiles 44-45 x 36-37 show the Rotted Woods rows%s)", pins == 2 ? "in place" : "NOT complete", pins,
              g_settings[S_ONE_REGION] >= 1 ? "; off for one-region" : "");
     }
