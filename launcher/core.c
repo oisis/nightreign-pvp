@@ -39,7 +39,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 31
+#define BUILD_FORMAT 32
 #define BOSS_DEATHS_MIN 100  // the game (1.3.3) has 158 such flags; fewer = its event scripts changed
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
@@ -2053,6 +2053,7 @@ static int map_tables(buf bundle, int index[4], buf maps[4]) {
     return 1;
 }
 
+static buf camp_variation_rows(buf p);  // with the camp scripts below
 static int build_regulation(const char *game_dir) {
     char path[1300];
     snprintf(path, sizeof path, "%s" SEP "regulation.bin", game_dir);
@@ -2071,7 +2072,8 @@ static int build_regulation(const char *game_dir) {
         return free(enc.p), logf_("regulation.bin is not in the expected format"), 0;
     buf bundle = {xalloc((size_t)usize + (1 << 17)), usize};
     buf patched = {0}, body = {0}, param = {0}, speffect = {0}, speffect2 = {0}, step = {0}, maps[4] = {{0}}, cur = {0}, goods = {0}, shop = {0};
-    int ok = 0, index, sp_index, npc_index, area_index, goods_index = -1, shop_index = -1, map_index[4] = {-1, -1, -1, -1};
+    int ok = 0, index, sp_index, npc_index, area_index, goods_index = -1, shop_index = -1, map_index[4] = {-1, -1, -1, -1}, var_index = -1;
+    buf variation = {0};
     u8 *team_row = NULL, *ally_row = NULL;
     if (nr_zstd_decompress(dcx + 0x4C, csize, bundle.p, (size_t)usize + (1 << 17)) != usize) {
         logf_("regulation.bin could not be unpacked");
@@ -2094,6 +2096,9 @@ static int build_regulation(const char *game_dir) {
                !day_flow_rows(&speffect2, &goods, &shop) || bnd4_find(bundle, "\\PlayerCommonParam.param") < 0 ||
                !player_common_slots(bnd4_file(bundle, bnd4_find(bundle, "\\PlayerCommonParam.param")))) {
         logf_("The game's goods, shop or SpEffect params look different than expected (day flow rows). The game may have been updated; the mod needs an update too.");
+    } else if ((var_index = bnd4_find(bundle, "\\SmallBaseMapVariationParam.param")) < 0 ||
+               !(variation = camp_variation_rows(bnd4_file(bundle, var_index))).p) {
+        logf_("The game's SmallBaseMapVariationParam looks different than expected. The game may have been updated; the mod needs an update too.");
     } else if (!map_tables(bundle, map_index, maps)) {
         logf_("The game's map pattern tables look different than expected; the two-region maps cannot be built. The game may have been updated; the mod needs an update too.");
     } else {
@@ -2122,6 +2127,7 @@ static int build_regulation(const char *game_dir) {
         patched = bnd4_replace(step, sp_index, speffect2);
         cur = bnd4_replace(patched, goods_index, goods), free(patched.p), patched = cur;
         cur = bnd4_replace(patched, shop_index, shop), free(patched.p), patched = cur;
+        cur = bnd4_replace(patched, var_index, variation), free(patched.p), patched = cur;
         logf_("Day flow: item %d at the field merchant (rows 3007 / 3507 instead of the Small Pouch, %d runes), 8 item slots from the start, %d enemy tiers", CHALLENGE_GOODS, CHALLENGE_PRICE, TIER_COUNT);
         for (int t = 0; t < 4; t++)
             if (maps[t].p) cur = bnd4_replace(patched, map_index[t], maps[t]), free(patched.p), patched = cur;
@@ -2139,7 +2145,7 @@ static int build_regulation(const char *game_dir) {
         free(out.p);
     }
     free(enc.p); free(bundle.p); free(param.p); free(speffect.p); free(speffect2.p); free(step.p); free(patched.p); free(body.p);
-    free(goods.p); free(shop.p);
+    free(goods.p); free(shop.p); free(variation.p);
     for (int t = 0; t < 4; t++) free(maps[t].p);
     return ok;
 }
@@ -2997,6 +3003,79 @@ static void emevd_boss_entities(buf d, const u32 *flags, int have) {
             for (int x = 0; x < ne; x++) boss_entity_add(flags, have, fls[f], ents[x]);
     }
 }
+// Day flow, invader camps (owner, 2026-11-19: one invader from the start, a second after 5 bosses). How many invaders a
+// camp gets is read twice, both 1 for the caves m30_00 / m30_30 and m38_00 / m38_10 (2 for m32_* / m34_*):
+// - the generator's camp roll (0x1406bb760): per camp, SmallBaseMapVariationParam (param 0xca, 0x140e80950) row = the
+//   small map id, +0x08 (capped at 2) invaders, which get the SmallbaseInvationNpcParam rows and entity ids +50, +51;
+// - the camp's own script: event 0 of mAA_BB_00_00.emevd starts common 90015310 (2000[06]: slot, event id, then
+//   chr +50, chr +51, count, ...); the script warps and turns on +51 only when count is 2.
+// Every one of the four has a c0100 character +51 (msb). So both become 2: the param row in the regulation, and the
+// count in each script, written to work/build/event (me3 overlays build/; the game ships some event scripts as DFLT
+// DCX itself, which dcx_write writes). The DLL keeps +51 off until the day's fifth boss.
+#define CAMP_SCRIPT_EVENT 90015310
+static const int CAMP_ONE_MAPS[4] = {3000, 3030, 3800, 3810};
+// The count in event 0's start of 90015310 for small map aabb (entities aabb0050 / aabb0051): 1 -> 2. 1 if changed.
+static int emevd_camp_count(buf d, int map) {
+    if (d.n < 0x80 || memcmp(d.p, "EVD", 3)) return 0;
+    u64 ev = rd64(d.p + 0x18), ins = rd64(d.p + 0x28), args = rd64(d.p + 0x78);
+    u32 n = (u32)rd64(d.p + 0x10);
+    for (u32 e = 0; e < n && ev + (u64)(e + 1) * 0x30 <= d.n; e++) {
+        const u8 *E = d.p + ev + e * 0x30;
+        if (rd64(E) != 0) continue;
+        u64 cnt = rd64(E + 8), off = rd64(E + 0x10);
+        for (u64 k = 0; k < cnt && ins + off + (k + 1) * 0x20 <= d.n; k++) {
+            const u8 *I = d.p + ins + off + k * 0x20;
+            u64 alen = rd64(I + 8), aoff = rd64(I + 0x10);
+            if (rd32(I) != 2000 || rd32(I + 4) != 6 || alen < 20 || args + aoff + alen > d.n) continue;
+            u8 *a = d.p + args + aoff;
+            if (rd32(a + 4) == CAMP_SCRIPT_EVENT && rd32(a + 8) == (u32)map * 10000 + 50 && rd32(a + 12) == (u32)map * 10000 + 51 &&
+                rd32(a + 16) == 1)
+                return wr32(a + 16, 2), 1;
+        }
+    }
+    return 0;
+}
+static int build_camp_scripts(const char *game_dir, buf bhd, const char *bdt) {
+    char names[4][48], path[1300];
+    buf in[4], out[4];
+    for (int i = 0; i < 4; i++) {
+        snprintf(names[i], sizeof names[i], "/event/m%02d_%02d_00_00.emevd.dcx", CAMP_ONE_MAPS[i] / 100, CAMP_ONE_MAPS[i] % 100);
+        in[i] = archive_read(bhd, bdt, names[i]);
+        if (!in[i].p) {
+            for (int j = 0; j < i; j++) free(in[j].p);
+            return logf_("Day flow: %s not in the game archive", names[i]), 0;
+        }
+    }
+    dcx_read_many(game_dir, in, out, 4);
+    int ok = 1;
+    for (int i = 0; i < 4; i++) {
+        if (!out[i].p || !emevd_camp_count(out[i], CAMP_ONE_MAPS[i])) {
+            if (ok) logf_("Day flow: %s: the camp script's start looks different than expected", names[i]);
+            ok = 0;
+            continue;
+        }
+        buf z = dcx_write(out[i]);
+        snprintf(path, sizeof path, "%s" SEP "work" SEP "build" SEP "event" SEP "%s", g_app, names[i] + 7);
+        ok = write_file(path, z.p, z.n) && ok;
+        free(z.p);
+    }
+    for (int i = 0; i < 4; i++) free(in[i].p), free(out[i].p);
+    if (ok) logf_("Day flow: invader camps of 4 small maps take 2 invaders (camp scripts written)");
+    return ok;
+}
+// SmallBaseMapVariationParam rows of the four: +0x08 1 -> 2 (see above). A copy, 0 if a row is not as expected.
+static buf camp_variation_rows(buf p) {
+    buf c = bnd4_copy(p);
+    int done = 0;
+    for (u32 i = 0; c.p && i < rd16(c.p + 0x0A); i++) {
+        int id = (int)rd32(c.p + 0x40 + i * 24);
+        u8 *r = c.p + rd64(c.p + 0x40 + i * 24 + 8);
+        for (int k = 0; k < 4; k++)
+            if (id == CAMP_ONE_MAPS[k] && rd32(r + 8) == 1) wr32(r + 8, 2), done++;
+    }
+    if (done != 4) free(c.p), c.p = NULL;
+    return c;
+}
 static int build_boss_deaths(const char *game_dir, buf bhd, const char *bdt) {
     static char names[1 + 4 * 4 * 6 + 40 * 100][48];
     static buf in[sizeof names / sizeof names[0]], out[sizeof names / sizeof names[0]];
@@ -3096,6 +3175,8 @@ int core_build(const char *game_dir) {
     else if (ok) ok = build_two_region_map(game_dir, bhd, bdt_path);
     if (ok && build_boss_deaths(game_dir, bhd, bdt_path) < BOSS_DEATHS_MIN)
         ok = 0, logf_("The game's event scripts look different than expected (too few boss deaths). The game may have been updated; the mod needs an update too.");
+    if (ok && !build_camp_scripts(game_dir, bhd, bdt_path))
+        ok = 0, logf_("The game's camp scripts look different than expected. The game may have been updated; the mod needs an update too.");
     free(bhd.p);
     if (ok && two_pair()->halves) ok = build_pair_half(game_dir);
     if (!ok) return 0;
@@ -3219,6 +3300,18 @@ int core_selftest(void) {
     for (int i = 0; i < 16; i++) if (block[i] != (u8)(i * 0x11)) ok = 0;
     if (!ok) logf_("selftest: AES failed");
 
+    // camp script patch: event 0 starting 90015310 for m30_30 with count 1 -> 2, once
+    {
+        u8 e[0xE4] = {0};
+        memcpy(e, "EVD", 3);
+        e[0x10] = 1, e[0x18] = 0x80, e[0x28] = 0xB0, e[0x78] = 0xD0;
+        e[0x88] = 1;                                            // event 0: 1 instruction at 0
+        wr32(e + 0xB0, 2000), wr32(e + 0xB4, 6), e[0xB8] = 20;  // 2000[06], 20 bytes of arguments at 0
+        wr32(e + 0xD4, CAMP_SCRIPT_EVENT), wr32(e + 0xD8, 30300050), wr32(e + 0xDC, 30300051), wr32(e + 0xE0, 1);
+        buf b = {e, sizeof e};
+        if (!emevd_camp_count(b, 3030) || rd32(e + 0xE0) != 2 || emevd_camp_count(b, 3030) || emevd_camp_count(b, 3810))
+            ok = 0, logf_("selftest: camp script patch failed");
+    }
     // zstd decoder: a frame with one raw block holding "abc".
     static const u8 frame[] = {0x28, 0xB5, 0x2F, 0xFD, 0x20, 0x03, 0x19, 0x00, 0x00, 'a', 'b', 'c'};
     u8 *back = xalloc(3 + (1 << 17));
