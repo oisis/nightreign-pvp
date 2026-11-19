@@ -272,6 +272,35 @@ static int df_point_known(int entity) {
     char *pm = *(char **)(g_base + 0x3c11848);
     return pm && !IsBadReadPtr(pm + 0x10, 8) && ((char *(*)(char *, unsigned))(g_base + 0x5fc6f0))(pm, (unsigned)entity) != NULL;
 }
+// Small bases against the world (run of dev.67, pair 3, pattern 29: the map showed the church at attach point 108,
+// m60_44_36, and the owner found none): every 60 s, the pattern's small bases whose attach point (SmallBaseAndSpot-
+// AttachPoint +0x14, its entity) the point manager does not know, with their tile and small map. A point is known only
+// while its map file is loaded, so the line also lists the player's block; the ones near the player are what counts.
+static void df_bases_check(void) {
+    static DWORD next;
+    if ((int)(GetTickCount() - next) < 0) return;
+    next = GetTickCount() + 60000;
+    char *lots = df_param("LOT_RESULT_SMALLBASE_AND_SPOT_ST"), *points = df_param("SMALLBASE_AND_SPOT_ATTACH_POINT_ST");
+    char *gm = *(char **)(g_base + 0x3c13258), *me = local_player();
+    if (!lots || !points || !gm) return;
+    unsigned pat = *(unsigned *)(gm + 0xb4c);
+    char line[700];
+    int at = 0, missing = 0, all = 0;
+    for (int i = 0; i < *(unsigned short *)(lots + 0xa) && at < 640; i++) {
+        char *r = lots + *(unsigned long long *)(lots + 0x40 + i * 0x18 + 8);
+        if (*(unsigned *)(r + 4) != pat) continue;
+        int ap = *(int *)(r + 8), map = *(int *)(r + 0xc);
+        char *pt = df_param_row(points, ap);
+        if (!pt || map >= 4000) continue;  // the sites (forts, churches, camps, ruins; not the spots)
+        all++;
+        if (df_point_known(*(int *)(pt + 0x14))) continue;
+        missing++;
+        at += snprintf(line + at, sizeof line - (size_t)at, " %d(m%02d_%02d, %u_%u)", ap, map / 100, map % 100, (unsigned char)pt[5],
+                       (unsigned char)pt[6]);
+    }
+    logf("small bases: pattern %u: %d of %d sites with their point not known now (player block %08x):%s", pat, missing, all,
+         me ? *(unsigned *)(me + CHR_BLOCK_ID) : 0, missing ? line : " none");
+}
 // The game's own way to an unloaded spot: the death restart (CS::CSLuaEventScriptImitation::CSDeathRestartEvent,
 // 0x1405c38f0 -> states 0x1405c3670 / 0x1405c37b0 / 0x1405c4360) asks the world for the respawn block when it is not
 // loaded (0x140639150(mgr [0x143c123f8], &block) false): 0x140639760(mgr, &block, &pos, &rot) with the default
@@ -737,6 +766,7 @@ static void day_flow_frame(int in_world) {
         else if ((int)(GetTickCount() - next) >= 0 && (next = GetTickCount() + 1000, df_warp())) g_df_warp_until = 0;
     }
     df_lobby_watch();
+    df_bases_check();
     df_state_sync();
     df_move_frame();
     df_track_frame();
