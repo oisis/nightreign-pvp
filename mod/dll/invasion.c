@@ -2804,6 +2804,16 @@ static unsigned *variant_hook(unsigned *out, unsigned *id, unsigned long long mo
             logf("pair: tile m60_%02u_%02u: variant %u -> %d (%s)", x, z, *out >> 4 & 0xf, TWO_ADDED.variant, TWO_ADDED.name);
         *out = want;
     }
+    // The lod1 quadrant of the added region (2x2 tiles, low nibble 1: m60_21_18 = 42-43 x 36-37, Noklateo's; m60_22_18 =
+    // 44-45 x 36-37, the Rotted Woods'; analysis 09 §15): it took the base region's variant too, so the second
+    // region's buildings were drawn only by their own near tiles (pair 3, dev.63: Noklateo's walls cut open seen from
+    // the city's edge). It gets the added region's variant; the other quadrants stay the game's choice.
+    if (m >> 24 == 60 && (m & 0xf) == 1 && x == (TWO_ADDED.variant == 5 ? 21u : 22u) && z == 18) {
+        unsigned want = (m & 0xffffff00u) | ((unsigned)TWO_ADDED.variant << 4) | 1;
+        if (*out != want && g_variant_forced++ < 40)
+            logf("pair: quadrant m60_%02u_%02u (lod1): variant %u -> %d (%s)", x, z, *out >> 4 & 0xf, TWO_ADDED.variant, TWO_ADDED.name);
+        *out = want;
+    }
     return out;
 }
 // No rain (fixed, every player): the raindrops outside the circle and the circle's wall are one effect, the
