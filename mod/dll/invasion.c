@@ -908,7 +908,9 @@ static int g_hook_retry_n;
 static void hook_call(unsigned rva_site, unsigned rva_target, void *hook, const char *what) {
     unsigned char *site = (unsigned char *)g_base + rva_site;
     int expected = (int)(rva_target - (rva_site + 5));
-    unsigned char *stub = site[0] == 0xE8 && !memcmp(site + 1, &expected, 4) ? near_alloc(12) : NULL;
+    int match = site[0] == 0xE8 && !memcmp(site + 1, &expected, 4);
+    unsigned char *stub = match ? near_alloc(12) : NULL;
+    if (match && !stub) return (void)logf("%s: no room for a stub near the game's code, NOT hooked (%x)", what, rva_site);
     if (!stub) {
         logf("%s: call site %x does not look as expected (%02x %02x %02x %02x %02x), not hooked%s", what, rva_site, site[0], site[1],
              site[2], site[3], site[4], g_hook_retry_n < 32 ? " yet: tried again for 2 minutes" : "");
@@ -3563,11 +3565,16 @@ static void show_boss_list_hook(void *grid, char *list, void *a3, void *a4) {
 
 // Executable memory within +-2 GB of the game image, so rel32 calls and rip-relative loads in the
 // game's code can be pointed at it. One page, handed out in pieces.
+// Stubs within rel32 reach of the game's code: pages below the image, a new one when the last is full. (Until dev.65
+// there was one 4 KB page, 256 stubs: with the 27 per-tile variant hooks of pairs 1-3 the later hooks found no stub
+// and were reported "not as expected" although their bytes were right; the Deck's joins were refused for that.)
 static unsigned char *near_alloc(unsigned size) {
     static unsigned char *page;
     static unsigned used;
-    for (int i = 1; i < 0x4000 && !page; i++)
-        page = VirtualAlloc(g_base - (SIZE_T)i * 0x10000, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    static int next = 1;
+    if (page && used + size > 0x1000) page = NULL;
+    for (; next < 0x4000 && !page; next++)
+        if ((page = VirtualAlloc(g_base - (SIZE_T)next * 0x10000, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE))) used = 0;
     if (!page || used + size > 0x1000) return NULL;
     unsigned char *p = page + used;
     used += (size + 15) & ~15u;
@@ -3582,7 +3589,7 @@ static unsigned char *near_alloc(unsigned size) {
 // way to the start (0x9eb363 -> 0xb67190 -> fill context at 0xb67199 -> 0xb50b70 -> set-step 12 at
 // 0xb51035) goes through that call. A changed displacement is logged with what is there now and
 // written again.
-#define CODE_PATCH_MAX 160
+#define CODE_PATCH_MAX 512
 static struct { unsigned char *field; int rel; } g_code_patch[CODE_PATCH_MAX];
 static int g_code_patch_count, g_code_patch_rewriting;
 static int patch_rel32(unsigned char *field, unsigned char *next, unsigned char *target) {
