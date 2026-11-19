@@ -39,37 +39,13 @@ static int df_target_tier(void) {
     int t = g_df_met ? g_df_met_at * 5 + g_df_after * 50 : g_df_bosses * 5;
     return t > DF_TIER_COUNT * 5 ? DF_TIER_COUNT * 5 : t;
 }
-// The summon message's time on screen is not in its data (SummonMsgData 0x1408b3240: vtable, priority, flag, text;
-// no time field) and the queue's update is protected code, so the owner's ~5 s comes from showing it a second time:
-// once it has left the screen with the queue idle, under 4 s after it was queued (df_notice_frame, which logs how
-// long the first showing was on screen).
-static int g_df_reshow_id, g_df_reshow_seen;
-static char g_df_reshow_arg[24];
-static DWORD g_df_reshow_at;
-static void df_notice_long(int id, const char *arg) {
-    notice_with(id, arg);
-    g_df_reshow_id = id, g_df_reshow_seen = 0, g_df_reshow_at = GetTickCount();
-    snprintf(g_df_reshow_arg, sizeof g_df_reshow_arg, "%s", arg ? arg : "");
-}
-static void df_notice_frame(void) {
-    if (!g_df_reshow_id) return;
-    char *q = summon_queue();
-    int on = q && *(short *)(q + SMQ_CURRENT_PRIORITY) >= 0, idle = q && !on && *(int *)(q + SMQ_WAITING_COUNT) == 0;
-    DWORD t = GetTickCount() - g_df_reshow_at;
-    if (on) g_df_reshow_seen = 1;
-    else if (g_df_reshow_seen && idle) {
-        int id = g_df_reshow_id;
-        g_df_reshow_id = 0;
-        logf("day flow: notice %d left the screen %lu ms after it was queued%s", id, t, t < 4000 ? ": shown once more" : "");
-        if (t < 4000) notice_with(id, *g_df_reshow_arg ? g_df_reshow_arg : NULL);
-    }
-    if (t > 15000) g_df_reshow_id = 0;
-}
+// The text always shows the release target (owner, 2026-11-19: "Zawsze N/6"): challenge-bosses only shortens the
+// condition, silently. The game keeps a summon message up about 5.9 s by itself (run of dev.60: 5924 ms).
 static void df_progress_notice(void) {
     char arg[24];
-    snprintf(arg, sizeof arg, "%d/%d|%d", g_df_bosses < df_needed() ? g_df_bosses : df_needed(), df_needed(), df_needed());
-    if (g_df_met) df_notice_long(131182, NULL);
-    else df_notice_long(g_df_special ? 131181 : 131180, arg);
+    snprintf(arg, sizeof arg, "%d/%d", g_df_bosses < DF_BOSSES ? g_df_bosses : DF_BOSSES, DF_BOSSES);
+    if (g_df_met) notice_with(131182, NULL);
+    else notice_with(g_df_special ? 131181 : 131180, arg);
 }
 // --- enemy tiers: through the game's own re-apply of the player-count correction (ChrFinder -> 0x1405186a0, which
 // calls 0x1403c7e50(chr) for each character at 0x1405186ac; the pass runs when WCM+0x17558 differs from the count,
@@ -155,6 +131,18 @@ static void df_camp_control(char *chr) {
         logf("day flow: invader %d found (chr %p, block %08x); its camp is looked up by entity id", i + 1, (void *)chr, *(unsigned *)(chr + CHR_BLOCK_ID));
     }
     int camp = g_df_inv[i].camp, key = 0;
+    // Only an invader with SpEffect 4450 is one of the camps the generator rolled: the camp script (90015310) turns
+    // on only one that has it. Run of dev.60: m38_10 #0's +50 carries NpcParam 600030010 in the map file itself
+    // (m30 / m32 / m34 and m38's +51 have placeholders the roll fills), never got 4450 and never arrived; it is no
+    // camp of this expedition. Such a character is left alone (and logged once) until it gets 4450.
+    if (camp < 0 && !speffect_on(chr, 4450)) {
+        if (!(g_df_inv[i].seen & 0x40000000u)) {
+            g_df_inv[i].seen |= 0x40000000u;
+            int k2 = 0, e2 = df_invader_entity(chr, &k2);
+            logf("day flow: invader %d (entity %d): no SpEffect 4450, not one of the rolled camps (its camp script keeps it away)", i + 1, e2);
+        }
+        return;
+    }
     if (camp < 0) {
         int e = df_invader_entity(chr, &key);
         if (e) {
@@ -484,7 +472,7 @@ static void df_move_frame(void) {  // the warp once the screen is black; the fad
 static void df_item_used(void) {
     if (!g_df_met || g_df_used) {  // the item is not consumed (launcher: isConsume off), nothing to give back
         char arg[16];
-        snprintf(arg, sizeof arg, "%d", df_needed());
+        snprintf(arg, sizeof arg, "%d", DF_BOSSES);
         if (g_df_used) notice_with(131184, NULL);
         else notice_with(131183, arg);
         logf("day flow: item used %s: kept, not consumed", g_df_used ? "after this day's challenge" : "before the condition");
@@ -628,6 +616,40 @@ static void df_death_restart_install(void) {
     if (patch_rel32(site + 3, site + 7, stub)) logf("day flow: death restart state: hooked (5c3ffa)");
 }
 // --- every frame in the field (every machine)
+// The day flow's state is the host's (dev.60: a rejoined ally began its own count at its arrival): the host publishes
+// it in its lobby data (LOBBY_DF_KEY "day,bosses,special,met,met_at,after,kills_day,second", on change); a joiner
+// takes it at its arrival and on every change instead of counting itself (its boss count, the condition, the tier,
+// the camps' second invaders, the progress notice). The challenge itself goes as before (LOBBY_CHAL_KEY).
+#define LOBBY_DF_KEY "nrpvp_df"
+static int g_df_host_state;  // joiner: the host's state was taken (from then on it does not count itself)
+static void df_state_sync(void) {
+    static DWORD next;
+    static char last[64];
+    if ((int)(GetTickCount() - next) < 0 || !g_steam.mm || g_steam_down) return;
+    next = GetTickCount() + 500;
+    char text[64];
+    if (g_join != 4) {
+        g_df_host_state = 0;
+        if (!g_lobby) return;
+        snprintf(text, sizeof text, "%d,%d,%d,%d,%d,%d,%d,%d", g_df_day, g_df_bosses, g_df_special, g_df_met, g_df_met_at, g_df_after,
+                 g_df_kills_day, g_df_second);
+        if (strcmp(text, last)) snprintf(last, sizeof last, "%s", text), lobby_set(LOBBY_DF_KEY, text);
+        return;
+    }
+    const char *v = g_candidate ? g_steam.get_data(g_steam.mm, g_candidate, LOBBY_DF_KEY) : NULL;
+    int d[8];
+    if (!v || sscanf(v, "%d,%d,%d,%d,%d,%d,%d,%d", &d[0], &d[1], &d[2], &d[3], &d[4], &d[5], &d[6], &d[7]) != 8) return;
+    if (g_df_host_state && !strcmp(v, last)) return;
+    int more = g_df_host_state && (d[1] > g_df_bosses || d[2] > g_df_special || d[3] > g_df_met);
+    snprintf(last, sizeof last, "%s", v);
+    g_df_day = d[0], g_df_bosses = d[1], g_df_special = d[2], g_df_met = d[3], g_df_met_at = d[4], g_df_after = d[5];
+    g_df_kills_day = d[6], g_df_second = d[7];
+    logf("day flow: the host's state %s: day %d, %d bosses, special %d, condition %d, after it %d, this day %d, second invaders %d",
+         g_df_host_state ? "changed" : "taken", d[0], d[1], d[2], d[3], d[5], d[6], d[7]);
+    g_df_host_state = 1;
+    if (more) g_df_notice_due = GetTickCount() + 6000 | 1;
+    df_repass("the host's state");
+}
 static void day_flow_frame(int in_world) {
     static int was, marker_was, day2_seen, last_tier = -1, down_last = -1;
     static DWORD repass_tick;
@@ -638,7 +660,7 @@ static void day_flow_frame(int in_world) {
     if (first) {
         g_df_bosses = g_df_special = g_df_met = g_df_met_at = g_df_after = 0, g_df_day = 1, g_df_go = g_df_used = 0, g_df_seq = 0;
         g_df_tier = 0, day2_seen = 0, last_tier = -1, marker_was = 0, down_last = -1, g_df_kills_day = 0, g_df_camps = 0, g_df_ninv = 0, g_df_notice_due = 0;
-        g_df_second = 0;
+        g_df_second = 0, g_df_host_state = 0;
         g_df_events = 0, g_df_started = 0, g_df_event_tick = 0;
         InterlockedExchange(&g_df_kills, 0), InterlockedExchange(&g_df_special_kills, 0);
         char *gm0 = *(char **)(g_base + 0x3c13258);
@@ -667,6 +689,12 @@ static void day_flow_frame(int in_world) {
         logf("day flow: day 2: the merchant's item stock reset (flags 90470+ that were on: %s)", *was ? was : "none");
     }
     LONG k = InterlockedExchange(&g_df_kills, 0), sk = InterlockedExchange(&g_df_special_kills, 0);
+    // A joiner takes the host's count (df_state_sync): a late or rejoined ally starts its own count at its arrival
+    // (run of dev.60: after a rejoin the host had 2 bosses, the ally 1). Its own kills only re-pass the characters.
+    if (g_join == 4 && g_df_host_state) {
+        if (k > 0 || sk > 0) df_repass("a boss: camps and tier");
+        k = sk = 0;
+    }
     g_df_kills_day += (int)(k + sk);
     if (k > 0 || sk > 0) df_repass("a boss: camps and tier");
     if (k > 0 || sk > 0) {
@@ -709,8 +737,8 @@ static void day_flow_frame(int in_world) {
         else if ((int)(GetTickCount() - next) >= 0 && (next = GetTickCount() + 1000, df_warp())) g_df_warp_until = 0;
     }
     df_lobby_watch();
+    df_state_sync();
     df_move_frame();
-    df_notice_frame();
     df_track_frame();
     if (g_join != 4) df_events_frame();
     (void)down_last;  // the final death is the death restart's (df_death_restart_hook)
