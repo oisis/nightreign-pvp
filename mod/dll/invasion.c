@@ -898,12 +898,23 @@ static unsigned char read_answer_hook(void *ctx, int *answer, unsigned long long
     }
     return got;
 }
+// A call site that is not yet what we expect is tried again (hooks_retry) for a while: run of dev.63, the Deck
+// host at 20:51:56 found 12 call sites in the session code (0xdd..-0xdf.., 0xb58f.., 0x7c8c / 0x7dab) "not as
+// expected" that every other start hooked, among them the join check 0xdde7ad, so its joins got answer 2 (the
+// game's expected-member refusal). The same code hooked in the starts before and after: the code was not in its
+// final state yet at that moment (it is rewritten at run time).
+static struct { unsigned site, target; void *hook; const char *what; } g_hook_retry[32];
+static int g_hook_retry_n;
 static void hook_call(unsigned rva_site, unsigned rva_target, void *hook, const char *what) {
     unsigned char *site = (unsigned char *)g_base + rva_site;
     int expected = (int)(rva_target - (rva_site + 5));
-    unsigned char *stub = near_alloc(12);
-    if (site[0] != 0xE8 || memcmp(site + 1, &expected, 4) || !stub) {
-        logf("%s: call site %x does not look as expected, not hooked", what, rva_site);
+    unsigned char *stub = site[0] == 0xE8 && !memcmp(site + 1, &expected, 4) ? near_alloc(12) : NULL;
+    if (!stub) {
+        logf("%s: call site %x does not look as expected (%02x %02x %02x %02x %02x), not hooked%s", what, rva_site, site[0], site[1],
+             site[2], site[3], site[4], g_hook_retry_n < 32 ? " yet: tried again for 2 minutes" : "");
+        if (g_hook_retry_n < 32)
+            g_hook_retry[g_hook_retry_n].site = rva_site, g_hook_retry[g_hook_retry_n].target = rva_target,
+            g_hook_retry[g_hook_retry_n].hook = hook, g_hook_retry[g_hook_retry_n].what = what, g_hook_retry_n++;
         return;
     }
     stub[0] = 0x48; stub[1] = 0xB8;  // mov rax, hook; jmp rax
@@ -911,6 +922,28 @@ static void hook_call(unsigned rva_site, unsigned rva_target, void *hook, const 
     stub[10] = 0xFF; stub[11] = 0xE0;
     if (patch_rel32(site + 1, site + 5, stub)) logf("%s: hooked (%x)", what, rva_site);
     else logf("%s: cannot patch %x", what, rva_site);
+}
+static void hooks_retry(void) {  // every second for 2 minutes after the start, while some site is still pending
+    static DWORD start, next;
+    if (!g_hook_retry_n || (int)(GetTickCount() - next) < 0) return;
+    if (!start) start = GetTickCount();
+    next = GetTickCount() + 1000;
+    for (int i = 0; i < g_hook_retry_n; i++) {
+        unsigned char *site = (unsigned char *)g_base + g_hook_retry[i].site;
+        int expected = (int)(g_hook_retry[i].target - (g_hook_retry[i].site + 5));
+        int done = site[0] == 0xE8 && !memcmp(site + 1, &expected, 4);
+        if (!done && GetTickCount() - start < 120000) continue;
+        if (done) {
+            unsigned char *stub = near_alloc(12);
+            if (stub) {
+                stub[0] = 0x48, stub[1] = 0xB8, memcpy(stub + 2, &g_hook_retry[i].hook, 8), stub[10] = 0xFF, stub[11] = 0xE0;
+                logf("%s: %s (%x, %lu ms after the start)", g_hook_retry[i].what,
+                     patch_rel32(site + 1, site + 5, stub) ? "hooked late" : "cannot patch", g_hook_retry[i].site, GetTickCount() - start);
+            }
+        } else
+            logf("%s: call site %x still not as expected after 2 minutes: NOT hooked", g_hook_retry[i].what, g_hook_retry[i].site);
+        g_hook_retry[i] = g_hook_retry[--g_hook_retry_n], i--;
+    }
 }
 // Host, controller step InGame (0xb58f60): as host it reads ready packets 0x21 (1 byte) from members
 // with 0xddbbc0 (marks the member's player data +0x86c ready) and, when one came, sends 0x23 with 1
@@ -5256,17 +5289,18 @@ static char *speffect_entry(char *chr, unsigned id) {  // the active entry of Sp
 // Name from 0x140d40640(L, 2), as act 148 in the dispatcher 0x1403f5870 reads it.
 static int (*g_act_real)(void *);
 static volatile LONG g_act_seen, g_act_ours, g_act_all, g_act_148;
-// Walk / run on L3 (owner, 2026-11-19: "Chód <-> bieg"; sprint stays off). The script's speed is MoveSpeedIndex,
-// set only through ChangeMoveSpeedIndex -> SetVariable (act 148): SpeedUpdate gives 0 at a light tilt, 1 above 0.4,
-// 2 (the run) above 1.1, 3 the sprint (ER's names: 0 walk, 1 run, 2 dash). In walk mode our character's every index
-// above WALK_SPEED_INDEX becomes it. L3 (env 1108 ACTION_ARM_L3) is the sprint button: SpeedUpdate pc 529-560 / SpeedUpdate2
-// ask env(1116, 102610) only while it is held (and the character moves, stamina >= 0), every frame; our env_wrap
-// answers that question, so a question after a gap of more than WALK_PRESS_GAP_MS is a new press: it flips the mode.
-// The numeric value of ACTION_ARM_L3 is a game-side global, not in the script, so the press is taken from there.
-// ponytail: a press is only seen while moving; a press-anywhere toggle needs the input value, not located.
-#define WALK_SPEED_INDEX  0
-#define WALK_PRESS_GAP_MS 300
-static volatile int g_walk;  // 0 run (default), 1 walk
+// L3 as a held B (owner, 2026-11-19: "L3 emitowal wcisniety przycisk kolko/B"; sprint stays off). The script's speed
+// is MoveSpeedIndex, set only through ChangeMoveSpeedIndex -> SetVariable (act 148): SpeedUpdate gives 0 at a light
+// tilt, 1 above 0.4, 2 above 1.1 and 3 the sprint. MoveSpeedLevel (the engine's, GetVariable) goes above 1.1 only with
+// the dash held, so a held B is the 2 at full tilt; we take that from the script's own value: while the toggle is on,
+// our character's 1 becomes 2 (3 becomes 2 always). The dash/sprint button is env 1108 ACTION_ARM_L3: SpeedUpdate
+// pc 529-560 / SpeedUpdate2 ask env(1116, 102610) only while it is held (and stamina >= 0), every frame; our env_wrap
+// answers that, so a question after more than RUN_PRESS_GAP_MS is a new press and flips the toggle. ACTION_ARM_*
+// values are game-side globals (not in the script): every env(1108, x) of our character is logged once per (x, answer)
+// so a run shows which x is B and which L3. ponytail: if a held B also asks the sprint question, a B hold flips the
+// toggle too; the logged ids are the way to tell them apart.
+#define RUN_PRESS_GAP_MS 300
+static volatile int g_run_held;  // 1: the toggle is on (our character runs as with B held)
 
 static int act_wrap(void *L) {
     if (L && !IsBadReadPtr((char *)L + 0x48, 16)) {
@@ -5274,7 +5308,7 @@ static int act_wrap(void *L) {
         InterlockedIncrement(&g_act_all);
         if (base && top >= base + 16 && *(unsigned *)base == 3 && *(float *)(base + 8) == 148.0f) InterlockedIncrement(&g_act_148);
         if (base && top >= base + 3 * 16 && *(unsigned *)base == 3 && *(float *)(base + 8) == 148.0f && *(unsigned *)(base + 32) == 3 &&
-            (*(float *)(base + 40) == 3.0f || (g_walk && *(float *)(base + 40) > (float)WALK_SPEED_INDEX))) {
+            (*(float *)(base + 40) == 3.0f || (g_run_held && *(float *)(base + 40) == 1.0f))) {
             const char *nm = ((const char *(*)(void *, int))(g_base + 0xd40640))(L, 2);  // as act 148 reads it
             if (nm && !strcmp(nm, "MoveSpeedIndex")) {
                 InterlockedIncrement(&g_act_seen);
@@ -5289,7 +5323,7 @@ static int act_wrap(void *L) {
                 char *m2 = m && !IsBadReadPtr(m + 0x10, 8) ? *(char **)(m + 0x10) : NULL;
                 char **obj = m2 && !IsBadReadPtr(m2 + 0x10, 8) ? *(char ***)(m2 + 0x10) : NULL;
                 char *chr = obj && !IsBadReadPtr(obj, 8) ? *obj : NULL;
-                if (chr && chr == local_player()) InterlockedIncrement(&g_act_ours), *(float *)(base + 40) = g_walk ? (float)WALK_SPEED_INDEX : 2.0f;
+                if (chr && chr == local_player()) InterlockedIncrement(&g_act_ours), *(float *)(base + 40) = 2.0f;
             }
         }
     }
@@ -5324,9 +5358,9 @@ static int env_wrap(void *L) {
             if (chr && chr == local_player()) {
                 static DWORD last;
                 DWORD now = GetTickCount();
-                if (now - last > WALK_PRESS_GAP_MS) {
-                    g_walk = !g_walk;
-                    logf("walk: L3: %s", g_walk ? "walk (full tilt walks)" : "run");
+                if (now - last > RUN_PRESS_GAP_MS) {
+                    g_run_held = !g_run_held;
+                    logf("run: L3: %s", g_run_held ? "on (as with B held)" : "off");
                 }
                 last = now;
                 InterlockedIncrement(&g_env_answered);
@@ -5334,7 +5368,30 @@ static int env_wrap(void *L) {
             }
         }
     }
-    return g_env_real(L);
+    int is1108 = 0;
+    float arg = 0;
+    if (L && !IsBadReadPtr((char *)L + 0x48, 16)) {
+        char *base = *(char **)((char *)L + 0x50), *top = *(char **)((char *)L + 0x48);
+        if (base && top >= base + 2 * 16 && *(unsigned *)base == 3 && *(float *)(base + 8) == 1108.0f && *(unsigned *)(base + 16) == 3)
+            is1108 = 1, arg = *(float *)(base + 24);
+    }
+    int r = g_env_real(L);
+    if (is1108) {
+        char *top = *(char **)((char *)L + 0x48);
+        float ans = top && !IsBadReadPtr(top - 16, 16) && *(unsigned *)(top - 16) == 3 ? *(float *)(top - 8) : -1;
+        static float seen[32][2];
+        static int nseen;
+        int known = 0;
+        for (int i = 0; i < nseen; i++) known |= seen[i][0] == arg && seen[i][1] == ans;
+        if (!known && nseen < 32) {
+            char *chr = script_chr(L);
+            if (chr && chr == local_player()) {
+                seen[nseen][0] = arg, seen[nseen][1] = ans, nseen++;
+                logf("input: env(1108, %.0f) = %.0f on our character (button ids: B and L3 are among these)", arg, ans);
+            }
+        }
+    }
+    return r;
 }
 
 // Map pins placed by players (decision: the other side's pins are not seen). CS::CSPinManImp (global 0x143c17be0)
@@ -7029,6 +7086,7 @@ static DWORD WINAPI run(LPVOID self) {
         level_watch();
         lag_tick();
         act_wrap_tick();
+        hooks_retry();
         if (1) marker_tick();
         if (1) finish_tick();
     }
