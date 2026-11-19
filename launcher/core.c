@@ -39,7 +39,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 32
+#define BUILD_FORMAT 33
 #define BOSS_DEATHS_MIN 100  // the game (1.3.3) has 158 such flags; fewer = its event scripts changed
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
@@ -96,6 +96,48 @@ static const struct { const char *fmg, *english, *polish; } ITEM_TEXT[] = {
      "i bossa specjalnego regionu (smoka Szczytu albo Kapitana Zgni\xc5\x82" "ego Lasu). Przenosi ca\xc5\x82\xc4\x85 dru\xc5\xbcyn\xc4\x99 "
      "na aren\xc4\x99 bossa nocy i zapada noc.\n\nU\xc5\xbcyte za wcze\xc5\x9bnie zostaje w sakwie."},
 };
+
+// The four region pairs (owner, 2026-11-19), one drawn at each launcher start (read_settings): their names, and the
+// special boss of the challenge, one per region (owner, 2026-11-19: the Mountaintop's dragon, the Rotted Woods'
+// Captain, the Crater's Magma Wyrm, Noklateo's Naturalborn of the Void; DLL df_special), English / Polish.
+static const char *const PAIR_NAME[4][2] = {
+    {"Frozen Thicket", "Zamarzni\xc4\x99ty G\xc4\x85szcz"},
+    {"City Beneath the Peak", "Miasto pod Szczytem"},
+    {"Ash and Rot", "Popi\xc3\xb3\xc5\x82 i Zgnilizna"},
+    {"Fire over the City", "Ogie\xc5\x84 nad Miastem"},
+};
+static const char *const PAIR_SPECIAL[4][2] = {
+    {"the dragon or the Captain", "smoka lub Kapitana"},
+    {"the dragon or the Naturalborn of the Void", "smoka lub Naturalborn of the Void"},
+    {"the Magma Wyrm or the Captain", "Magmowego Wyrma lub Kapitana"},
+    {"the Magma Wyrm or the Naturalborn of the Void", "Magmowego Wyrma lub Naturalborn of the Void"},
+};
+static int g_pair_given;  // the test settings name a pair (0..3); otherwise it is drawn
+static int pair_now(void);
+// Texts that depend on the pair: 131180 / 131183 (the special boss), 131185 (the map's name, at the expedition start),
+// 131186 + k (a team with our password plays pair k), the item's caption. (id, text) for the language, n of them.
+static int pair_texts(int polish, u32 *ids, char text[][400]) {
+    int p = pair_now(), l = polish != 0, n = 0;
+    const char *sp = PAIR_SPECIAL[p][l];
+    ids[n] = 131180, snprintf(text[n++], 400, l ? "Zabi\xc5\x82" "e\xc5\x9b %%s boss\xc3\xb3w. Zabij %%s boss\xc3\xb3w i bossa specjalnego (%s), aby wyzwa\xc4\x87 bossa nocy."
+                                                  : "Bosses defeated: %%s. Defeat %%s bosses and the special boss (%s) to challenge the night boss.", sp);
+    ids[n] = 131183, snprintf(text[n++], 400, l ? "Wyzwanie nie jest jeszcze dost\xc4\x99pne: pokonaj %%s boss\xc3\xb3w i bossa specjalnego (%s)"
+                                                  : "The challenge is not available yet: defeat %%s bosses and the special boss (%s)", sp);
+    ids[n] = 131185, snprintf(text[n++], 400, l ? "Mapa: %s" : "Map: %s", PAIR_NAME[p][l]);
+    for (int k = 0; k < 4; k++)
+        ids[n] = 131186 + (u32)k, snprintf(text[n++], 400, l ? "Twoja dru\xc5\xbcyna (to samo has\xc5\x82o) gra na mapie %s. Uruchom launcher ponownie, aby wylosowa\xc4\x87 map\xc4\x99."
+                                                             : "Your team (same password) plays the map %s. Start the launcher again to draw a map.", PAIR_NAME[k][l]);
+    return n;
+}
+static void pair_caption(int polish, char *out, size_t cap) {
+    int l = polish != 0;
+    snprintf(out, cap, l ? "Dwa skrzy\xc5\xbcowane ostrza, wezwanie Nocy.\n\nMo\xc5\xbcna u\xc5\xbcy\xc4\x87, gdy dru\xc5\xbcyna pokona sze\xc5\x9b" "ciu boss\xc3\xb3w "
+                           "i bossa specjalnego (%s). Przenosi ca\xc5\x82\xc4\x85 dru\xc5\xbcyn\xc4\x99 na aren\xc4\x99 bossa nocy i zapada noc.\n\n"
+                           "U\xc5\xbcyte za wcze\xc5\x9bnie zostaje w sakwie."
+                         : "Two crossed blades, a call to the Night.\n\nUsable once the squad has defeated six bosses and the special boss (%s). "
+                           "Takes the whole squad to the night boss's arena, and the night falls.\n\nUsed too early, it stays in the pouch.",
+             PAIR_SPECIAL[pair_now()][l]);
+}
 
 // --- small utilities ----------------------------------------------------------------------------
 
@@ -1154,11 +1196,13 @@ static int setting(int i) { return g_set[i] > 0; }
 static int load_settings(const char *path, short v[SETTINGS_COUNT]) {  // 0: no file
     buf t = read_file(path);
     char bad[300];
+    g_pair_given = 0;
     if (!t.p) {
         for (int i = 0; i < SETTINGS_COUNT; i++) v[i] = setting_default(i);
         return 0;
     }
     if (settings_parse((const char *)t.p, t.n, v, bad, sizeof bad)) logf_("test-settings.toml: ignored: %s", bad);
+    g_pair_given = v[S_PAIR] >= 0 && v[S_PAIR] <= 3;
     for (int i = 0; i < SETTINGS_COUNT; i++) if (v[i] < 0) v[i] = setting_default(i);
     free(t.p);
     return 1;
@@ -1168,6 +1212,14 @@ static int read_settings(void) {
     snprintf(path, sizeof path, "%s" SEP "test-settings.toml", g_app);
     int found = load_settings(path, g_set);
     g_set[S_DEBUG_LOG] = (short)core_load_debug();  // the window's "Debug log" box decides
+    // The region pair: forced by the test settings (pair = 0..3), else drawn at each start, each with the same chance.
+    // ponytail: rand() seeded from the clock and a stack address; an OS random source if the draw ever needs more.
+    if (!g_pair_given) {
+        srand((unsigned)time(NULL) ^ (unsigned)clock() ^ (unsigned)(uintptr_t)&found);
+        g_set[S_PAIR] = (short)(rand() % 4);
+    }
+    logf_("Map this start: %s (region pair %d, %s)", PAIR_NAME[g_set[S_PAIR]][0], g_set[S_PAIR],
+          g_pair_given ? "set in test-settings.toml" : "drawn at random");
     for (int i = 0; i < SETTINGS_COUNT; i++)
         if (g_set[i]) snprintf(on + strlen(on), sizeof on - strlen(on), " %s", SETTING_NAMES[i]);
     logf_(found ? "Test settings:%s" : "Test settings:%s (no test-settings.toml next to the launcher)", on[0] ? on : " none");
@@ -1215,6 +1267,7 @@ static const region_t R_MT = {20, 1, 7601, 11, 42, 43, 38, 39, "Mountaintop", "M
 // with b's tiles of that half taken from b's).
 typedef struct { const region_t *a, *b; int start, tree, halves; } two_pair_t;  // halves: bit 0 west, bit 1 east
 static const two_pair_t TWO_PAIRS[4] = {{&R_MT, &R_RW, 701, 1, 0}, {&R_MT, &R_NK, 708, 0, 1}, {&R_CR, &R_RW, 701, 1, 2}, {&R_CR, &R_NK, 704, 0, 3}};
+static int pair_now(void) { int p = g_set[S_PAIR]; return p >= 1 && p <= 3 ? p : 0; }
 static const two_pair_t *two_pair(void) { int p = g_set[S_PAIR]; return &TWO_PAIRS[p >= 1 && p <= 3 ? p : 0]; }
 static const region_t *pair_a(void) { return two_pair()->a; }
 static const region_t *pair_b(void) { return two_pair()->b; }
@@ -1369,7 +1422,8 @@ typedef struct {
 // index 0 from both sources (pattern 8: m46_68 from Mountaintop 22 at point 756 and from Rotted Woods 30 at 315), so
 // both copies would share one block and one set of entities. A repeat gets the lowest index its map does not have in
 // that pattern, never above the highest index the game itself gives that map.
-static int distinct_instances(buf p) {
+#define DROPPED_PATTERN 0x7fffffff  // distinct_instances: a row to remove
+static int distinct_instances(buf p) {  // returns how many rows it marked for removal
     static u8 top[10000];
     memset(top, 0, sizeof top);
     u32 count = rd16(p.p + 0x0A);
@@ -1391,14 +1445,16 @@ static int distinct_instances(buf p) {
             int k = 0;
             while (k < 16 && used[m][k]) k++;
             if (k < 16 && k <= top[m]) row[0x10] = (u8)k, used[m][k] = 1, moved++;
-            else if (stuck++ < 4) logf_("two-regions: pattern %d: small map m%02u_%02u placed %d times, the game gives it index 0..%d only", slot,
-                                         m / 100, m % 100, k + 1, top[m]);
+            else {  // more copies than the game gives that map indexes (pair 2, pattern 200: m45_55 nine times, 0..7): dropped
+                if (stuck++ < 4) logf_("two-regions: pattern %d: small map m%02u_%02u placed %d times, the game gives it index 0..%d only: "
+                                       "this copy dropped", slot, m / 100, m % 100, k + 1, top[m]);
+                wr32(row + 4, (u32)DROPPED_PATTERN);
+            }
         }
     }
-    logf_("two-regions: small maps placed twice in one pattern with one index: %d given the next free index%s", moved,
-          stuck ? ", some left (no index the game uses is free)" : "");
-    if (stuck) logf_("two-regions: check failed: %d small maps would share an instance", stuck);
-    return !stuck;
+    logf_("two-regions: small maps placed twice in one pattern with one index: %d given the next free index, %d dropped (no index the "
+          "game uses is free)", moved, stuck);
+    return stuck;
 }
 // Per-tile composition (user's method, analysis/merge/compose.py): the four tiles with Rotted Woods terrain
 // (44..45 x 36..37) take their whole content from the Rotted Woods pattern (40g+30+k), every other tile from
@@ -1802,7 +1858,12 @@ static buf map_test_table(buf src, int table, buf flags, buf points, int two) {
             }
         logf_("two-regions: small bases per tile: %d %s ones on the %s tiles removed, %d of the %s on them added (most on one pattern %d)",
               removed, pair_a()->name, pair_b()->tiles, added, pair_b()->of, most);
-        if (ok) ok = distinct_instances(p);
+        if (ok && distinct_instances(p) > 0) {
+            int removed = 0, mark = DROPPED_PATTERN;
+            buf less = param_remove_rows(p, drop_pattern, &mark, &removed);
+            ok = less.p != NULL;
+            if (ok) free(p.p), p = less;
+        }
         if (ok && spot_doubles(p, &sets)) ok = 0, logf_("two-regions: check failed: two small bases on one spot");
         else if (ok) logf_("two-regions: check: no merged pattern has two small bases on one spot");
     }
@@ -2564,6 +2625,11 @@ static int build_text(const char *game_dir, buf bhd, const char *bdt, const char
             static u8 wide[OUR_TEXT_COUNT][512];
             for (size_t i = 0; i < OUR_TEXT_COUNT; i++)
                 fmg_set(&dst, OUR_TEXT[i].id, wide[i], utf8_to_utf16(polish ? OUR_TEXT[i].polish : OUR_TEXT[i].english, wide[i]));
+            static u8 pwide[8][1024];
+            static char ptext[8][400];
+            u32 pids[8];
+            int pn = pair_texts(polish, pids, ptext);
+            for (int i = 0; i < pn; i++) fmg_set(&dst, pids[i], pwide[i], utf8_to_utf16(ptext[i], pwide[i]));
             buf table = fmg_write(&dst), patched = bnd4_replace(bundle, target, table), dcx = dcx_write(patched);
             snprintf(path, sizeof path, "%s" SEP "work" SEP "build" SEP "msg" SEP "%s" SEP "menu_dlc01.msgbnd.dcx", g_app, lang);
             ok = write_file(path, dcx.p, dcx.n);
@@ -2580,7 +2646,10 @@ static int build_text(const char *game_dir, buf bhd, const char *bdt, const char
             if (target < 0 || !fmg_parse(bnd4_file(bundle, target), &dst)) {
                 ok = 0, logf_("%s: unexpected item text bundle layout (%s)", lang, ITEM_TEXT[t].fmg);
             } else {
-                fmg_set(&dst, CHALLENGE_GOODS, wide[t], utf8_to_utf16(polish ? ITEM_TEXT[t].polish : ITEM_TEXT[t].english, wide[t]));
+                static char cap_text[1200];
+                const char *txt = polish ? ITEM_TEXT[t].polish : ITEM_TEXT[t].english;
+                if (!strcmp(ITEM_TEXT[t].fmg, "\\GoodsCaption.fmg")) pair_caption(polish, cap_text, sizeof cap_text), txt = cap_text;
+                fmg_set(&dst, CHALLENGE_GOODS, wide[t], utf8_to_utf16(txt, wide[t]));
                 buf table = fmg_write(&dst), patched = bnd4_replace(bundle, target, table);
                 free(bundle.p), free(table.p);
                 bundle = patched;
@@ -3158,6 +3227,15 @@ int core_build(const char *game_dir) {
         return write_profile();
     }
     remove(stamp_path);
+    {  // the last start's pair files go: its composed map halves and map screen packs (another pair writes others)
+        char dir[1300];
+        snprintf(dir, sizeof dir, "%s" SEP "work" SEP "build" SEP "map", g_app);
+        remove_tree(dir);
+        for (int k = 1; k <= 5; k++) {
+            snprintf(dir, sizeof dir, "%s" SEP "work" SEP "build" SEP "menu" SEP "71_maptile_m%02d.tpf.dcx", g_app, k);
+            remove(dir);
+        }
+    }
     buf bhd = rsa_decrypt(enc);
     free(enc.p);
     if (memcmp(bhd.p, "BHD5", 4))
