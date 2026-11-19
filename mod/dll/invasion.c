@@ -1124,6 +1124,7 @@ static int member_no_is_invader(int no);    // a remote session member with this
 #define FINISH_GUARD_MS 10000  // ponytail: a guess at death animation + fade; the bleed-out death was never timed
 // decision 23: the invader's reward for a won invasion. Provisional amount (the user sets the real one).
 #define REWARD_MURK 5000
+#define REWARD_MURK_MIN 100    // owner, 2026-11-19: every expedition gives at least this much murk
 #define REWARD_MURK_LOST 1000  // a lost invasion (decision 23, updated): the reward screen always has content
 static int g_host_killed, g_reward_pending;  // decision 23, defined with join_over
 static int g_host_player_no = -1;  // invader: the session host's player number (member +0xd4), -1 unknown
@@ -1387,6 +1388,8 @@ static void finish_event_hook(void *msg, char *chr, unsigned long long kind, uns
 }
 // Every 250 ms while our local player is down (this thread, reads only): the fields above.
 static int chr_hp(char *c);
+static int ring_on(void);
+static void ring_where(const char *why);
 static void finish_tick(void) {
     static DWORD next, down_at;
     static float last_timer, last_grace;
@@ -1406,6 +1409,8 @@ static void finish_tick(void) {
     if ((int)(GetTickCount() - next) < 0) return;
     if (chr[0x710] != 1 && !(g_finish_tick && chr == g_finish_chr)) return;
     next = GetTickCount() + 250;
+    static DWORD ring_next;
+    if (ring_on() && (int)(GetTickCount() - ring_next) >= 0) ring_next = GetTickCount() + 1000, ring_where("while down");
     logf("finish test: state %u gauge %.1f timer %.2f grace %.2f HP %d still-down %u stand-up %u down count %u%s", (unsigned char)chr[0x710],
          *(float *)(chr + 0x714), *(float *)(chr + 0x718), *(float *)(chr + 0x71c), chr_hp(chr), (unsigned char)chr[0x731],
          (unsigned char)chr[0x732], (unsigned char)chr[0x730], g_finish_tick && chr == g_finish_chr ? " (stand-up refused)" : "");
@@ -2085,6 +2090,20 @@ static void reward_hook(unsigned long long a1, unsigned a2) {
     char *ps = *(char **)(g_base + 0x3c078d0);
     if (!g_reward_pending || !ps) {
         ((void (*)(unsigned long long, unsigned))(g_base + 0x1fd620))(a1, a2);
+        // The owner (2026-11-19): every expedition gives at least REWARD_MURK_MIN murk, however it ends; more from the
+        // game's own result stays. The game recorded what it gave in +0x36c (the amount it passed to 0x209730).
+        char *pd = ps ? *(char **)(ps + 8) : NULL;
+        if (ps && pd && !IsBadReadPtr(pd, 0x1a0)) {
+            unsigned got = *(unsigned short *)(ps + 0x36c);
+            if (got < REWARD_MURK_MIN) {
+                int before = *(int *)(pd + 0xd0);
+                int added = ((int (*)(char *, int))(g_base + 0x209730))(pd, (int)(REWARD_MURK_MIN - got));
+                *(unsigned short *)(ps + 0x36c) = (unsigned short)(got + (unsigned)added);
+                logf("reward: the expedition gave %u murk, raised to the minimum %d: murk %d -> %d, reward screen amount %u", got,
+                     REWARD_MURK_MIN, before, *(int *)(pd + 0xd0), *(unsigned short *)(ps + 0x36c));
+            } else
+                logf("reward: the expedition gave %u murk (at least the minimum %d)", got, REWARD_MURK_MIN);
+        }
         return;
     }
     int won = g_reward_pending == 1;
@@ -2805,6 +2824,22 @@ static void norain_effect_off(void) {
 // phase notice. Damage is the game's (launcher: PlayAreaCreateCommonParam's 99810 / 99811 kept; by day the held
 // radius leaves nobody outside). Day 2 (7505 clears g_df_used) holds the radius again.
 static int ring_on(void) { return g_settings[S_BOSS_FLOW] == 4 && g_df_used; }
+// Where the local player is against the circle (run of dev.60: an ally downed at the arena with the ring at 40 m, its
+// down timer frozen, the game ended its session 10 s later): the game's own "outside" bit (chr+0x1f9 bit 3, set by
+// the character update from 0x68c500), the radius, the circle centre as the manager holds it (+0x250 / +0x254 /
+// +0x258, raw) and the player's block and position.
+static int player_position(float out[3], unsigned *block);
+static char *local_player(void);
+static void ring_where(const char *why) {
+    char *pa = *(char **)(g_base + 0x3c13158), *me = local_player();
+    float p[3] = {0};
+    unsigned blk = 0;
+    int have = player_position(p, &blk);
+    if (!pa || IsBadReadPtr(pa, 0x264)) return;
+    logf("fire ring (%s): radius %.1f, centre %.1f %.1f %.1f; us: outside bit %d, block %08x position %s%.1f %.1f %.1f", why,
+         *(float *)(pa + 0x260), *(float *)(pa + 0x250), *(float *)(pa + 0x254), *(float *)(pa + 0x258),
+         me && !IsBadReadPtr(me + 0x1f9, 1) ? (me[0x1f9] >> 3) & 1 : -1, blk, have ? "" : "(none) ", p[0], p[1], p[2]);
+}
 static float g_circle_orig[6];
 static unsigned char g_circle_have[6];
 static void circle_hold(char *mgr) {
@@ -2829,7 +2864,7 @@ static void circle_hold(char *mgr) {
             logf("fire ring: off (day 2 or a new expedition): radius held at %.0f again", CIRCLE_HELD_RADIUS);
     }
     if (ring) {
-        if ((int)(GetTickCount() - next) >= 0) next = GetTickCount() + 30000, logf("fire ring: circle radius now %.1f (every 30 s)", *(float *)(mgr + 0x260));
+        if ((int)(GetTickCount() - next) >= 0) next = GetTickCount() + 30000, ring_where("every 30 s");
         return;
     }
     if (key && told_for != key) {
