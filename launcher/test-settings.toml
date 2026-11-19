@@ -2,20 +2,13 @@
 # Nothing here is needed to play: invasions work with every line false.
 # PL: Opcjonalne ustawienia testowe; do grania nic tu nie trzeba zmieniać.
 
-team-test = false   # solo tests only: 90 s into an expedition you turn red and monsters ignore you for 180 s
-slow-time = false   # both players the same: day and circle clocks run about ten times slower (the host's counts)
-full-sync = true    # invader: ask the host for its full world state (enemies, events); false only for tests
 loot-test = false   # logging only: what lies on the ground, every pickup and equipment dialog
 no-host = false           # test: your own expedition opens no host session (nobody can invade you)
 test-level = 0            # test: your own expedition sets your level to this number 5 s after the start (0 = off)
-boss-flow = 4             # the day clock (host): 4 = the day flow (held at 22:00 until the squad uses Challenge the Night; enemy tiers per boss; default); 3 = holds at 09, 11, ..., 21 and 22:59 until a boss is killed; 0 = the game's clock; 1 / 2 = old tests
+boss-flow = 4             # the day clock (host): 4 = the day flow (held at 18:00 until the squad uses Challenge the Night; enemy tiers per boss; default); 0 = the game's clock (comparison tests)
 challenge-bosses = 1      # test: bosses needed before the challenge (the special boss as well); 0 = 6 (default)
 revive-hits = false       # test, invasions: a downed player is finished by the other side in 2 hits, raised by its own side in 5
-no-sprint = true          # the fast run (sprint) is off; false turns it back on
 ult-pvp = 100             # test, invasions: ultimate damage against players of the other side in percent (100 = unchanged, 0..999)
 party = 0                 # test only: a number mixed into the squad matchmaking key, to keep test runs apart (0 = off)
-show-ping = true          # the round trip to each other player (ms) after its name on the party bars; false hides it
-show-counts = true        # in the Roundtable Hold: how many mod squads are in an expedition / looking for a player, top right; false hides it
 slot-test = false         # test: new session members take the highest free player slot first (3 machines reach slots 3 and 2)
-rain-hooks-legacy = true  # test: also the 8 older rain hooks the held circle radius makes unnecessary; false = the radius alone (confirmation run)
 # pair = 0          # test: force a region pair (0 Frozen Thicket, 1 City Beneath the Peak, 2 Ash and Rot, 3 Fire over the City); without it (or -1) the launcher draws one at every start

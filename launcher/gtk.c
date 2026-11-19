@@ -8,7 +8,7 @@
 
 static const char *const *T = UI_TEXT[L_EN];
 static GtkWidget *g_window, *g_folder, *g_log_view, *g_play, *g_uninstall, *g_backup, *g_help, *g_browse, *g_close, *g_folder_label,
-    *g_lang_label, *g_debug, *g_settings;
+    *g_lang_label, *g_settings;
 
 static void log_line(const char *line) {
     GtkTextBuffer *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(g_log_view));
@@ -81,16 +81,10 @@ static void set_texts(void) {
     gtk_button_set_label(GTK_BUTTON(g_help), T[T_HELP]);
     gtk_button_set_label(GTK_BUTTON(g_uninstall), T[T_UNINSTALL]);
     gtk_button_set_label(GTK_BUTTON(g_close), T[T_CLOSE]);
-    gtk_button_set_label(GTK_BUTTON(g_debug), T[T_DEBUG_LOG]);
     gtk_button_set_label(GTK_BUTTON(g_settings), T[T_SETTINGS]);
 }
 
-static void on_debug(GtkToggleButton *b, gpointer u) {
-    (void)u;
-    core_save_debug(gtk_toggle_button_get_active(b));
-}
-
-// Settings: the map (random or one of the four pairs), ping and squad counts; saved when the dialog is closed with OK.
+// Settings: the map (random or one of the four pairs) and the debug log; saved when the dialog is closed with OK.
 static void on_settings(GtkButton *b, gpointer u) {
     (void)b; (void)u;
     int pl = T == UI_TEXT[L_PL];
@@ -105,18 +99,15 @@ static void on_settings(GtkButton *b, gpointer u) {
     gtk_combo_box_set_active(GTK_COMBO_BOX(map), core_load_choice(CHOICE_MAP) + 1);
     gtk_box_pack_start(GTK_BOX(row), map, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(grid), row, FALSE, FALSE, 0);
-    GtkWidget *ping = gtk_check_button_new_with_label(T[T_SHOW_PING]), *counts = gtk_check_button_new_with_label(T[T_SHOW_COUNTS]);
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ping), core_load_choice(CHOICE_PING));
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(counts), core_load_choice(CHOICE_COUNTS));
-    gtk_box_pack_start(GTK_BOX(grid), ping, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(grid), counts, FALSE, FALSE, 0);
+    GtkWidget *debug = gtk_check_button_new_with_label(T[T_DEBUG_LOG]);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(debug), core_load_debug());
+    gtk_box_pack_start(GTK_BOX(grid), debug, FALSE, FALSE, 0);
     gtk_container_add(GTK_CONTAINER(area), grid);
     gtk_widget_show_all(d);
     if (gtk_dialog_run(GTK_DIALOG(d)) == GTK_RESPONSE_OK) {
         int m = gtk_combo_box_get_active(GTK_COMBO_BOX(map));
         core_save_choice(CHOICE_MAP, m >= 1 && m <= 4 ? m - 1 : -1);
-        core_save_choice(CHOICE_PING, gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ping)));
-        core_save_choice(CHOICE_COUNTS, gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(counts)));
+        core_save_debug(gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(debug)));
     }
     gtk_widget_destroy(d);
 }
@@ -189,10 +180,6 @@ int main(int argc, char **argv) {
     gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(g_log_view), GTK_WRAP_WORD_CHAR);
     gtk_container_add(GTK_CONTAINER(scroll), g_log_view);
     gtk_box_pack_start(GTK_BOX(box), scroll, TRUE, TRUE, 0);
-    g_debug = gtk_check_button_new_with_label(T[T_DEBUG_LOG]);
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g_debug), core_load_debug());
-    gtk_box_pack_start(GTK_BOX(box), g_debug, FALSE, FALSE, 0);
-    g_signal_connect(g_debug, "toggled", G_CALLBACK(on_debug), NULL);
 
     GtkWidget *buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     g_play = gtk_button_new_with_label(T[T_PLAY]);

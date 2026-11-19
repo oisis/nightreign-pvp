@@ -6,19 +6,20 @@
 #include <stddef.h>
 #include <string.h>
 
-enum { S_TEAM_TEST, S_SLOW_TIME, S_FULL_SYNC, S_LOOT_TEST, S_DEBUG_LOG, S_NO_HOST, S_TEST_LEVEL, S_FLAG_LOG, S_MAP_DUMP, S_MAP_GROUP, S_ONE_REGION, S_BOSS_FLOW, S_REVIVE_HITS, S_NO_SPRINT, S_ULT_PVP, S_PAIR, S_PARTY, S_SHOW_PING, S_SHOW_COUNTS, S_SLOT_TEST, S_RAIN_HOOKS_LEGACY, S_CHALLENGE_BOSSES, SETTINGS_COUNT };
-static const char *const SETTING_NAMES[SETTINGS_COUNT] = {"team-test", "slow-time", "full-sync", "loot-test",
+enum { S_LOOT_TEST, S_DEBUG_LOG, S_NO_HOST, S_TEST_LEVEL, S_FLAG_LOG, S_MAP_DUMP, S_MAP_GROUP, S_ONE_REGION, S_BOSS_FLOW, S_REVIVE_HITS, S_ULT_PVP, S_PAIR, S_PARTY, S_SLOT_TEST, S_CHALLENGE_BOSSES, SETTINGS_COUNT };
+static const char *const SETTING_NAMES[SETTINGS_COUNT] = {"loot-test",
                                                           "debug-log", "no-host", "test-level", "flag-log",
-                                                          "map-dump", "map-group", "one-region", "boss-flow", "revive-hits", "no-sprint", "ult-pvp", "pair", "party", "show-ping", "show-counts", "slot-test", "rain-hooks-legacy", "challenge-bosses"};
+                                                          "map-dump", "map-group", "one-region", "boss-flow", "revive-hits", "ult-pvp", "pair", "party", "slot-test", "challenge-bosses"};
 // Keys of settings that became fixed behaviour or were dropped; old files may still have them: skipped silently.
 // (no-rain: decision 27, the rain outside the circle never does damage. two-regions, map-test-control, map-region,
 // map-pair-a / -b: every map is a Mountaintop + Rotted Woods map now (decision 35). no-circle: to be redone. ally: the
 // menu's "team" choice joins as an ally now.)
-static const char *const SETTING_RETIRED[] = {"ally", "no-rain", "two-regions", "map-test-control", "map-region", "map-pair-a", "map-pair-b", "no-circle"};
+static const char *const SETTING_RETIRED[] = {"team-test", "slow-time", "full-sync", "no-sprint", "show-ping", "show-counts",
+                                               "rain-hooks-legacy", "ally", "no-rain", "two-regions", "map-test-control", "map-region", "map-pair-a", "map-pair-b", "no-circle"};
 // Settings that take a whole number 0..999 instead of true / false (0 = off).
 static int setting_is_number(int i) { return i == S_TEST_LEVEL || i == S_MAP_GROUP || i == S_ONE_REGION || i == S_BOSS_FLOW || i == S_ULT_PVP || i == S_PAIR || i == S_PARTY || i == S_CHALLENGE_BOSSES; }
 // Settings that are on when the file does not mention them.
-static int setting_default(int i) { return i == S_BOSS_FLOW ? 4 : i == S_FULL_SYNC || i == S_NO_SPRINT || i == S_SHOW_PING || i == S_SHOW_COUNTS || i == S_RAIN_HOOKS_LEGACY; }  // boss-flow: 3, the owner's flow  // no-sprint: the fast run is off unless a file says false
+static int setting_default(int i) { return i == S_BOSS_FLOW ? 4 : 0; }  // boss-flow: 4, the day flow
 
 static int settings_word(const char *s, size_t n, const char *w) {  // case-insensitive, whole word
     size_t i = 0;
@@ -57,6 +58,7 @@ static int settings_parse(const char *t, size_t n, short v[SETTINGS_COUNT], char
                 for (const char *c = vs; val >= 0 && c < e; c++) val = *c >= '0' && *c <= '9' ? val * 10 + (*c - '0') : -1;
             }
         }
+        if (key == S_BOSS_FLOW && val != 0 && val != 4) val = -1;  // flows 1..3 retired: only 0 (the game's clock) and 4
         if (key >= 0 && val >= 0) {
             v[key] = (short)val;
             continue;
