@@ -77,7 +77,14 @@ static int slot_alloc(unsigned long long *steam_id) {
     unsigned long long id = steam_id && !IsBadReadPtr(steam_id, 8) ? *steam_id : 0;
     unsigned long long lobby = our_lobby();
     unsigned long long owner = lobby && g_steam.mm && g_diag.owner ? g_diag.owner(g_steam.mm, lobby) : 0;
-    int ally = id && lobby && (member_ally(lobby, id) || id == owner);  // the host's side: the lobby owner and allies
+    // the host's side: the lobby owner and allies. On a party host (team play) also a member with no role yet: a rejoin
+    // (run of dev.60, 19:54:44) is added within the same second it enters the lobby, before its role arrives; the slot
+    // is never changed later. ponytail: an invader that joins a party host before its role arrives takes a slot of the
+    // host's side (0 / 1: only named messages and the result screen tell); a slot change once the role arrives is the
+    // upgrade, not established.
+    const char *r = id && lobby && g_diag.get_member && g_steam.mm ? g_diag.get_member(g_steam.mm, lobby, id, LOBBY_ROLE_KEY) : NULL;
+    int no_role = !r || !*r;
+    int ally = id && lobby && (member_ally(lobby, id) || id == owner || (g_party_host && no_role));
     int test = setting(S_SLOT_TEST) != 0;
     static const int ORDER[2][2][4] = {{{0, 1, 2, 3}, {2, 3, 0, 1}}, {{1, 0, 3, 2}, {3, 2, 1, 0}}};  // [test][invader]
     const int *o = ORDER[test][!ally];
@@ -87,7 +94,8 @@ static int slot_alloc(unsigned long long *steam_id) {
         if (s < g_cap_remote && !state[s]) slot = s;
     }
     // the session number is given right after this (0x140df5f4d), so the member is named by its tag here
-    logf("slot: member %04x got slot %d (%s%s)", id_tag(id), slot, ally ? "host's side" : "invader or no role yet", test ? ", slot-test" : "");
+    logf("slot: member %04x got slot %d (%s%s)", id_tag(id), slot,
+         ally ? (no_role && id != owner ? "host's side: no role yet, party host" : "host's side") : "invader or no role yet", test ? ", slot-test" : "");
     return slot;
 }
 // Party list (CS::PartyMemberInfo, [0x143c13258]+0xdc8): 3 entries of 0x30 from +0x28, every loop bounded by 3;
