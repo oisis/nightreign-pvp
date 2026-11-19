@@ -41,9 +41,9 @@ void core_save_lang(const char *code);
 int core_load_debug(void);
 void core_save_debug(int on);
 // The window's Settings dialog (an ordinary player's choices), from / to <app>/launcher-settings.txt:
-// CHOICE_MAP -1 random (default) or the region pair 0..3, CHOICE_PING / CHOICE_COUNTS 0 or 1 (default 1). Applied at
-// the next "Play with the mod" (the map: unless test-settings.toml sets pair). core_pair_name: the pair's name.
-enum { CHOICE_MAP, CHOICE_PING, CHOICE_COUNTS, CHOICE_COUNT };
+// CHOICE_MAP -1 random (default) or the region pair 0..3, applied at the next "Play with the mod" unless
+// test-settings.toml sets pair. (The debug log is the window's other setting, core_load_debug.) core_pair_name: the name.
+enum { CHOICE_MAP, CHOICE_COUNT };
 int core_load_choice(int which);
 void core_save_choice(int which, int value);
 const char *core_pair_name(int pair, int polish);

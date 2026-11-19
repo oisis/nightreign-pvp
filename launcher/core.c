@@ -1179,15 +1179,8 @@ static int no_rain(buf p) {
     return 1;
 }
 
-// Slow clock (test sessions only): an empty file "slow-time" in work/native/ makes the profile set
-// the game's debug property Game.IngameTime.TimeScale to 7.29, a tenth of the expedition clock's
-// rate (GameSystemCommonParam +0x1bc = 72.9; the game reads the property in 0x140f884b0 and lets it
-// replace that rate when the clock is set up). The circles run on a second clock, the play-area
-// manager's, with its own property Game.PlayAreaTime.TimeScale (read in 0x14068b130 when above 0;
-// otherwise its rate comes from param table 0x92 row 0 +0x1b4): set to 7.29 as well. The host's
-// clocks are the ones clients follow.
 // Test settings (test phase only): test-settings.toml next to the launcher, read at every build
-// (each "Play with the mod"). A missing file means all false. slow-time acts here; the
+// (each "Play with the mod"). A missing file means the defaults; the
 // resolved values of all of them go to work/native/test-settings.toml, which the DLL reads.
 #include "../mod/dll/settings.h"
 #include "ui.h"
@@ -1215,10 +1208,9 @@ static int read_settings(void) {
     g_set[S_DEBUG_LOG] = (short)core_load_debug();  // the window's "Debug log" box decides
     // The region pair: forced by the test settings (pair = 0..3), else drawn at each start, each with the same chance.
     // ponytail: rand() seeded from the clock and a stack address; an OS random source if the draw ever needs more.
-    // The Settings dialog: show-ping / show-counts always; the map unless test-settings.toml sets pair.
+    // The Settings dialog: the map, unless test-settings.toml sets pair.
     int choice[CHOICE_COUNT];
     choices_read(choice);
-    g_set[S_SHOW_PING] = (short)choice[CHOICE_PING], g_set[S_SHOW_COUNTS] = (short)choice[CHOICE_COUNTS];
     const char *how = "set in test-settings.toml";
     if (!g_pair_given && choice[CHOICE_MAP] >= 0) g_set[S_PAIR] = (short)choice[CHOICE_MAP], how = "chosen in Settings";
     else if (!g_pair_given) {
@@ -1240,7 +1232,6 @@ static int read_settings(void) {
     fclose(f);
     return 1;
 }
-static int slow_time_wanted(void) { return setting(S_SLOW_TIME); }
 #define TWO_PATTERNS 320
 #define TWO_PATTERNS_ TWO_PATTERNS
 // Every expedition map is a Mountaintop + Rotted Woods one (decision 35; 09 §12-18). Each region is a set of
@@ -2575,8 +2566,8 @@ int core_backup_save(const char *save_dir, char *where, size_t cap) {
     return 1;
 }
 
-static const char *const CHOICE_KEY[CHOICE_COUNT] = {"map", "show-ping", "show-counts"};
-static const int CHOICE_DEFAULT[CHOICE_COUNT] = {-1, 1, 1};
+static const char *const CHOICE_KEY[CHOICE_COUNT] = {"map"};
+static const int CHOICE_DEFAULT[CHOICE_COUNT] = {-1};
 static void choices_read(int v[CHOICE_COUNT]) {
     char path[1300];
     for (int i = 0; i < CHOICE_COUNT; i++) v[i] = CHOICE_DEFAULT[i];
@@ -2731,10 +2722,6 @@ static int write_profile(void) {
         logf_("Seamless Co-op found next to the launcher: it will be loaded too");
     }
     fprintf(f, "\n[[natives]]\npath = \"native/invasion.dll\"\n");
-    if (slow_time_wanted()) {
-        fprintf(f, "\n[debug_properties]\n\"Game.IngameTime.TimeScale\" = 7.29\n\"Game.PlayAreaTime.TimeScale\" = 7.29\n");
-        logf_("Test option: slow day and circle clocks");
-    }
     fclose(f);
     return 1;
 }
@@ -3259,7 +3246,7 @@ int core_build(const char *game_dir) {
     // BUILD_FORMAT: bump when the set of files the launcher builds changes.
     snprintf(stamp, sizeof stamp, "%016llx%016llx", (unsigned long long)fnv1a64(enc.p, enc.n),
              (unsigned long long)(fnv1a64(dll.p, dll.n) + BUILD_FORMAT +
-                                     ((u64)slow_time_wanted() << 41) + ((u64)(map_draw_group() + 1) << 49) + ((u64)one_region() << 53) + ((u64)g_set[S_PAIR] << 57)));
+                                     ((u64)(map_draw_group() + 1) << 49) + ((u64)one_region() << 53) + ((u64)g_set[S_PAIR] << 57)));
     free(dll.p);
     buf old_stamp = read_file(stamp_path);
     int same = old_stamp.n == 32 && !memcmp(old_stamp.p, stamp, 32);
@@ -3519,12 +3506,13 @@ int core_selftest(void) {
     }
     {  // test settings: values, comments, CRLF, case, a retired key (no-rain), unknown keys and bad values, a missing file
         static const char t[] = "# c\r\nteam-test = true\r\n  NO-RAIN=FALSE # x\r\nslow-time\t= True\r\ntwo-regions = true\r\n"
-                                "nope = true\r\nloot-test = yes\r\n\r\ndebug-log = false\r\ntest-level = 15\r\nmap-group = 3\r\nult-pvp = 250\r\none-region = 1000";
+                                "nope = true\r\nloot-test = yes\r\n\r\ndebug-log = false\r\ntest-level = 15\r\nmap-group = 3\r\nult-pvp = 250\r\none-region = 1000\r\n"
+                                "pair = -1\r\nboss-flow = 3";
         short v[SETTINGS_COUNT];
-        char bad[64];
-        static const short want[SETTINGS_COUNT] = {1, 1, -1, -1, 0, -1, 15, -1, -1, 3, -1, -1, -1, -1, 250, -1, -1, -1, -1, -1, -1, -1};
-        int good = settings_parse(t, sizeof t - 1, v, bad, sizeof bad) == 3 && !memcmp(v, want, sizeof v) &&
-                   !strcmp(bad, "nope = true, loot-test = yes, one-region = 1000");
+        char bad[96];
+        static const short want[SETTINGS_COUNT] = {-1, 0, -1, 15, -1, -1, 3, -1, -1, -1, 250, -1, -1, -1, -1};
+        int good = settings_parse(t, sizeof t - 1, v, bad, sizeof bad) == 4 && !memcmp(v, want, sizeof v) &&
+                   !strcmp(bad, "nope = true, loot-test = yes, one-region = 1000, boss-flow = 3");
         good = good && !load_settings("/nonexistent/test-settings.toml", v);
         for (int i = 0; i < SETTINGS_COUNT; i++) good = good && v[i] == setting_default(i);
         if (!good) { ok = 0; logf_("selftest: test settings parser failed"); }

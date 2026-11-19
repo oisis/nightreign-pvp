@@ -255,7 +255,7 @@ static void ov_barrier(ID3D12Resource *r, D3D12_RESOURCE_STATES from, D3D12_RESO
     ID3D12GraphicsCommandList_ResourceBarrier(g_ov.list, 1, &b);
 }
 static void ov_draw(IDXGISwapChain *sc) {
-    if (g_ov_off || !g_ov.shown || sc != g_ov_sc || !g_ov_queue || !setting(S_SHOW_COUNTS)) return;
+    if (g_ov_off || !g_ov.shown || sc != g_ov_sc || !g_ov_queue) return;
     static int tex_ready;  // the texture went to PIXEL_SHADER_RESOURCE once
     IDXGISwapChain3 *sc3 = NULL;
     if (FAILED(IDXGISwapChain_QueryInterface(sc, &IID_IDXGISwapChain3, (void **)&sc3))) return ov_fail("IDXGISwapChain3", 0);

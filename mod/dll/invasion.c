@@ -2190,7 +2190,6 @@ static int g_flog_last_mode = -1;  // mode of the last layout (run 32: 1 = the e
 static struct { unsigned id; DWORD t; } g_flog_back[8];  // ten-digit flags turned on, read back 5 s later
 static int g_flog_back_n, g_flog_back_logged;
 static double flog_t(void) { return (GetTickCount() - g_flog_layout_tick) / 1000.0; }
-static void bf3_kill(unsigned id);
 // Boss deaths: every flag a site-of-grace chain waits for (common_func 9005810's first and 90015006's third parameter
 // in the game's tile and small-map scripts), listed by the launcher at the mod build from the player's own game files:
 // work/native/boss-deaths.txt (a header line, one id per line). One per boss: a small map's boss set-up (90045002)
@@ -2242,7 +2241,7 @@ static void df_chr_pass_hook(char *chr);
 static void df_death_restart_install(void);
 static void flag_note(char *man, unsigned id, int on, int before) {
     (void)man;
-    if (on && before == 0 && id >= 10000000u && boss_death(id)) bf3_kill(id), df_kill(id);
+    if (on && before == 0 && id >= 10000000u && boss_death(id)) df_kill(id);
     if (!setting(S_FLAG_LOG)) {
         // always (boss-grace check): a boss-family flag (nnn 800..899 in a block with d = 0, the d digit being
         // (id / 1000) % 10 in tile ids 10XXYYdnnn / 10XYVddnnn and small-map ids) turned on, or dropped for want of a
@@ -2835,11 +2834,8 @@ static void norain_sound_hook(char *mgr, float dt) {
 // only at 0x68e208) creates the effect around the player while beyond radius + margin (+0x430); its fields
 // +0x424/+0x428 are read by nothing else. 0x692350 (called only at 0x68e213) keeps the rain instances along the
 // edge near the player (807421/3/5, list +0x408/+0x410/+0x418, else only a clean-up walk); its callees are
-// math (0x68f1d0) and ground queries (0xdac580, 0xdad400). Both calls are skipped: never created.
-static void norain_player_rain_hook(char *mgr) {
-    (void)mgr;
-    norain_first(3, "rain around the player 0x695f80 skipped");
-}
+// math (0x68f1d0) and ground queries (0xdac580, 0xdad400). The edge rain is skipped (never created); the rain around the
+// player needs no hook: with the radius held it is never beyond the radius (rain-hooks-legacy, retired).
 static void norain_edge_rain_hook(char *mgr, float dt) {
     (void)mgr, (void)dt;
     norain_first(4, "rain along the edge 0x692350 skipped");
@@ -2852,34 +2848,12 @@ static void norain_border_hook(char *mgr, float dt) {
     (void)mgr, (void)dt;
     norain_first(5, "circle border effects 0x694580 skipped");
 }
-// Health bar colour outside the circle: the HUD (0x7cbdf0 at 0x7cbf86, 0x7ceca0 at 0x7cee41) asks 0x68c5f0(play
-// area, character) whether the character is in the play area's per-character map (+0x460) while the circle exists,
-// and styles the bar with the answer (+0xa4 = 2 / 1). Without a circle the function answers 0; these are its only
-// callers. The hooks always answer 0: the bar looks as before the circle.
 // Circle-start notice: when the circle phase (+0x154) changes, 0x696170 calls the HUD (0x3c14a70) at 0x69722c:
 // 0x7c52f0(hud, phase) shows text effect 4200 (phase 1, "The Night's tide grows stronger") or 4201 (phase 2, "Rains
 // gather, portending the tide of Night") through 0x8b4c30 and does nothing else; its only caller. Skipped.
 static void hud_circle_notice_hook(void *hud, unsigned long long phase) {
     (void)hud, (void)phase;
     norain_first(7, "circle notice 0x7c52f0 skipped");
-}
-// Weather side of the circle: 0x68b5c0 (play area +0x471: the player is inside the circle) has four callers, all
-// weather or sound: 0x65feb0 (weather effect +0x108), 0x6631a0 (rain ground splash 1004010 outside), 0x6640f0 (weather
-// effects +0x118 / +0x128 and one attached to each character), 0xef54e0 (sound state). Answered 1: they keep the
-// state they have inside the circle (and without one).
-static unsigned long long weather_inside_hook(char *mgr) {
-    (void)mgr;
-    norain_first(9, "weather side answered inside the circle");
-    return 1;
-}
-// Outside the circle: the character update 0x3e2580 stores 0x68c500 (position beyond the radius) in bit 3 of
-// chr+0x1f9 (call 0x3e2a16, its only caller); the SpEffect check 0x50f740 (0x50fa6a) lets a row with +0x353 bit 1
-// act only while that bit is set (14 rows: the Night's Tide damage / increased damage / instant death of both
-// shrinkings, 98220 / 98221, 99880 / 99881, 4710, 296400). Answered 0: no character is ever outside.
-static unsigned long long outside_circle_hook(char *mgr, float *pos) {
-    (void)mgr, (void)pos;
-    norain_first(11, "no character marked outside the circle");
-    return 0;
 }
 // Map pins: 0x6af290(map type T, &map id) decides whether a WorldMapPointParam row gets a pin (pin
 // loop 0x910fb3, call 0x911081; second row loop 0xa5bba1). The map id is built by 0x6772b0 from the row's +0x1c..+0x1f:
@@ -2905,11 +2879,6 @@ static unsigned long long pin_row_shown_hook(unsigned long long type, unsigned *
 static unsigned long long map_no_circle_hook(void *mgr, void *a, void *b, void *c) {
     (void)mgr, (void)a, (void)b, (void)c;
     norain_first(8, "map: circle and next-circle preview not drawn");
-    return 0;
-}
-static unsigned long long hud_circle_state_hook(char *mgr, unsigned long long chr) {
-    (void)mgr, (void)chr;
-    norain_first(6, "health bar circle state answered 0");
     return 0;
 }
 static unsigned *map_request_hook(unsigned *out, unsigned *request) {
@@ -3149,45 +3118,33 @@ static void hook_acceptance(void) {
     if (g_settings[S_PAIR] >= 1)
         for (unsigned i = 0; i < sizeof VARIANT_SITES / sizeof *VARIANT_SITES; i++)
             hook_call(VARIANT_SITES[i], 0x6ab7a0, (void *)variant_hook, "pair: per-tile variant");
-    // rain-hooks-legacy (test, default on): the 8 hooks the held radius makes the game answer by itself (rain around
-    // the player, health bar circle state x2, weather side x4, no character outside); off = the radius alone
-    int legacy = setting(S_RAIN_HOOKS_LEGACY);
+    // the held radius makes the game answer the rain around the player, the health bar's circle state, the weather side
+    // and "outside the circle" by itself (rain-hooks-legacy, retired: its 8 hooks went)
     hook_call(0x68e1d2, 0x696170, (void *)norain_circle_hook, "no rain: circle radius held, play-area effect off after the circle update");
     hook_call(0x68e1ea, 0x698c90, (void *)norain_circle2_hook, "no rain: play-area effect off after the second circle update");
     hook_call(0x68e229, 0x6953b0, (void *)norain_sound_hook, "no rain: circle edge sound skipped");
-    if (legacy) hook_call(0x68e208, 0x695f80, (void *)norain_player_rain_hook, "no rain: rain around the player skipped");
     hook_call(0x68e213, 0x692350, (void *)norain_edge_rain_hook, "no rain: rain along the circle edge skipped");
     hook_call(0x68e21e, 0x694580, (void *)norain_border_hook, "no rain: circle border effects skipped");
-    if (legacy) hook_call(0x7cbf86, 0x68c5f0, (void *)hud_circle_state_hook, "no rain: health bar circle state (1)");
-    if (legacy) hook_call(0x7cee41, 0x68c5f0, (void *)hud_circle_state_hook, "no rain: health bar circle state (2)");
     hook_call(0x69722c, 0x7c52f0, (void *)hud_circle_notice_hook, "no rain: circle notice skipped");
     hook_call(0x91079b, 0x68bab0, (void *)map_no_circle_hook, "no rain: map circle not drawn");
     hook_call(0x9108e6, 0x68bcd0, (void *)map_no_circle_hook, "no rain: map next-circle preview not drawn");
-    if (legacy) hook_call(0x65ff39, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (1)");
-    if (legacy) hook_call(0x6639c3, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (2)");
-    if (legacy) hook_call(0x664170, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (3)");
-    if (legacy) hook_call(0xef5cdd, 0x68b5c0, (void *)weather_inside_hook, "no rain: weather side inside the circle (4)");
     hook_call(0x693ae8, 0x704cd0, (void *)asset_enable_hook, "no rain: circle far asset disabled (1)");
     hook_call(0x693dc3, 0x704cd0, (void *)asset_enable_hook, "no rain: circle far asset disabled (2)");
-    if (legacy) hook_call(0x3e2a16, 0x68c500, (void *)outside_circle_hook, "no rain: no character outside the circle");
     hook_call(0x911081, RVA_PIN_ROW_SHOWN, (void *)pin_row_shown_hook, "map pins: woods tiles by the Rotted Woods rule (pin loop)");
     hook_call(0xa5bba1, RVA_PIN_ROW_SHOWN, (void *)pin_row_shown_hook, "map pins: woods tiles by the Rotted Woods rule (second row loop)");
     {
-        static const unsigned site[18] = {0x68e1d2, 0x68e1ea, 0x68e229, 0x68e208, 0x68e213, 0x68e21e, 0x7cbf86, 0x7cee41, 0x69722c,
-                                         0x65ff39, 0x6639c3, 0x664170, 0xef5cdd, 0x693ae8, 0x693dc3, 0x3e2a16, 0x911081, 0xa5bba1},
-                              orig[18] = {0x696170, 0x698c90, 0x6953b0, 0x695f80, 0x692350, 0x694580, 0x68c5f0, 0x68c5f0, 0x7c52f0,
-                                          0x68b5c0, 0x68b5c0, 0x68b5c0, 0x68b5c0, 0x704cd0, 0x704cd0, 0x68c500, RVA_PIN_ROW_SHOWN, RVA_PIN_ROW_SHOWN};
+        static const unsigned site[10] = {0x68e1d2, 0x68e1ea, 0x68e229, 0x68e213, 0x68e21e, 0x69722c, 0x693ae8, 0x693dc3, 0x911081, 0xa5bba1},
+                              orig[10] = {0x696170, 0x698c90, 0x6953b0, 0x692350, 0x694580, 0x7c52f0, 0x704cd0, 0x704cd0, RVA_PIN_ROW_SHOWN,
+                                          RVA_PIN_ROW_SHOWN};
         int n = 0, pins = 0;
-        for (int i = 0; i < 18; i++) {
+        for (int i = 0; i < 10; i++) {
             unsigned char *c = (unsigned char *)g_base + site[i];
             int rel = (int)(orig[i] - (site[i] + 5));
             int hooked = c[0] == 0xE8 && memcmp(c + 1, &rel, 4) != 0;
-            if (i < 16) n += hooked; else pins += hooked;
+            if (i < 8) n += hooked; else pins += hooked;
         }
-        int want = legacy ? 16 : 8;
-        logf("no rain: %s (%d of %d hooks: circle radius held at %.0f and play-area effect off at both circle updates; edge sound, rain along the edge, border effects and circle notice skipped; far asset disabled (2)%s)",
-             n == want ? "in place" : "NOT complete", n, want, CIRCLE_HELD_RADIUS,
-             legacy ? "; legacy: rain around the player skipped, health bar circle state 0, weather side inside the circle (4), no character outside the circle" : "; rain-hooks-legacy off: the 8 consumer hooks are not installed");
+        logf("no rain: %s (%d of 8 hooks: circle radius held at %.0f and play-area effect off at both circle updates; edge sound, rain along the edge, border effects and circle notice skipped; far asset disabled (2))",
+             n == 8 ? "in place" : "NOT complete", n, CIRCLE_HELD_RADIUS);
         logf("map pins: %s (%d of 2 hooks: woods tiles 44-45 x 36-37 show the Rotted Woods rows%s)", pins == 2 ? "in place" : "NOT complete", pins,
              g_settings[S_ONE_REGION] >= 1 ? "; off for one-region" : "");
     }
@@ -4381,7 +4338,7 @@ static int g_in_exped;  // step hook: in the field of an expedition (host InGame
 static unsigned short g_name_buf[96];
 static void **name_hook(void **out, char *chr, unsigned char flag, void *a4) {  // a4: passed on as the site has it
     void **r = ((void **(*)(void **, char *, unsigned char, void *))(g_base + 0x7aa960))(out, chr, flag, a4);
-    if (!r || !chr || !g_in_exped || !setting(S_SHOW_PING) || IsBadReadPtr(chr, 0x600)) return r;
+    if (!r || !chr || !g_in_exped || IsBadReadPtr(chr, 0x600)) return r;
     int no = -1;
     ((int *(*)(char *, int *))(g_base + 0x66c6f0))(chr, &no);
     char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
@@ -4408,7 +4365,7 @@ static void **name_hook(void **out, char *chr, unsigned char flag, void *a4) {  
 // other side (lobby member data: owner and "ally" = host's side) and while its echo answers ("name  N ms").
 static void **tag_name_hook(void **out, char *chr, unsigned char flag, void *a4) {
     void **r = ((void **(*)(void **, char *, unsigned char, void *))(g_base + 0x7aa960))(out, chr, flag, a4);
-    if (!r || !chr || !g_in_exped || !setting(S_SHOW_PING) || IsBadReadPtr(chr, 0x600)) return r;
+    if (!r || !chr || !g_in_exped || IsBadReadPtr(chr, 0x600)) return r;
     int no = -1;
     ((int *(*)(char *, int *))(g_base + 0x66c6f0))(chr, &no);
     char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
@@ -5165,11 +5122,7 @@ static int join_leave(void) {
 #define TEAM_TEST_SPEFFECT 90071610
 #define ALLY_LOOK_SPEFFECT 90071611  // the ally's gold phantom look only (launcher: SPEFFECT_ALLY_ROW)
 #define ALLY_LOOK_RENEW_MS 20000
-#define TEAM_TEST_START_MS 90000
-#define TEAM_TEST_LEN_MS   180000
-static int g_team_test;        // 0 off, 1 waiting, 2 applied, 3 over
-static DWORD g_team_tick, g_team_next;
-static int g_team_phase;
+static DWORD g_team_tick;
 static char *local_player(void) {
     char *wcm = *(char **)(g_base + RVA_WORLD_CHR_MAN);
     return wcm ? *(char **)(wcm + WCM_LOCAL_PLAYER) : NULL;
@@ -5226,7 +5179,7 @@ static int (*g_act_real)(void *);
 static volatile LONG g_act_seen, g_act_ours, g_act_all, g_act_148;
 
 static int act_wrap(void *L) {
-    if (setting(S_NO_SPRINT) && L && !IsBadReadPtr((char *)L + 0x48, 16)) {
+    if (L && !IsBadReadPtr((char *)L + 0x48, 16)) {
         char *base = *(char **)((char *)L + 0x50), *top = *(char **)((char *)L + 0x48);
         InterlockedIncrement(&g_act_all);
         if (base && top >= base + 16 && *(unsigned *)base == 3 && *(float *)(base + 8) == 148.0f) InterlockedIncrement(&g_act_148);
@@ -5273,7 +5226,7 @@ static char *script_chr(void *L) {  // the ChrIns whose script L is (act and env
 static int (*g_env_real)(void *);
 static volatile LONG g_env_answered;
 static int env_wrap(void *L) {
-    if (setting(S_NO_SPRINT) && L && !IsBadReadPtr((char *)L + 0x48, 16)) {
+    if (L && !IsBadReadPtr((char *)L + 0x48, 16)) {
         char *base = *(char **)((char *)L + 0x50), *top = *(char **)((char *)L + 0x48);
         if (base && top >= base + 2 * 16 && *(unsigned *)base == 3 && *(float *)(base + 8) == 1116.0f && *(unsigned *)(base + 16) == 3 &&
             *(float *)(base + 24) == 102610.0f) {
@@ -5405,7 +5358,6 @@ static double sqrt_approx(double x) {  // no math.h here (its logf clashes with 
     return r;
 }
 static void no_sprint_frame(void) {
-    if (!setting(S_NO_SPRINT)) return;
     char *chr = local_player();
     if (!chr || IsBadReadPtr(chr, 0x200)) return;
     // Movement check: the local character's ground speed each frame (position from 0x3d0e60, x/z), counted in bands
@@ -5702,7 +5654,7 @@ static void enter_watch(char *sm) {
     // (14), NonActiveBlockInfo (23) and others ask the host only when sync +0xe5 is set (0xdcd260 sets it
     // only for a role-8 rejoin, from gm+0xc96); the host answers every subtype for a member it flags
     // as rejoining (+0xea), which our joiner is. Set before the sync passes step 6.
-    if (g_move_test && setting(S_FULL_SYNC) && sync && now[0] == 6 && now[2] >= 0 && now[2] <= 6 && !sync[0xe5]) {
+    if (g_move_test && sync && now[0] == 6 && now[2] >= 0 && now[2] <= 6 && !sync[0xe5]) {
         sync[0xe5] = 1;
         logf("move test: sync +0xe5 set (sync step %d): the client asks the host for the full world state", now[2]);
     }
@@ -5900,84 +5852,7 @@ static void enter_watch(char *sm) {
         return;
     }
 }
-// Death while on our team (decision 3: a dead invader leaves the session). The effect goes by rule:
-// our row keeps dontDeleteOnDead at 0 (SpEffectParam field per Smithbox's paramdef; the code that
-// honours it is not read). The solo test showed it gone well before its 180 s. Signal used here:
-// our effect active one frame and gone the next while its time is not up; the next 15 s are logged
-// to show what the game does (respawn, team back to base, character instance kept or replaced).
-// ponytail: a proxy for death; HP / a death flag on the character are not located yet.
-static DWORD g_team_position, g_team_death;
-static int g_team_was_active;
-static char *g_team_chr;
-static void team_death_watch(DWORD t) {
-    char *chr = local_player();
-    int active = chr ? our_speffect_active(chr) == 1 : 0;
-    if (g_team_was_active && !active && !g_team_death && t + 2000 < TEAM_TEST_START_MS + TEAM_TEST_LEN_MS) {
-        g_team_death = t;
-        logf("team test: our effect ended early at +%lums (%lus before its time; death?), character %p (was %p)", t,
-             (TEAM_TEST_START_MS + TEAM_TEST_LEN_MS - t) / 1000, (void *)chr, (void *)g_team_chr);
-        team_log("at the early end");
-        log_position("team test");
-    }
-    static int phase;
-    if (!g_team_death) phase = 0;
-    else if (phase == 0 && t - g_team_death >= 5000) {
-        team_log("5 s after the early end");
-        phase = 1;
-    } else if (phase == 1 && t - g_team_death >= 15000) {
-        team_log("15 s after the early end");
-        logf("team test: character now %p", (void *)local_player());
-        phase = 2;
-    }
-    g_team_was_active = active;
-    if (active) g_team_chr = chr;
-}
-// InGame step, every frame. first: the first frame of this expedition's world.
-static void team_test_frame(int first) {
-    if (first) {
-        g_team_test = 0;
-        if (!setting(S_TEAM_TEST)) return;
-        g_team_test = 1;
-        g_team_tick = GetTickCount();
-        g_team_position = 0;
-        g_team_was_active = 0;
-        g_team_death = 0;
-        logf("team test: on: team 16 from +%us to +%us", TEAM_TEST_START_MS / 1000,
-             (TEAM_TEST_START_MS + TEAM_TEST_LEN_MS) / 1000);
-        team_log("start");
-        return;
-    }
-    if (!g_team_test) return;
-    DWORD t = GetTickCount() - g_team_tick;
-    if (t >= g_team_position) {
-        log_position("team test");
-        g_team_position = t + 10000;
-    }
-    if (g_team_test == 2) team_death_watch(t);
-    if (g_team_test == 3) return;
-    if (g_team_test == 1 && t >= TEAM_TEST_START_MS) {
-        char *chr = local_player();
-        if (!chr) return;  // try again next frame
-        team_log("before apply");
-        ((void (*)(void *, int, unsigned char))(g_base + RVA_ADD_SPEFFECT))(chr, TEAM_TEST_SPEFFECT, 0);
-        logf("team test: add SpEffect %d to the local player called", TEAM_TEST_SPEFFECT);
-        team_log("after apply");
-        g_team_test = 2;
-        g_team_phase = 0;
-        g_team_next = t + 5000;
-        return;
-    }
-    if (g_team_test == 2 && t >= g_team_next) {  // phases: 5 s after apply, effect's end, 5 s after
-        static const char *const what[] = {"5 s after apply", "effect due to end", "5 s after the end"};
-        team_log(what[g_team_phase]);
-        g_team_phase++;
-        if (g_team_phase == 1) g_team_next = TEAM_TEST_START_MS + TEAM_TEST_LEN_MS;
-        else if (g_team_phase == 2) g_team_next += 5000;
-        else g_team_test = 3;
-    }
-}
-
-// --- Slow clock (test sessions), only with slow-time = true in the test settings -----------------
+// --- The clocks (logged) -------------------------------------------------------------------------------
 //
 // The expedition's clock: singleton 0x3c125d8 (created in 0x62ed40, set up by 0x65a9c0 / 0x65af70).
 // +0x08 time of day, packed (hour bits 34-38, minute 39-44, second 45-50, as 0x602f80 unpacks it);
@@ -5985,9 +5860,7 @@ static void team_test_frame(int first) {
 // Game.IngameTime.TimeScale when it is above 0 (0xf884b0, read once, at set-up); +0x38 the rate
 // the update 0x65c1d0 advances the time with; +0x4b "running". A client's rate is pulled toward
 // the host's time (0x65c750: every 15 s from the host, a jump when 120 s apart), so the host's
-// rate is the one that counts. With slow-time on this sets both rates to a tenth of the base,
-// once per expedition, unless the base is already below 10 (the profile's TimeScale arrived).
-// Every 30 s it logs the time of day and the rates, so the log shows how fast the day goes.
+// rate is the one that counts. Every 30 s it logs the time of day and the rates, so the log shows how fast the day goes.
 // The solo test of 12 Nov showed the circles do NOT run on this clock (rain at its 07:00).
 //
 // The circles run on the play-area manager's own clock (singleton 0x3c13158): +0x100 packed time
@@ -6009,7 +5882,6 @@ static void team_test_frame(int first) {
 #define PA_TIME           0x100
 #define PA_RATE           0x118
 #define PA_BASE_RATE      0x11c
-static int g_slow_time;
 static DWORD g_clock_tick, g_clock_next;
 static void clock_log(const char *when) {
     char *clock = *(char **)(g_base + RVA_CLOCK_PTR);
@@ -6029,30 +5901,10 @@ static void clock_log(const char *when) {
          (unsigned)(v >> 39) & 0x3f, (unsigned)(v >> 45) & 0x3f, *(float *)(pa + PA_BASE_RATE), *(float *)(pa + PA_RATE),
          *(float *)(pa + 0x260));
 }
-static void slow_time_frame(int first) {
+static void clock_frame(int first) {  // the clocks in the log: at the expedition start and every 30 s
     if (first) {
         g_clock_tick = GetTickCount();
-        g_clock_next = 0;
-        g_slow_time = setting(S_SLOW_TIME);
-        clock_log(g_slow_time ? "expedition start (slow-time on)" : "expedition start");
-        char *clock = *(char **)(g_base + RVA_CLOCK_PTR);
-        if (g_slow_time && clock) {
-            float base = *(float *)(clock + CLOCK_BASE_RATE);
-            if (base >= 10.0f) {
-                *(float *)(clock + CLOCK_BASE_RATE) = base / 10.0f;
-                *(float *)(clock + CLOCK_RATE) = base / 10.0f;
-                clock_log("rate set to a tenth");
-            } else logf("clock: base rate %.3f already slow (debug property arrived), left as it is", base);
-        }
-        char *pa = *(char **)(g_base + RVA_PLAY_AREA_PTR);
-        if (g_slow_time && pa) {
-            float base = *(float *)(pa + PA_BASE_RATE);
-            if (base >= 10.0f) {
-                *(float *)(pa + PA_BASE_RATE) = base / 10.0f;
-                *(float *)(pa + PA_RATE) = base / 10.0f;
-                clock_log("circle clock rate set to a tenth");
-            } else logf("clock: circle clock base rate %.3f already slow (debug property arrived), left as it is", base);
-        }
+        clock_log("expedition start");
         g_clock_next = 30000;
         return;
     }
@@ -6062,118 +5914,12 @@ static void slow_time_frame(int first) {
     }
 }
 
-// boss-flow (test setting, own expedition only; the invader's clock follows the host's, 0x6987b0): only the
-// circle clock is driven, every phase flag is the game's own. Chain (common 1100 / 1103 / 1107, common_func
-// 90055000 / 90055001 / 90065900): the arena 90055000 (day n) sets 7501 / 7506 when the clock is in
-// 23:00:00-23:59:59 and the player is in its MSB area (or at 23:59); 90055001 sets 7504 / 7509 after that, at
-// 23:59 with the wave dead; the night boss's death gives 7502 / 7507; 1100 then 7503 -> 1103 resets the clock
-// (2003[89], 20 s later) -> 1100 sets 7505 once the clock is in 0:00-22:59:59; day 2 ends in 7508 and the final.
-// Here (boss-flow 2; 1 is the same with a running day held at 22:59): frozen from the start (+0x118 and +0x11c 0 every frame); the first region boss dead (Ice Dragon flags or
-// Lordsworn Captain) -> clock 23:00:00 through 0x68ff30, still frozen; 7501 -> running again (the game stops it at
-// 23:59 itself); 7505 -> frozen; the second region boss dead (queued if it died earlier) -> 23:00:00; 7506 ->
-// running for good.
+// boss-flow: 4 the day flow (day_flow.h, the default), 0 the game's own clock (for comparison tests). Only the circle
+// clock and the time of day are driven (bf4_frame); every phase flag stays the game's.
 #define RVA_PA_SET_TIME 0x68ff30  // (manager, hour, minute, second): adds the differences to +0xf8 / +0x100
-enum { BF_WAIT, BF_DAY1, BF_NIGHT1_WAIT, BF_NIGHT1, BF_DAY2, BF_NIGHT2_WAIT, BF_NIGHT2 };
-static const char *const BF_NAME[] = {"waiting for the circle clock", "day 1", "night 1 at 23:00, frozen until 7501",
-                                      "night 1, running", "day 2", "night 2 at 23:00, frozen until 7506", "night 2, running (done)"};
-// boss-flow = 1 (the user's choice): the day runs as in the game and the clock is only held at 22:59:00 while the
-// region boss is alive. The circle's phase is recomputed from the clock every frame (0x696170: phase index
-// from the phase table's hour:minute ranges; a change only raises +0x15b, calls the HUD notice and the result
-// log 0x691270), so a jump from any hour to 23:00 lands in the night phase without passing the others.
-// Held 5 min (real time) at 22:59 with no region boss dead, the clock goes back to the day's start and runs again,
-// as often as needed (the user's rule). common 1100 waits for 7502 before its 0:00-22:59:59 check, so 7505 is
-// not set by this; the time-ranged scripts before 23:00 are one-shot by their own flags or restart anyway (1905).
-static int g_bf_held, g_bf_repeats;
-static DWORD g_bf_hold_tick;
-#define BF_REPEAT_MS 300000
-// The day's start time, where common 1103's "Reset Time of Day" (2003[89] -> 0x5fea00 -> 0x68c1b0) takes it:
-// table 0x92 row 0 (0xe76d50) bytes +0x2d0 hour / +0x2d1 minute (the game prefers the debug properties
-// Game.PlayAreaTime.GameStartHour / Minute, which we never set). 7:00 when the table is not there.
-static void bf_day_start(int *h, int *m) {
-    char tmp[16];
-    char **p = ((char **(*)(void *))(g_base + 0xe76d50))(tmp);
-    *h = 7, *m = 0;
-    if (p && *p && (unsigned char)(*p)[0x2d0] < 24 && (unsigned char)(*p)[0x2d1] < 60) *h = (unsigned char)(*p)[0x2d0], *m = (unsigned char)(*p)[0x2d1];
-}
-static int g_bf_state;
-static float g_bf_base;
 static int bf_flag(unsigned id) {
     char *m = flag_man();
     return m && flag_state_in(m, id) == 1;
-}
-// pair = 1 (test, Mountaintop + Noklateo): Noklateo has ten field bosses (90015002: 1026500800 / 810 / 820 / 830 /
-// 840 / 850 / 860, 1027500800, 1036500800, 1037500800) and no one region boss; none is counted yet (the user's
-// choice), so on that pair only the Mountaintop's boss brings a night. Their flags are in the log line.
-static const unsigned NOKLATEO_BOSSES[10] = {1026500800, 1026500810, 1026500820, 1026500830, 1026500840,
-                                             1026500850, 1026500860, 1027500800, 1036500800, 1037500800};
-static int bf_bosses_dead(void) {  // regions whose boss is dead: Mountaintop (Ice Dragon, by tile variant) + Rotted Woods (Captain)
-    int p = g_settings[S_PAIR], crater = p == 2 || p == 3, nk = p == 1 || p == 3;
-    int mt = !crater && (bf_flag(1028100800) || bf_flag(1029100800) || bf_flag(1039100800) || bf_flag(1039100801));
-    return mt + (nk ? 0 : bf_flag(1056300800));  // Crater and Noklateo region bosses: open (none counted)
-}
-static void bf_log(char *pa, const char *what) {
-    unsigned long long v = *(unsigned long long *)(pa + PA_TIME);
-    logf("boss-flow: %s -> %s (circle clock %02u:%02u:%02u, rate %.3f, base %.3f; 7501..7509: %d%d%d%d%d %d%d%d%d; region bosses dead %d: dragon %d%d%d%d captain %d; not counted: woods 44_36 / 44_37 / 45_37 bosses %d%d%d)",
-         what, BF_NAME[g_bf_state], (unsigned)(v >> 34) & 0x1f, (unsigned)(v >> 39) & 0x3f, (unsigned)(v >> 45) & 0x3f,
-         *(float *)(pa + PA_RATE), *(float *)(pa + PA_BASE_RATE), bf_flag(7501), bf_flag(7502), bf_flag(7503), bf_flag(7504),
-         bf_flag(7505), bf_flag(7506), bf_flag(7507), bf_flag(7508), bf_flag(7509), bf_bosses_dead(), bf_flag(1028100800),
-         bf_flag(1029100800), bf_flag(1039100800), bf_flag(1039100801), bf_flag(1056300800), bf_flag(1046300800),
-         bf_flag(1047300800), bf_flag(1057300800));
-}
-// boss-flow = 3 (the owner's flow, default): the day runs to 09:00 and holds until a boss is killed, then runs two more
-// hours and holds again: stops 09, 11, ..., 21 and 23 (held at 22:59:00, so the 23:00 world changes and the night
-// come only once the clock really gets there; after the 23 stop it runs on to 23:59 and the night boss comes as in
-// the game). Kills are banked: a kill while the clock runs towards a stop pays for that stop. A boss = a death flag
-// nnn 800..899 with d = 0 turning on in the host's flag storage (flag_note: small maps, tile field bosses, region
-// bosses; joiners' kills arrive synced). Day 2 (7505 on) starts over at 07:00 with the stop 09; after its 23 stop
-// the clock is left alone (night 2 and the final as in the game). Both clocks are held together (circle clock
-// +0x118 / +0x11c and time of day +0x34 / +0x38 rates 0, the 30 min apart kept); joiners take both from the host
-// (0x6987b0 / 0x140ddf130 every 15 s). Phases and flags stay the game's: holding only pauses the clock.
-static volatile LONG g_bf3_kills;          // boss kills not yet seen by the frame (flag_note, any thread)
-static volatile unsigned g_bf3_last_flag;
-static void bf3_kill(unsigned id) { g_bf3_last_flag = id, InterlockedIncrement(&g_bf3_kills); }
-static void bf3_frame(int first) {
-    static int day, stop, banked, held, done;
-    static float base_pa, base_clock;
-    char *pa = *(char **)(g_base + RVA_PLAY_AREA_PTR), *clock = *(char **)(g_base + RVA_CLOCK_PTR);
-    if (first) day = 0, stop = 9, banked = 0, held = 0, done = 0, InterlockedExchange(&g_bf3_kills, 0);
-    if (!pa || !clock || done) return;
-    if (!day) {
-        day = 1, base_pa = *(float *)(pa + PA_BASE_RATE), base_clock = *(float *)(clock + CLOCK_BASE_RATE);
-        logf("clock: boss flow 3: day 1, stops every 2 hours from 09:00 (rates %.3f / %.3f)", base_pa, base_clock);
-    }
-    LONG k = InterlockedExchange(&g_bf3_kills, 0);
-    if (k > 0) {
-        banked += (int)k;
-        int next = stop + 2 * banked;  // held at a stop: the kill pays it; running: it pays the coming one
-        logf("clock: boss killed (flag %u): next stop %02d:00%s", g_bf3_last_flag, next > 23 ? 23 : next, next > 23 ? " (then the night)" : "");
-    }
-    if (day == 1 && bf_flag(7505)) {
-        day = 2, stop = 9, held = 0;
-        logf("clock: boss flow 3: day 2 (7505 on), stops every 2 hours from 09:00 again (%d kill(s) banked)", banked);
-    }
-    unsigned long long v = *(unsigned long long *)(pa + PA_TIME);
-    unsigned secs = (((unsigned)(v >> 34) & 0x1f) * 60 + ((unsigned)(v >> 39) & 0x3f)) * 60 + ((unsigned)(v >> 45) & 0x3f);
-    unsigned at = stop == 23 ? (22 * 60 + 59) * 60 : (unsigned)stop * 3600;
-    if (stop <= 23 && secs >= at && secs < 23 * 3600 + 30 * 60) {  // reached (not the night's 23:59 / after-midnight times)
-        if (banked > 0) {
-            banked--, stop += 2;
-            if (held) {
-                held = 0;
-                *(float *)(pa + PA_RATE) = base_pa, *(float *)(pa + PA_BASE_RATE) = base_pa;
-                *(float *)(clock + CLOCK_RATE) = base_clock, *(float *)(clock + CLOCK_BASE_RATE) = base_clock;
-            }
-            logf("clock: boss flow 3: stop %02d:00 paid, running%s", stop - 2, stop > 23 ? " on to the night" : "");
-            if (stop > 23 && day == 2) done = 1;
-        } else {
-            if (!held) {
-                ((void (*)(char *, int, int, int))(g_base + RVA_PA_SET_TIME))(pa, stop == 23 ? 22 : stop, stop == 23 ? 59 : 0, 0);
-                held = 1, bf_log(pa, stop == 23 ? "22:59 reached (23 stop), held until a boss is killed" : "stop reached, held until a boss is killed");
-            }
-            *(float *)(pa + PA_RATE) = 0.0f, *(float *)(pa + PA_BASE_RATE) = 0.0f;
-            *(float *)(clock + CLOCK_RATE) = 0.0f, *(float *)(clock + CLOCK_BASE_RATE) = 0.0f;
-        }
-    }
 }
 // Night boss active (9019 on: common 1108 holds it from 23:59:00 until 9052, ...): every other living boss is
 // disabled on this machine, as the game's own 23:00 field-boss events do (2004[5] "Change Character Enable State"
@@ -6224,81 +5970,7 @@ static void night_hide_frame(int in_world) {
 }
 static void bf4_frame(int first);
 static void boss_flow_frame(int first) {
-    if (first) g_bf_state = BF_WAIT, g_bf_held = 0, g_bf_repeats = 0;
-    if (g_settings[S_BOSS_FLOW] == 3) {
-        bf3_frame(first);
-        return;
-    }
-    if (g_settings[S_BOSS_FLOW] == 4) {
-        bf4_frame(first);
-        return;
-    }
-    if (!setting(S_BOSS_FLOW) || g_bf_state == BF_NIGHT2) return;
-    char *pa = *(char **)(g_base + RVA_PLAY_AREA_PTR);
-    if (!pa) return;
-    int dead = bf_bosses_dead(), was = g_bf_state;
-    const char *why = NULL;
-    if (g_bf_state == BF_WAIT) {
-        g_bf_base = *(float *)(pa + PA_BASE_RATE);
-        g_bf_state = BF_DAY1, why = g_settings[S_BOSS_FLOW] != 2 ? "expedition start (boss-flow 1: running, held at 22:59)" : "expedition start (boss-flow 2: frozen all day)";
-    } else if (g_bf_state == BF_DAY1 && dead >= 1) {
-        ((void (*)(char *, int, int, int))(g_base + RVA_PA_SET_TIME))(pa, 23, 0, 0);
-        g_bf_state = BF_NIGHT1_WAIT, why = "first region boss dead, clock set to 23:00:00";
-    } else if (g_bf_state == BF_NIGHT1_WAIT && bf_flag(7501)) {
-        g_bf_state = BF_NIGHT1, why = "7501 on, clock released";
-    } else if (g_bf_state == BF_NIGHT1 && bf_flag(7505)) {
-        g_bf_state = BF_DAY2, why = "7505 on (day 2), clock frozen again";
-    } else if (g_bf_state == BF_DAY2 && dead >= 2) {
-        ((void (*)(char *, int, int, int))(g_base + RVA_PA_SET_TIME))(pa, 23, 0, 0);
-        g_bf_state = BF_NIGHT2_WAIT, why = "second region boss dead, clock set to 23:00:00";
-    } else if (g_bf_state == BF_NIGHT2_WAIT && bf_flag(7506)) {
-        g_bf_state = BF_NIGHT2, why = "7506 on, clock released";
-    }
-    int day = g_bf_state == BF_DAY1 || g_bf_state == BF_DAY2, frozen = g_bf_state == BF_NIGHT1_WAIT || g_bf_state == BF_NIGHT2_WAIT;
-    if (day && g_settings[S_BOSS_FLOW] != 2) {  // boss-flow 1 (the user's choice): running, held at 22:59:00
-        unsigned long long v = *(unsigned long long *)(pa + PA_TIME);
-        unsigned secs = (((unsigned)(v >> 34) & 0x1f) * 60 + ((unsigned)(v >> 39) & 0x3f)) * 60 + ((unsigned)(v >> 45) & 0x3f);
-        if (secs >= (22 * 60 + 59) * 60) {  // also past it (a long frame): back to 22:59:00
-            if (!g_bf_held) {
-                ((void (*)(char *, int, int, int))(g_base + RVA_PA_SET_TIME))(pa, 22, 59, 0);
-                g_bf_held = 1, g_bf_hold_tick = GetTickCount(), bf_log(pa, "22:59 reached, held until the region boss is dead");
-            }
-            frozen = 1;
-            if (GetTickCount() - g_bf_hold_tick >= BF_REPEAT_MS) {  // the user's rule: 5 min held -> the day again
-                int h, m;
-                bf_day_start(&h, &m);
-                ((void (*)(char *, int, int, int))(g_base + RVA_PA_SET_TIME))(pa, h, m, 0);
-                *(float *)(pa + PA_RATE) = g_bf_base, *(float *)(pa + PA_BASE_RATE) = g_bf_base;
-                g_bf_held = 0, frozen = 0, g_bf_repeats++;
-                char what[120];
-                snprintf(what, sizeof what, "held 5 min at 22:59, region boss alive: clock back to %02d:%02d, the day again (repeat %d)", h, m, g_bf_repeats);
-                bf_log(pa, what);
-            }
-        }
-    } else if (day)
-        frozen = 1;
-    if (frozen) *(float *)(pa + PA_RATE) = 0.0f, *(float *)(pa + PA_BASE_RATE) = 0.0f;
-    else if (g_bf_state != was || g_bf_held) *(float *)(pa + PA_RATE) = g_bf_base, *(float *)(pa + PA_BASE_RATE) = g_bf_base;
-    if (!frozen || !day) g_bf_held = 0;
-    if (g_bf_state != was) {
-        bf_log(pa, why);
-        if (g_settings[S_PAIR] == 1 || g_settings[S_PAIR] == 3) {
-            char line[200];
-            int at = 0;
-            for (int k = 0; k < 10; k++) at += snprintf(line + at, sizeof line - (size_t)at, " %u:%d", NOKLATEO_BOSSES[k], bf_flag(NOKLATEO_BOSSES[k]));
-            logf("boss-flow: Noklateo field bosses (not counted):%s", line);
-        }
-        if (g_settings[S_PAIR] == 2 || g_settings[S_PAIR] == 3) {  // Crater field bosses (90015002 on 43_38 / 43_39 / 44_38 / 44_39)
-            static const unsigned CRATER_BOSSES[8] = {1038202800, 1039202800, 1039202810, 1048202800, 1048202830, 1049202800, 1049202810, 1049202820};
-            char line[200];
-            int at = 0;
-            for (int k = 0; k < 8; k++) at += snprintf(line + at, sizeof line - (size_t)at, " %u:%d", CRATER_BOSSES[k], bf_flag(CRATER_BOSSES[k]));
-            logf("boss-flow: Crater field bosses (not counted):%s", line);
-        }
-    }
-    static DWORD next;  // and every 30 s, so a stuck link shows
-    if (was == BF_WAIT) next = GetTickCount() + 30000;
-    else if (GetTickCount() - next < 0x80000000u) bf_log(pa, "every 30 s"), next = GetTickCount() + 30000;
+    if (g_settings[S_BOSS_FLOW] == 4) bf4_frame(first);
 }
 
 // Host: publish where the host is. Checked every LOBBY_POS_PERIOD_MS; written when the block changed,
@@ -6541,8 +6213,8 @@ static void host_expedition(int step) {
     if (step == QM_STEP_INGAME) {
         int first_frame = !g_in_expedition;
         if (!g_in_expedition) {
-            team_test_frame(1);
-            slow_time_frame(1);
+            g_team_tick = GetTickCount();
+            clock_frame(1);
             g_in_expedition = 1;
             g_expedition_tick = GetTickCount();
             g_expedition_start_tick = GetTickCount() | 1;
@@ -6566,8 +6238,7 @@ static void host_expedition(int step) {
                 }
             }
         }
-        team_test_frame(0);
-        slow_time_frame(0);
+        clock_frame(0);
         boss_flow_frame(first_frame);
         flag_log_frame();
         md_frame(g_expedition_start_tick);
@@ -6664,7 +6335,7 @@ static int counts_in_hub(void) {
     return me && (blk >> 24) == 0x0a && !g_in_expedition && g_join != 4;
 }
 static void counts_tick(void) {  // game thread (step hook)
-    if (!setting(S_SHOW_COUNTS) || g_ov_off) return;
+    if (g_ov_off) return;
     if (!counts_in_hub()) {
         ov_hide();
         return;
@@ -7257,7 +6928,7 @@ static DWORD WINAPI run(LPVOID self) {
         code_patch_check();
         level_watch();
         lag_tick();
-        if (setting(S_NO_SPRINT)) act_wrap_tick();
+        act_wrap_tick();
         if (1) marker_tick();
         if (1) finish_tick();
     }
