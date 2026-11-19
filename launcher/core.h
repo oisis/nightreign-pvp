@@ -40,6 +40,13 @@ void core_save_lang(const char *code);
 // value goes to the DLL as the debug-log setting at the next "Play with the mod".
 int core_load_debug(void);
 void core_save_debug(int on);
+// The window's Settings dialog (an ordinary player's choices), from / to <app>/launcher-settings.txt:
+// CHOICE_MAP -1 random (default) or the region pair 0..3, CHOICE_PING / CHOICE_COUNTS 0 or 1 (default 1). Applied at
+// the next "Play with the mod" (the map: unless test-settings.toml sets pair). core_pair_name: the pair's name.
+enum { CHOICE_MAP, CHOICE_PING, CHOICE_COUNTS, CHOICE_COUNT };
+int core_load_choice(int which);
+void core_save_choice(int which, int value);
+const char *core_pair_name(int pair, int polish);
 // Build the mod's files from the player's own game files into <app>/work/build and write the
 // me3 profile. Returns 1 on success.
 int core_build(const char *game_dir);

@@ -6,7 +6,8 @@
 #include <stdio.h>
 #include <string.h>
 
-enum { ID_FOLDER = 100, ID_BROWSE, ID_PLAY, ID_UNINSTALL, ID_LOG, ID_CLOSE, ID_BACKUP, ID_HELP, ID_LANG, ID_LANG_LABEL, ID_DEBUG };
+enum { ID_FOLDER = 100, ID_BROWSE, ID_PLAY, ID_UNINSTALL, ID_LOG, ID_CLOSE, ID_BACKUP, ID_HELP, ID_LANG, ID_LANG_LABEL, ID_DEBUG, ID_SETTINGS,
+       ID_S_MAP = 200, ID_S_PING, ID_S_COUNTS, ID_S_OK, ID_S_CANCEL };
 static const char *const *T = UI_TEXT[L_EN];
 static HWND g_window, g_folder, g_log;
 
@@ -78,6 +79,61 @@ static void set_texts(void) {
     SetWindowTextW(GetDlgItem(g_window, ID_UNINSTALL), wide(T[T_UNINSTALL]));
     SetWindowTextW(GetDlgItem(g_window, ID_CLOSE), wide(T[T_CLOSE]));
     SetWindowTextW(GetDlgItem(g_window, ID_DEBUG), wide(T[T_DEBUG_LOG]));
+    SetWindowTextW(GetDlgItem(g_window, ID_SETTINGS), wide(T[T_SETTINGS]));
+}
+
+// Settings: the map (random or one of the four pairs), ping and squad counts; saved with OK. A small window of its own,
+// the main window disabled while it is open.
+static HWND g_set_win;
+static HWND set_child(const wchar_t *cls, const char *text, DWORD style, int id, int x, int y, int w, int h) {
+    HWND c = CreateWindowExW(0, cls, wide(text), WS_CHILD | WS_VISIBLE | style, x, y, w, h, g_set_win, (HMENU)(INT_PTR)id,
+                             GetModuleHandleW(NULL), NULL);
+    SendMessageW(c, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    return c;
+}
+static LRESULT CALLBACK set_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_COMMAND && LOWORD(wp) == ID_S_OK) {
+        int m = (int)SendMessageW(GetDlgItem(w, ID_S_MAP), CB_GETCURSEL, 0, 0);
+        core_save_choice(CHOICE_MAP, m >= 1 && m <= 4 ? m - 1 : -1);
+        core_save_choice(CHOICE_PING, SendMessageW(GetDlgItem(w, ID_S_PING), BM_GETCHECK, 0, 0) == BST_CHECKED);
+        core_save_choice(CHOICE_COUNTS, SendMessageW(GetDlgItem(w, ID_S_COUNTS), BM_GETCHECK, 0, 0) == BST_CHECKED);
+        DestroyWindow(w);
+        return 0;
+    }
+    if (msg == WM_COMMAND && LOWORD(wp) == ID_S_CANCEL) return DestroyWindow(w), 0;
+    if (msg == WM_DESTROY) {
+        EnableWindow(g_window, TRUE), SetForegroundWindow(g_window), g_set_win = NULL;
+        return 0;
+    }
+    return DefWindowProcW(w, msg, wp, lp);
+}
+static void settings(void) {
+    if (g_set_win) return;
+    static int registered;
+    if (!registered) {
+        WNDCLASSW wc = {0};
+        wc.lpfnWndProc = set_proc, wc.hInstance = GetModuleHandleW(NULL), wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1), wc.lpszClassName = L"NightreignInvasionsSettings";
+        RegisterClassW(&wc), registered = 1;
+    }
+    RECT r;
+    GetWindowRect(g_window, &r);
+    g_set_win = CreateWindowW(L"NightreignInvasionsSettings", wide(T[T_SETTINGS]), WS_CAPTION | WS_SYSMENU | WS_POPUP, r.left + 60,
+                              r.top + 60, 480, 200, g_window, NULL, GetModuleHandleW(NULL), NULL);
+    int pl = T == UI_TEXT[L_PL];
+    set_child(L"STATIC", T[T_MAP], 0, -1, 12, 14, 70, 20);
+    HWND map = set_child(L"COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL, ID_S_MAP, 90, 10, 360, 200);
+    SendMessageW(map, CB_ADDSTRING, 0, (LPARAM)wide(T[T_MAP_RANDOM]));
+    for (int k = 0; k < 4; k++) SendMessageW(map, CB_ADDSTRING, 0, (LPARAM)wide(core_pair_name(k, pl)));
+    SendMessageW(map, CB_SETCURSEL, core_load_choice(CHOICE_MAP) + 1, 0);
+    HWND ping = set_child(L"BUTTON", T[T_SHOW_PING], BS_AUTOCHECKBOX, ID_S_PING, 12, 46, 440, 22);
+    HWND counts = set_child(L"BUTTON", T[T_SHOW_COUNTS], BS_AUTOCHECKBOX, ID_S_COUNTS, 12, 74, 440, 22);
+    SendMessageW(ping, BM_SETCHECK, core_load_choice(CHOICE_PING) ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(counts, BM_SETCHECK, core_load_choice(CHOICE_COUNTS) ? BST_CHECKED : BST_UNCHECKED, 0);
+    set_child(L"BUTTON", "OK", BS_DEFPUSHBUTTON, ID_S_OK, 250, 116, 95, 28);
+    set_child(L"BUTTON", T[T_CLOSE], BS_PUSHBUTTON, ID_S_CANCEL, 355, 116, 95, 28);
+    EnableWindow(g_window, FALSE);
+    ShowWindow(g_set_win, SW_SHOW);
 }
 
 static void uninstall(void) {
@@ -105,7 +161,8 @@ static LRESULT CALLBACK proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         MoveWindow(GetDlgItem(w, ID_BROWSE), cx - m - 90, 33, 90, 26, TRUE);
         MoveWindow(g_log, m, 68, cx - 2 * m, cy - 68 - 80, TRUE);
         MoveWindow(GetDlgItem(w, ID_DEBUG), m, cy - 70, cx - 2 * m, 22, TRUE);
-        MoveWindow(GetDlgItem(w, ID_PLAY), m, cy - 40, cx - 6 * m - 4 * 110, 30, TRUE);
+        MoveWindow(GetDlgItem(w, ID_PLAY), m, cy - 40, cx - 7 * m - 5 * 110, 30, TRUE);
+        MoveWindow(GetDlgItem(w, ID_SETTINGS), cx - 5 * m - 5 * 110, cy - 40, 110, 30, TRUE);
         MoveWindow(GetDlgItem(w, ID_BACKUP), cx - 4 * m - 4 * 110, cy - 40, 110, 30, TRUE);
         MoveWindow(GetDlgItem(w, ID_UNINSTALL), cx - 3 * m - 3 * 110, cy - 40, 110, 30, TRUE);
         MoveWindow(GetDlgItem(w, ID_HELP), cx - 2 * m - 2 * 110, cy - 40, 110, 30, TRUE);
@@ -118,6 +175,7 @@ static LRESULT CALLBACK proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (LOWORD(wp) == ID_UNINSTALL) uninstall();
         if (LOWORD(wp) == ID_BACKUP) backup();
         if (LOWORD(wp) == ID_HELP) help();
+        if (LOWORD(wp) == ID_SETTINGS) settings();
         if (LOWORD(wp) == ID_DEBUG && HIWORD(wp) == BN_CLICKED)
             core_save_debug(SendMessageW(GetDlgItem(w, ID_DEBUG), BM_GETCHECK, 0, 0) == BST_CHECKED);
         if (LOWORD(wp) == ID_LANG && HIWORD(wp) == CBN_SELCHANGE) {
@@ -164,7 +222,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     wc.lpszClassName = L"NightreignInvasions";
     RegisterClassW(&wc);
     g_window = CreateWindowW(wc.lpszClassName, wide(T[T_TITLE]), WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-                             660, 440, NULL, NULL, inst, NULL);
+                             720, 440, NULL, NULL, inst, NULL);
     child(L"STATIC", T[T_GAME_FOLDER], 0, 1);
     g_folder = child(L"EDIT", "", ES_AUTOHSCROLL, ID_FOLDER);
     child(L"BUTTON", T[T_BROWSE], BS_PUSHBUTTON, ID_BROWSE);
@@ -173,6 +231,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     child(L"BUTTON", T[T_UNINSTALL], BS_PUSHBUTTON, ID_UNINSTALL);
     child(L"BUTTON", T[T_BACKUP], BS_PUSHBUTTON, ID_BACKUP);
     child(L"BUTTON", T[T_HELP], BS_PUSHBUTTON, ID_HELP);
+    child(L"BUTTON", T[T_SETTINGS], BS_PUSHBUTTON, ID_SETTINGS);
     child(L"STATIC", T[T_LANGUAGE], SS_RIGHT, ID_LANG_LABEL);
     HWND debug_box = child(L"BUTTON", T[T_DEBUG_LOG], BS_AUTOCHECKBOX, ID_DEBUG);
     SendMessageW(debug_box, BM_SETCHECK, core_load_debug() ? BST_CHECKED : BST_UNCHECKED, 0);

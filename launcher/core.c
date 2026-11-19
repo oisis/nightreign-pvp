@@ -1207,6 +1207,7 @@ static int load_settings(const char *path, short v[SETTINGS_COUNT]) {  // 0: no 
     free(t.p);
     return 1;
 }
+static void choices_read(int v[CHOICE_COUNT]);  // the Settings dialog
 static int read_settings(void) {
     char path[1300], on[200] = "";
     snprintf(path, sizeof path, "%s" SEP "test-settings.toml", g_app);
@@ -1214,12 +1215,17 @@ static int read_settings(void) {
     g_set[S_DEBUG_LOG] = (short)core_load_debug();  // the window's "Debug log" box decides
     // The region pair: forced by the test settings (pair = 0..3), else drawn at each start, each with the same chance.
     // ponytail: rand() seeded from the clock and a stack address; an OS random source if the draw ever needs more.
-    if (!g_pair_given) {
+    // The Settings dialog: show-ping / show-counts always; the map unless test-settings.toml sets pair.
+    int choice[CHOICE_COUNT];
+    choices_read(choice);
+    g_set[S_SHOW_PING] = (short)choice[CHOICE_PING], g_set[S_SHOW_COUNTS] = (short)choice[CHOICE_COUNTS];
+    const char *how = "set in test-settings.toml";
+    if (!g_pair_given && choice[CHOICE_MAP] >= 0) g_set[S_PAIR] = (short)choice[CHOICE_MAP], how = "chosen in Settings";
+    else if (!g_pair_given) {
         srand((unsigned)time(NULL) ^ (unsigned)clock() ^ (unsigned)(uintptr_t)&found);
-        g_set[S_PAIR] = (short)(rand() % 4);
+        g_set[S_PAIR] = (short)(rand() % 4), how = "drawn at random";
     }
-    logf_("Map this start: %s (region pair %d, %s)", PAIR_NAME[g_set[S_PAIR]][0], g_set[S_PAIR],
-          g_pair_given ? "set in test-settings.toml" : "drawn at random");
+    logf_("Map this start: %s (region pair %d, %s)", PAIR_NAME[g_set[S_PAIR]][0], g_set[S_PAIR], how);
     for (int i = 0; i < SETTINGS_COUNT; i++)
         if (g_set[i]) snprintf(on + strlen(on), sizeof on - strlen(on), " %s", SETTING_NAMES[i]);
     logf_(found ? "Test settings:%s" : "Test settings:%s (no test-settings.toml next to the launcher)", on[0] ? on : " none");
@@ -2568,6 +2574,44 @@ int core_backup_save(const char *save_dir, char *where, size_t cap) {
     logf_("Save backed up (%d files) to backups" SEP "%s", copied, folder);
     return 1;
 }
+
+static const char *const CHOICE_KEY[CHOICE_COUNT] = {"map", "show-ping", "show-counts"};
+static const int CHOICE_DEFAULT[CHOICE_COUNT] = {-1, 1, 1};
+static void choices_read(int v[CHOICE_COUNT]) {
+    char path[1300];
+    for (int i = 0; i < CHOICE_COUNT; i++) v[i] = CHOICE_DEFAULT[i];
+    snprintf(path, sizeof path, "%s" SEP "launcher-settings.txt", g_app);
+    buf b = read_file(path);
+    for (size_t at = 0; b.p && at < b.n;) {  // "key = value" lines
+        char line[64] = "", key[24] = "";
+        size_t end = at;
+        while (end < b.n && b.p[end] != '\n') end++;
+        size_t len = end - at < sizeof line - 1 ? end - at : sizeof line - 1;
+        memcpy(line, b.p + at, len);
+        at = end + 1;
+        int val;
+        if (sscanf(line, " %23[a-z-] = %d", key, &val) != 2) continue;
+        for (int i = 0; i < CHOICE_COUNT; i++)
+            if (!strcmp(key, CHOICE_KEY[i]) && val >= (i == CHOICE_MAP ? -1 : 0) && val <= (i == CHOICE_MAP ? 3 : 1)) v[i] = val;
+    }
+    free(b.p);
+}
+int core_load_choice(int which) {
+    int v[CHOICE_COUNT];
+    choices_read(v);
+    return which >= 0 && which < CHOICE_COUNT ? v[which] : 0;
+}
+void core_save_choice(int which, int value) {
+    int v[CHOICE_COUNT];
+    choices_read(v);
+    if (which >= 0 && which < CHOICE_COUNT) v[which] = value;
+    char path[1300], text[160];
+    int n = snprintf(text, sizeof text, "# The launcher's Settings dialog writes this file.\n");
+    for (int i = 0; i < CHOICE_COUNT; i++) n += snprintf(text + n, sizeof text - (size_t)n, "%s = %d\n", CHOICE_KEY[i], v[i]);
+    snprintf(path, sizeof path, "%s" SEP "launcher-settings.txt", g_app);
+    write_file(path, (const u8 *)text, (size_t)n);
+}
+const char *core_pair_name(int pair, int polish) { return pair >= 0 && pair <= 3 ? PAIR_NAME[pair][polish != 0] : ""; }
 
 int core_load_debug(void) {
     char path[1300];
