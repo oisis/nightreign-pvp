@@ -3782,6 +3782,7 @@ static DWORD g_request_tick;  // when the last start request arrived
 #define LOBBY_VER_KEY    "nrpvp_ver"     // the mod version (MOD_VERSION); only the same version pairs up
 #define LOBBY_LEVEL_KEY  "nrpvp_lvl"     // host's level (player data +0x68)
 #define LOBBY_PHASE_KEY  "nrpvp_phase"   // host's expedition phase: "hub", "field", "boss" (a night boss fight), "late" (day-2 boss beaten)
+#define LOBBY_PAIR_KEY   "nrpvp_pair"    // the host's region pair this launcher start (0..3); only the same pair pairs up
 #define LOBBY_BORN_KEY   "nrpvp_born"    // when the lobby was marked: seconds since 2026-01-01 UTC (its age for the pick order)
 #define SQUAD_MAX        3               // the game's squad
 #define LOBBY_EQUAL      0               // ELobbyComparison
@@ -4512,6 +4513,11 @@ static void lobby_mark(void) {
         lobby_set(LOBBY_PROTO_KEY, LOBBY_PROTO);
         lobby_set(LOBBY_GAME_KEY, LOBBY_GAME);
         lobby_set(LOBBY_VER_KEY, MOD_VERSION);
+        {
+            char pt[8];
+            snprintf(pt, sizeof pt, "%d", g_settings[S_PAIR]);
+            lobby_set(LOBBY_PAIR_KEY, pt);
+        }
         {  // the expedition's start block: what a solo start put in the pending block (SingleStart ->
            // context vt+8 0xb44630 -> 0xb47470), kept by the game manager for the whole expedition
             char *gm = *(char **)(g_base + 0x3c13258), text[16];
@@ -4602,6 +4608,7 @@ static void lobby_mark(void) {
 // is set to our formatted copy, like the ping after a name. Once per hub visit and once per search start.
 static int g_ver_notice_armed = 1;
 static char g_ver_newest[24], g_ver_team[24];
+static int g_pair_team = -1;  // a lobby with our password and version, on another region pair (its pair), this search
 static int version_parse(const char *v, int out[3]) {  // a release is "a.b.c", digits only
     if (!v) return 0;
     int n = 0, k = 0;
@@ -4649,7 +4656,11 @@ static void notice_with(int id, const char *arg) {
          q ? *(short *)(q + SMQ_CURRENT_PRIORITY) : -2, q ? *(int *)(q + SMQ_WAITING_COUNT) : -1);
 }
 static void version_result(int found_same) {
-    if (g_ver_notice_armed && *g_ver_newest) {
+    if (g_ver_notice_armed && g_party && !found_same && g_pair_team >= 0 && !*g_ver_team) {
+        g_ver_notice_armed = 0;
+        logf("pair: the team with our password plays region pair %d (ours %d): notice shown", g_pair_team, g_settings[S_PAIR]);
+        notice_with(131186 + g_pair_team, NULL);
+    } else if (g_ver_notice_armed && *g_ver_newest) {
         g_ver_notice_armed = 0;
         logf("version: a newer mod version %s is in use (ours %s): notice shown", g_ver_newest, MOD_VERSION);
         notice_with(131170, g_ver_newest);
@@ -4659,6 +4670,7 @@ static void version_result(int found_same) {
         notice_with(131171, g_ver_team);
     }
     g_ver_newest[0] = g_ver_team[0] = 0;
+    g_pair_team = -1;
 }
 static int counts_in_hub(void);
 static void counts_from_list(unsigned n);
@@ -4713,8 +4725,13 @@ static int lobby_search_frame(const char *who) {
         const char *afree = g_steam.get_data(g_steam.mm, id, LOBBY_ALLY_FREE_KEY);
         int own = id == g_lobby && g_lobby, slots = g_as_ally ? (afree ? atoi(afree) : 0) : free ? atoi(free) : 0;
         const char *ver = g_steam.get_data(g_steam.mm, id, LOBBY_VER_KEY);
+        const char *pr = g_steam.get_data(g_steam.mm, id, LOBBY_PAIR_KEY);
         int same = proto && !strcmp(proto, LOBBY_PROTO) && ver && !strcmp(ver, MOD_VERSION);
+        int pair_ok = pr && *pr && atoi(pr) == g_settings[S_PAIR];
         version_seen(ver, g_party != 0);
+        if (same && !own && !pair_ok && g_party && pr && *pr && g_pair_team < 0) g_pair_team = atoi(pr) & 3;
+        if (same && !own && !pair_ok) logf("%s:   lobby %llu: map (region pair) '%s', ours %d: not for us", who, id, pr ? pr : "?", g_settings[S_PAIR]);
+        same = same && pair_ok;
         int fits = same && !own && slots > 0 && game && !strcmp(game, LOBBY_GAME);
         // GetLobbyData gives "" for a key that is not set.
         logf("%s:   lobby %llu: proto '%s' game '%s' squad '%s' free '%s', members %d of %d -> %s", who, id, proto ? proto : "?",

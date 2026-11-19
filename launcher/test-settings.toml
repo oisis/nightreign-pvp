@@ -18,3 +18,4 @@ show-ping = true          # the round trip to each other player (ms) after its n
 show-counts = true        # in the Roundtable Hold: how many mod squads are in an expedition / looking for a player, top right; false hides it
 slot-test = false         # test: new session members take the highest free player slot first (3 machines reach slots 3 and 2)
 rain-hooks-legacy = true  # test: also the 8 older rain hooks the held circle radius makes unnecessary; false = the radius alone (confirmation run)
+# pair = 0          # test: force a region pair (0 Frozen Thicket, 1 City Beneath the Peak, 2 Ash and Rot, 3 Fire over the City); without it (or -1) the launcher draws one at every start

@@ -61,6 +61,7 @@ static int settings_parse(const char *t, size_t n, short v[SETTINGS_COUNT], char
             v[key] = (short)val;
             continue;
         }
+        if (key == S_PAIR && eq && e - eq >= 3 && settings_word(e - 2, 2, "-1")) continue;  // pair = -1: drawn (as absent)
         int retired = 0;
         for (size_t i = 0; eq && i < sizeof SETTING_RETIRED / sizeof *SETTING_RETIRED; i++) {
             const char *ke = eq;

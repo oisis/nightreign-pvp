@@ -10,16 +10,27 @@
 #define DF_TIER_COUNT   200
 #define DF_BOSSES       6
 #define LOBBY_CHAL_KEY  "nrpvp_chal"   // host lobby: the challenge's number this expedition ("1", "2"); members: the same as member data
-// The special bosses (death flags, 2003[69] after death; see 08-flagi-gry): the Mountaintop's ice dragon
-// (m60_42_38_10, 42_39_10, 43_39_10) and the Captain of the Rotted Woods (m60_45_36_30).
-static const unsigned DF_SPECIAL[] = {1028100800, 1029100800, 1039100800, 1039100801, 1056300800};
+// The special bosses, one per region (owner, 2026-11-19; death flags, 2003[69] after death through common_func 90015002 /
+// 90015407; see 08-flagi-gry): the Mountaintop's ice dragon (m60_42_38_10, 42_39_10, 43_39_10), the Rotted Woods'
+// Captain (m60_45_36_30), the Crater's Magma Wyrm (m60_44_38_20), Noklateo's Naturalborn of the Void (m60_42_36_50).
+// Only the two regions of this start's pair (setting pair, written by the launcher) count.
+static const unsigned DF_SPECIAL_MT[] = {1028100800, 1029100800, 1039100800, 1039100801}, DF_SPECIAL_RW[] = {1056300800},
+                      DF_SPECIAL_CR[] = {1048202800}, DF_SPECIAL_NK[] = {1026500800};
+static int df_special(unsigned id) {
+    int p = g_settings[S_PAIR], crater = p == 2 || p == 3, nk = p == 1 || p == 3;
+    const unsigned *a = crater ? DF_SPECIAL_CR : DF_SPECIAL_MT, *b = nk ? DF_SPECIAL_NK : DF_SPECIAL_RW;
+    unsigned na = crater ? 1 : 4, nb = 1;
+    for (unsigned i = 0; i < na; i++) if (id == a[i]) return 1;
+    for (unsigned i = 0; i < nb; i++) if (id == b[i]) return 1;
+    return 0;
+}
+static const char *const DF_PAIR_NAME[4] = {"Frozen Thicket", "City Beneath the Peak", "Ash and Rot", "Fire over the City"};
 static volatile LONG g_df_kills, g_df_special_kills;
 static int g_df_bosses, g_df_special, g_df_met, g_df_met_at, g_df_after, g_df_day = 1, g_df_go, g_df_used;
 static int g_df_tier;  // percent: 0, 5, 10 ...
 static DWORD g_df_notice_due;  // the progress notice, 6 s after a kill
 static void df_kill(unsigned id) {  // flag_note, any thread: a boss death flag turned on
-    for (unsigned i = 0; i < sizeof DF_SPECIAL / sizeof *DF_SPECIAL; i++)
-        if (id == DF_SPECIAL[i]) { InterlockedIncrement(&g_df_special_kills); return; }
+    if (df_special(id)) { InterlockedIncrement(&g_df_special_kills); return; }
     InterlockedIncrement(&g_df_kills);
 }
 static int df_on(void) { return g_settings[S_BOSS_FLOW] == 4; }
@@ -606,8 +617,10 @@ static void day_flow_frame(int in_world) {
         g_df_events = 0, g_df_started = 0, g_df_event_tick = 0;
         InterlockedExchange(&g_df_kills, 0), InterlockedExchange(&g_df_special_kills, 0);
         char *gm0 = *(char **)(g_base + 0x3c13258);
-        logf("day flow: expedition start (pattern %u / %u): challenge after %d bosses and the special boss", gm0 ? *(unsigned *)(gm0 + 0xb48) : 0,
-             gm0 ? *(unsigned *)(gm0 + 0xb4c) : 0, df_needed());
+        int pr = g_settings[S_PAIR] >= 0 && g_settings[S_PAIR] <= 3 ? g_settings[S_PAIR] : 0;
+        logf("day flow: expedition start (pattern %u / %u): map %s (region pair %d); challenge after %d bosses and the special boss",
+             gm0 ? *(unsigned *)(gm0 + 0xb48) : 0, gm0 ? *(unsigned *)(gm0 + 0xb4c) : 0, DF_PAIR_NAME[pr], pr, df_needed());
+        notice_with(131185, NULL);  // "Map: <name>" (launcher: the pair's name)
         g_df_warp_until = 0, g_df_load_until = 0, g_df_ended = 0;
     }
     if (!day2_seen && bf_flag(7505)) {  // day 2: the game's own day-2 level, our count starts again
