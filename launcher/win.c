@@ -7,7 +7,7 @@
 #include <string.h>
 
 enum { ID_FOLDER = 100, ID_BROWSE, ID_PLAY, ID_UNINSTALL, ID_LOG, ID_CLOSE, ID_BACKUP, ID_HELP, ID_LANG, ID_LANG_LABEL, ID_DEBUG, ID_SETTINGS,
-       ID_S_MAP = 200, ID_S_DEBUG, ID_S_OK, ID_S_CANCEL };
+       ID_S_DEBUG = 200, ID_S_OK, ID_S_CANCEL };
 static const char *const *T = UI_TEXT[L_EN];
 static HWND g_window, g_folder, g_log;
 
@@ -81,7 +81,7 @@ static void set_texts(void) {
     SetWindowTextW(GetDlgItem(g_window, ID_SETTINGS), wide(T[T_SETTINGS]));
 }
 
-// Settings: the map (random or one of the four pairs) and the debug log; saved with OK. A small window of its own,
+// Settings: the debug log; saved with OK. (The map is drawn at every start; test-settings.toml can fix it: map = 1..4.) A small window of its own,
 // the main window disabled while it is open.
 static HWND g_set_win;
 static HWND set_child(const wchar_t *cls, const char *text, DWORD style, int id, int x, int y, int w, int h) {
@@ -92,8 +92,6 @@ static HWND set_child(const wchar_t *cls, const char *text, DWORD style, int id,
 }
 static LRESULT CALLBACK set_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_COMMAND && LOWORD(wp) == ID_S_OK) {
-        int m = (int)SendMessageW(GetDlgItem(w, ID_S_MAP), CB_GETCURSEL, 0, 0);
-        core_save_choice(CHOICE_MAP, m >= 1 && m <= 4 ? m - 1 : -1);
         core_save_debug(SendMessageW(GetDlgItem(w, ID_S_DEBUG), BM_GETCHECK, 0, 0) == BST_CHECKED);
         DestroyWindow(w);
         return 0;
@@ -117,17 +115,11 @@ static void settings(void) {
     RECT r;
     GetWindowRect(g_window, &r);
     g_set_win = CreateWindowW(L"NightreignInvasionsSettings", wide(T[T_SETTINGS]), WS_CAPTION | WS_SYSMENU | WS_POPUP, r.left + 60,
-                              r.top + 60, 480, 170, g_window, NULL, GetModuleHandleW(NULL), NULL);
-    int pl = T == UI_TEXT[L_PL];
-    set_child(L"STATIC", T[T_MAP], 0, -1, 12, 14, 70, 20);
-    HWND map = set_child(L"COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL, ID_S_MAP, 90, 10, 360, 200);
-    SendMessageW(map, CB_ADDSTRING, 0, (LPARAM)wide(T[T_MAP_RANDOM]));
-    for (int k = 0; k < 4; k++) SendMessageW(map, CB_ADDSTRING, 0, (LPARAM)wide(core_pair_name(k, pl)));
-    SendMessageW(map, CB_SETCURSEL, core_load_choice(CHOICE_MAP) + 1, 0);
-    HWND debug = set_child(L"BUTTON", T[T_DEBUG_LOG], BS_AUTOCHECKBOX, ID_S_DEBUG, 12, 46, 440, 22);
+                              r.top + 60, 480, 135, g_window, NULL, GetModuleHandleW(NULL), NULL);
+    HWND debug = set_child(L"BUTTON", T[T_DEBUG_LOG], BS_AUTOCHECKBOX, ID_S_DEBUG, 12, 14, 440, 22);
     SendMessageW(debug, BM_SETCHECK, core_load_debug() ? BST_CHECKED : BST_UNCHECKED, 0);
-    set_child(L"BUTTON", "OK", BS_DEFPUSHBUTTON, ID_S_OK, 250, 90, 95, 28);
-    set_child(L"BUTTON", T[T_CLOSE], BS_PUSHBUTTON, ID_S_CANCEL, 355, 90, 95, 28);
+    set_child(L"BUTTON", "OK", BS_DEFPUSHBUTTON, ID_S_OK, 250, 56, 95, 28);
+    set_child(L"BUTTON", T[T_CLOSE], BS_PUSHBUTTON, ID_S_CANCEL, 355, 56, 95, 28);
     EnableWindow(g_window, FALSE);
     ShowWindow(g_set_win, SW_SHOW);
 }

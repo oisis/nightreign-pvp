@@ -17,7 +17,7 @@
 static const unsigned DF_SPECIAL_MT[] = {1028100800, 1029100800, 1039100800, 1039100801}, DF_SPECIAL_RW[] = {1056300800},
                       DF_SPECIAL_CR[] = {1048202800}, DF_SPECIAL_NK[] = {1026500800};
 static int df_special(unsigned id) {
-    int p = g_settings[S_PAIR], crater = p == 2 || p == 3, nk = p == 1 || p == 3;
+    int p = PAIR_NOW, crater = p == 2 || p == 3, nk = p == 1 || p == 3;
     const unsigned *a = crater ? DF_SPECIAL_CR : DF_SPECIAL_MT, *b = nk ? DF_SPECIAL_NK : DF_SPECIAL_RW;
     unsigned na = crater ? 1 : 4, nb = 1;
     for (unsigned i = 0; i < na; i++) if (id == a[i]) return 1;
@@ -717,7 +717,7 @@ static void day_flow_frame(int in_world) {
         g_df_events = 0, g_df_started = 0, g_df_event_tick = 0;
         InterlockedExchange(&g_df_kills, 0), InterlockedExchange(&g_df_special_kills, 0);
         char *gm0 = *(char **)(g_base + 0x3c13258);
-        int pr = g_settings[S_PAIR] >= 0 && g_settings[S_PAIR] <= 3 ? g_settings[S_PAIR] : 0;
+        int pr = PAIR_NOW >= 0 && PAIR_NOW <= 3 ? PAIR_NOW : 0;
         logf("day flow: expedition start (pattern %u / %u): map %s (region pair %d); challenge after %d bosses and the special boss",
              gm0 ? *(unsigned *)(gm0 + 0xb48) : 0, gm0 ? *(unsigned *)(gm0 + 0xb4c) : 0, DF_PAIR_NAME[pr], pr, df_needed());
         notice_with(131185, NULL);  // "Map: <name>" (launcher: the pair's name)

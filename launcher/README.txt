@@ -7,8 +7,12 @@ What this is
   Roundtable Hold, "Invasion" (the first entry of the Target list) searches for another mod
   player's expedition and joins it as a red invader. A killed host ends the expedition and sends
   the invader home with a murk reward; a killed invader goes home with a smaller one.
-  Every expedition map has two Shifting Earth regions, the Mountaintop and the Rotted Woods.
-  The closing circle brings no rain: no falling rain, no rain damage; it still closes as usual.
+  Every expedition map has two Shifting Earth regions; each start of the launcher draws one of
+  four maps: Frozen Thicket (Mountaintop + Rotted Woods), City Beneath the Peak (Mountaintop +
+  Noklateo), Ash and Rot (Crater + Rotted Woods), Fire over the City (Crater + Noklateo). Only
+  players on the same map meet.
+  The closing circle brings no rain by day; after the night challenge a ring of fire closes
+  around the night boss's arena.
   No settings are needed.
 
 How to start

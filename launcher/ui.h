@@ -11,7 +11,7 @@ static const char *const LANG_NAME[LANG_COUNT] = {"English", "Polski", "Deutsch"
 
 enum { T_TITLE, T_GAME_FOLDER, T_BROWSE, T_PLAY, T_BACKUP, T_HELP, T_UNINSTALL, T_CLOSE, T_LANGUAGE, T_NOT_FOUND,
        T_FOUND, T_PICK, T_BAD_FOLDER, T_CONFIRM_UNINSTALL, T_NO_SAVE, T_BACKUP_DONE, T_BACKUP_FAILED, T_HELP_TEXT,
-       T_DEBUG_LOG, T_SETTINGS, T_MAP, T_MAP_RANDOM, T_COUNT };
+       T_DEBUG_LOG, T_SETTINGS, T_COUNT };
 
 static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
     [L_EN] = {
@@ -48,8 +48,6 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "Close: closes this window.",
         "Debug log",
         "Settings",
-        "Map:",
-        "Random (a new one at every start)"
     },
     [L_PL] = {
         "Nightreign Invasions " MOD_VERSION,
@@ -85,8 +83,6 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "Zamknij: zamyka to okno.",
         "Szczegółowy log",
         "Ustawienia",
-        "Mapa:",
-        "Losowa (nowa przy każdym starcie)"
     },
     [L_DE] = {
         "Nightreign Invasions " MOD_VERSION,
@@ -125,8 +121,6 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "Schließen: schließt dieses Fenster.",
         "Ausführliches Protokoll",
         "Einstellungen",
-        "Karte:",
-        "Zufällig (bei jedem Start neu)"
     },
     [L_FR] = {
         "Nightreign Invasions " MOD_VERSION,
@@ -166,8 +160,6 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "Fermer : ferme cette fenêtre.",
         "Journal détaillé",
         "Paramètres",
-        "Carte :",
-        "Aléatoire (une nouvelle à chaque lancement)"
     },
     [L_ES] = {
         "Nightreign Invasions " MOD_VERSION,
@@ -205,8 +197,6 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "Cerrar: cierra esta ventana.",
         "Registro detallado",
         "Ajustes",
-        "Mapa:",
-        "Aleatorio (uno nuevo en cada inicio)"
     },
 };
 

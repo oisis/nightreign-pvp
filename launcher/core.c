@@ -106,7 +106,7 @@ static const char *const PAIR_SPECIAL[4][2] = {
     {"the Magma Wyrm or the Captain", "Magmowego Wyrma lub Kapitana"},
     {"the Magma Wyrm or the Naturalborn of the Void", "Magmowego Wyrma lub Naturalborn of the Void"},
 };
-static int g_pair_given;  // the test settings name a pair (0..3); otherwise it is drawn
+static int g_pair_given;  // test-settings.toml names the map (map = 1..4); otherwise it is drawn
 static int pair_now(void);
 // Texts that depend on the pair: 131180 / 131183 (the special boss), 131185 (the map's name, at the expedition start),
 // 131186 + k (a team with our password plays pair k), the item's caption. (id, text) for the language, n of them.
@@ -122,8 +122,8 @@ static int pair_texts(int polish, u32 *ids, char text[][400]) {  // up to 8
                                                   : "The challenge is not available yet: defeat %%s bosses and the special boss (%s)", sp);
     ids[n] = 131185, snprintf(text[n++], 400, l ? "Mapa: %s" : "Map: %s", PAIR_NAME[p][l]);
     for (int k = 0; k < 4; k++)
-        ids[n] = 131186 + (u32)k, snprintf(text[n++], 400, l ? "Twoja dru\xc5\xbcyna (to samo has\xc5\x82o) gra na mapie %s. Uruchom launcher ponownie, aby wylosowa\xc4\x87 map\xc4\x99."
-                                                             : "Your team (same password) plays the map %s. Start the launcher again to draw a map.", PAIR_NAME[k][l]);
+        ids[n] = 131186 + (u32)k, snprintf(text[n++], 400, l ? "Twoja dru\xc5\xbcyna (to samo has\xc5\x82o) gra na mapie %s. Ustaw map = %d w test-settings.toml albo uruchom launcher ponownie, aby wylosowa\xc4\x87 map\xc4\x99."
+                                                             : "Your team (same password) plays the map %s. Set map = %d in test-settings.toml, or start the launcher again to draw a map.", PAIR_NAME[k][l], k + 1);
     return n;
 }
 static void pair_caption(int polish, char *out, size_t cap) {
@@ -1191,29 +1191,24 @@ static int load_settings(const char *path, short v[SETTINGS_COUNT]) {  // 0: no 
         return 0;
     }
     if (settings_parse((const char *)t.p, t.n, v, bad, sizeof bad)) logf_("test-settings.toml: ignored: %s", bad);
-    g_pair_given = v[S_PAIR] >= 0 && v[S_PAIR] <= 3;
+    g_pair_given = v[S_MAP] >= 1 && v[S_MAP] <= 4;
     for (int i = 0; i < SETTINGS_COUNT; i++) if (v[i] < 0) v[i] = setting_default(i);
     free(t.p);
     return 1;
 }
-static void choices_read(int v[CHOICE_COUNT]);  // the Settings dialog
 static int read_settings(void) {
     char path[1300], on[200] = "";
     snprintf(path, sizeof path, "%s" SEP "test-settings.toml", g_app);
     int found = load_settings(path, g_set);
     g_set[S_DEBUG_LOG] = (short)core_load_debug();  // the window's "Debug log" box decides
-    // The region pair: forced by the test settings (pair = 0..3), else drawn at each start, each with the same chance.
     // ponytail: rand() seeded from the clock and a stack address; an OS random source if the draw ever needs more.
-    // The Settings dialog: the map, unless test-settings.toml sets pair.
-    int choice[CHOICE_COUNT];
-    choices_read(choice);
-    const char *how = "set in test-settings.toml";
-    if (!g_pair_given && choice[CHOICE_MAP] >= 0) g_set[S_PAIR] = (short)choice[CHOICE_MAP], how = "chosen in Settings";
-    else if (!g_pair_given) {
+    // The map: test-settings.toml's map = 1..4 (owner, 2026-11-19), else drawn at each start, each with the same chance.
+    if (!g_pair_given) {
         srand((unsigned)time(NULL) ^ (unsigned)clock() ^ (unsigned)(uintptr_t)&found);
-        g_set[S_PAIR] = (short)(rand() % 4), how = "drawn at random";
+        g_set[S_MAP] = (short)(rand() % 4 + 1);
     }
-    logf_("Map this start: %s (region pair %d, %s)", PAIR_NAME[g_set[S_PAIR]][0], g_set[S_PAIR], how);
+    if (g_pair_given) logf_("Map this start: %s (set in test-settings.toml: map = %d)", PAIR_NAME[g_set[S_MAP] - 1][0], g_set[S_MAP]);
+    else logf_("Map this start: %s (drawn at random)", PAIR_NAME[g_set[S_MAP] - 1][0]);
     for (int i = 0; i < SETTINGS_COUNT; i++)
         if (g_set[i]) snprintf(on + strlen(on), sizeof on - strlen(on), " %s", SETTING_NAMES[i]);
     logf_(found ? "Test settings:%s" : "Test settings:%s (no test-settings.toml next to the launcher)", on[0] ? on : " none");
@@ -1260,8 +1255,8 @@ static const region_t R_MT = {20, 1, 7601, 11, 42, 43, 38, 39, "Mountaintop", "M
 // with b's tiles of that half taken from b's).
 typedef struct { const region_t *a, *b; int start, tree, halves; } two_pair_t;  // halves: bit 0 west, bit 1 east
 static const two_pair_t TWO_PAIRS[4] = {{&R_MT, &R_RW, 701, 1, 0}, {&R_MT, &R_NK, 708, 0, 1}, {&R_CR, &R_RW, 701, 1, 2}, {&R_CR, &R_NK, 704, 0, 3}};
-static int pair_now(void) { int p = g_set[S_PAIR]; return p >= 1 && p <= 3 ? p : 0; }
-static const two_pair_t *two_pair(void) { int p = g_set[S_PAIR]; return &TWO_PAIRS[p >= 1 && p <= 3 ? p : 0]; }
+static int pair_now(void) { int m = g_set[S_MAP]; return m >= 2 && m <= 4 ? m - 1 : 0; }  // map 1..4 -> pair 0..3
+static const two_pair_t *two_pair(void) { return &TWO_PAIRS[pair_now()]; }
 static const region_t *pair_a(void) { return two_pair()->a; }
 static const region_t *pair_b(void) { return two_pair()->b; }
 // the drawn slots: plain 40g+0..19 and the base region's 40g+a..a+4
@@ -2099,7 +2094,7 @@ static int map_tables(buf bundle, int index[4], buf maps[4]) {
         if (!(maps[t] = map_test_table(bnd4_file(bundle, index[t]), t, bnd4_file(bundle, index[0]), bnd4_file(bundle, ap), two)).p) return 0;
     }
     if (two) {
-        if (!g_set[S_PAIR]) chest_group_report(maps[0]);  // its table is the Rotted Woods' sites
+        if (!pair_now()) chest_group_report(maps[0]);  // its table is the Rotted Woods' sites
         int d = bnd4_find(bundle, "\\SmallBaseAndSpotDefine.param");
         if (d < 0 || !write_churches(bnd4_file(bundle, d), maps[2], bnd4_file(bundle, ap))) return 0;
         if (!day_flow_maps(maps, bnd4_file(bundle, ap))) return 0;
@@ -2562,43 +2557,6 @@ int core_backup_save(const char *save_dir, char *where, size_t cap) {
     return 1;
 }
 
-static const char *const CHOICE_KEY[CHOICE_COUNT] = {"map"};
-static const int CHOICE_DEFAULT[CHOICE_COUNT] = {-1};
-static void choices_read(int v[CHOICE_COUNT]) {
-    char path[1300];
-    for (int i = 0; i < CHOICE_COUNT; i++) v[i] = CHOICE_DEFAULT[i];
-    snprintf(path, sizeof path, "%s" SEP "launcher-settings.txt", g_app);
-    buf b = read_file(path);
-    for (size_t at = 0; b.p && at < b.n;) {  // "key = value" lines
-        char line[64] = "", key[24] = "";
-        size_t end = at;
-        while (end < b.n && b.p[end] != '\n') end++;
-        size_t len = end - at < sizeof line - 1 ? end - at : sizeof line - 1;
-        memcpy(line, b.p + at, len);
-        at = end + 1;
-        int val;
-        if (sscanf(line, " %23[a-z-] = %d", key, &val) != 2) continue;
-        for (int i = 0; i < CHOICE_COUNT; i++)
-            if (!strcmp(key, CHOICE_KEY[i]) && val >= (i == CHOICE_MAP ? -1 : 0) && val <= (i == CHOICE_MAP ? 3 : 1)) v[i] = val;
-    }
-    free(b.p);
-}
-int core_load_choice(int which) {
-    int v[CHOICE_COUNT];
-    choices_read(v);
-    return which >= 0 && which < CHOICE_COUNT ? v[which] : 0;
-}
-void core_save_choice(int which, int value) {
-    int v[CHOICE_COUNT];
-    choices_read(v);
-    if (which >= 0 && which < CHOICE_COUNT) v[which] = value;
-    char path[1300], text[160];
-    int n = snprintf(text, sizeof text, "# The launcher's Settings dialog writes this file.\n");
-    for (int i = 0; i < CHOICE_COUNT; i++) n += snprintf(text + n, sizeof text - (size_t)n, "%s = %d\n", CHOICE_KEY[i], v[i]);
-    snprintf(path, sizeof path, "%s" SEP "launcher-settings.txt", g_app);
-    write_file(path, (const u8 *)text, (size_t)n);
-}
-const char *core_pair_name(int pair, int polish) { return pair >= 0 && pair <= 3 ? PAIR_NAME[pair][polish != 0] : ""; }
 
 int core_load_debug(void) {
     char path[1300];
@@ -3298,7 +3256,7 @@ int core_build(const char *game_dir) {
     // BUILD_FORMAT: bump when the set of files the launcher builds changes.
     snprintf(stamp, sizeof stamp, "%016llx%016llx", (unsigned long long)fnv1a64(enc.p, enc.n),
              (unsigned long long)(fnv1a64(dll.p, dll.n) + BUILD_FORMAT +
-                                     ((u64)(map_draw_group() + 1) << 49) + ((u64)one_region() << 53) + ((u64)g_set[S_PAIR] << 57)));
+                                     ((u64)(map_draw_group() + 1) << 49) + ((u64)one_region() << 53) + ((u64)pair_now() << 57)));
     free(dll.p);
     buf old_stamp = read_file(stamp_path);
     int same = old_stamp.n == 32 && !memcmp(old_stamp.p, stamp, 32);
@@ -3572,6 +3530,9 @@ int core_selftest(void) {
         static const short want[SETTINGS_COUNT] = {-1, 0, -1, 15, -1, -1, 3, -1, -1, -1, 250, -1, -1, -1, -1, -1, -1};
         int good = settings_parse(t, sizeof t - 1, v, bad, sizeof bad) == 4 && !memcmp(v, want, sizeof v) &&
                    !strcmp(bad, "nope = true, loot-test = yes, one-region = 1000, boss-flow = 3");
+        char bad2[8];
+        good = good && settings_parse("pair = 3", 8, v, bad2, sizeof bad2) == 0 && v[S_MAP] == 4;     // the retired pair: map = pair + 1
+        good = good && settings_parse("map = 2\npair = 3", 17, v, bad2, sizeof bad2) == 0 && v[S_MAP] == 2;  // map wins
         good = good && !load_settings("/nonexistent/test-settings.toml", v);
         for (int i = 0; i < SETTINGS_COUNT; i++) good = good && v[i] == setting_default(i);
         if (!good) { ok = 0; logf_("selftest: test settings parser failed"); }

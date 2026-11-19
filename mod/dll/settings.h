@@ -6,18 +6,18 @@
 #include <stddef.h>
 #include <string.h>
 
-enum { S_LOOT_TEST, S_DEBUG_LOG, S_NO_HOST, S_TEST_LEVEL, S_FLAG_LOG, S_MAP_DUMP, S_MAP_GROUP, S_ONE_REGION, S_BOSS_FLOW, S_REVIVE_HITS, S_ULT_PVP, S_PAIR, S_PARTY, S_SLOT_TEST, S_CHALLENGE_BOSSES, S_VARIANT_TEST, S_PACK_TEST, SETTINGS_COUNT };
+enum { S_LOOT_TEST, S_DEBUG_LOG, S_NO_HOST, S_TEST_LEVEL, S_FLAG_LOG, S_MAP_DUMP, S_MAP_GROUP, S_ONE_REGION, S_BOSS_FLOW, S_REVIVE_HITS, S_ULT_PVP, S_MAP, S_PARTY, S_SLOT_TEST, S_CHALLENGE_BOSSES, S_VARIANT_TEST, S_PACK_TEST, SETTINGS_COUNT };
 static const char *const SETTING_NAMES[SETTINGS_COUNT] = {"loot-test",
                                                           "debug-log", "no-host", "test-level", "flag-log",
-                                                          "map-dump", "map-group", "one-region", "boss-flow", "revive-hits", "ult-pvp", "pair", "party", "slot-test", "challenge-bosses", "variant-test", "pack-test"};
+                                                          "map-dump", "map-group", "one-region", "boss-flow", "revive-hits", "ult-pvp", "map", "party", "slot-test", "challenge-bosses", "variant-test", "pack-test"};
 // Keys of settings that became fixed behaviour or were dropped; old files may still have them: skipped silently.
 // (no-rain: decision 27, the rain outside the circle never does damage. two-regions, map-test-control, map-region,
 // map-pair-a / -b: every map is a Mountaintop + Rotted Woods map now (decision 35). no-circle: to be redone. ally: the
 // menu's "team" choice joins as an ally now.)
-static const char *const SETTING_RETIRED[] = {"team-test", "slow-time", "full-sync", "no-sprint", "show-ping", "show-counts",
+static const char *const SETTING_RETIRED[] = {"pair", "team-test", "slow-time", "full-sync", "no-sprint", "show-ping", "show-counts",
                                                "rain-hooks-legacy", "ally", "no-rain", "two-regions", "map-test-control", "map-region", "map-pair-a", "map-pair-b", "no-circle"};
 // Settings that take a whole number 0..999 instead of true / false (0 = off).
-static int setting_is_number(int i) { return i == S_TEST_LEVEL || i == S_MAP_GROUP || i == S_ONE_REGION || i == S_BOSS_FLOW || i == S_ULT_PVP || i == S_PAIR || i == S_PARTY || i == S_CHALLENGE_BOSSES; }
+static int setting_is_number(int i) { return i == S_TEST_LEVEL || i == S_MAP_GROUP || i == S_ONE_REGION || i == S_BOSS_FLOW || i == S_ULT_PVP || i == S_MAP || i == S_PARTY || i == S_CHALLENGE_BOSSES; }
 // Settings that are on when the file does not mention them.
 static int setting_default(int i) { return i == S_BOSS_FLOW ? 4 : 0; }  // boss-flow: 4, the day flow
 
@@ -63,7 +63,15 @@ static int settings_parse(const char *t, size_t n, short v[SETTINGS_COUNT], char
             v[key] = (short)val;
             continue;
         }
-        if (key == S_PAIR && eq && e - eq >= 3 && settings_word(e - 2, 2, "-1")) continue;  // pair = -1: drawn (as absent)
+        {  // the retired "pair = 0..3" (pairs numbered from 0) still names a map when no "map" line does: map = pair + 1
+            const char *ke = eq ? eq : s, *vs = eq ? eq + 1 : e;
+            while (eq && ke > s && (ke[-1] == ' ' || ke[-1] == '\t')) ke--;
+            while (eq && vs < e && (*vs == ' ' || *vs == '\t')) vs++;
+            if (eq && settings_word(s, (size_t)(ke - s), "pair")) {
+                if (e - vs == 1 && *vs >= '0' && *vs <= '3' && v[S_MAP] < 0) v[S_MAP] = (short)(*vs - '0' + 1);
+                continue;
+            }
+        }
         int retired = 0;
         for (size_t i = 0; eq && i < sizeof SETTING_RETIRED / sizeof *SETTING_RETIRED; i++) {
             const char *ke = eq;

@@ -336,6 +336,7 @@ static void exit_line(int process_exit) {
 // Test settings: test-settings.toml next to the DLL (the launcher writes it at every start from the
 // file next to the launcher; the dev build copies $W/test-settings.toml). Read once, at load.
 #include "settings.h"
+#define PAIR_NOW (g_settings[S_MAP] >= 1 && g_settings[S_MAP] <= 4 ? g_settings[S_MAP] - 1 : 0)  // the map's region pair 0..3
 static short g_settings[SETTINGS_COUNT];
 static int setting(int i) { return g_settings[i] > 0; }
 static void next_to_dll(char *path, size_t cap, const char *name) {
@@ -1107,7 +1108,7 @@ static void generate_hook(unsigned long long a1, unsigned long long a2, unsigned
     // sets are always candidates. The launcher left weights only on that region's sets.
     // one-region (measurement only): that region's digit; the launcher left weights only on its sets.
     int want = g_settings[S_ONE_REGION] >= 1 && g_settings[S_ONE_REGION] <= 5 ? g_settings[S_ONE_REGION]
-               : g_settings[S_PAIR] == 2 || g_settings[S_PAIR] == 3 ? 2 : 1;  // decision 35: Mountaintop / plain sets; pairs 2 / 3: the Crater
+               : PAIR_NOW == 2 || PAIR_NOW == 3 ? 2 : 1;  // decision 35: Mountaintop / plain sets; pairs 2 / 3: the Crater
     if (want && g_join != 4 && v3 && !IsBadReadPtr(v3, 32)) {
         unsigned char *b = v3[1], *e = v3[2], *cap = v3[3];
         if (b && e > b) {
@@ -2191,7 +2192,7 @@ static void reward_hook(unsigned long long a1, unsigned a2) {
 // flag, 7601, there: 0x6b06f0). The event flags come from the record (the launcher puts a 7603 row before
 // 7601; OnMapEnter sets both). Host and invader alike. Event flag calls: 0x5e7260 get (man, &id, tag), 0x5e79f0 set
 // (man, &id, on, tag, notify 0, 0), the manager at 0x3c115a8.
-static int pair_base_off(void) { int p = g_settings[S_PAIR]; return p == 2 || p == 3 ? 25 : 20; }  // Crater base for pairs 2 / 3
+static int pair_base_off(void) { int p = PAIR_NOW; return p == 2 || p == 3 ? 25 : 20; }  // Crater base for pairs 2 / 3
 static int two_pattern(unsigned pat) {  // the plain and base-region slots (decision 35; pairs 2 / 3: Crater 25..29)
     return pat < 320 && (pat % 40 < 20 || (pat % 40 >= (unsigned)pair_base_off() && pat % 40 < (unsigned)pair_base_off() + 5));
 }
@@ -2784,13 +2785,13 @@ static void flag_log_frame(void) {  // InGame, every frame
 // 36-37, 4 every field tile, 5 Noklateo 42-43 x 36-37 and 44_37): region flag (7601..7606), variant digit, tiles.
 typedef struct { int flag, variant, x0, x1, z0, z1, xe, ze; const char *name; } two_region;  // xe/ze: one extra tile (-1 none)
 static const two_region TWO_BASE_REGIONS[2] = {{7601, 1, 42, 43, 38, 39, -1, -1, "Mountaintop"}, {7602, 2, 43, 44, 38, 39, -1, -1, "Crater"}};
-#define TWO_BASE (TWO_BASE_REGIONS[g_settings[S_PAIR] == 2 || g_settings[S_PAIR] == 3])  // the pattern's own region (map type)
+#define TWO_BASE (TWO_BASE_REGIONS[PAIR_NOW == 2 || PAIR_NOW == 3])  // the pattern's own region (map type)
 // The region laid over its tiles: pair = 0 the Rotted Woods; pair = 1 (test) Noklateo, with 44_37, which the game's
 // table gives to Noklateo and whose variant-5 file it loads once 7605 is in the region list (its tile scripts
 // m60_44_37_50 need that tile's own flag space; small bases there stay the Mountaintop's, launcher).
 static const two_region TWO_ADDED_PAIRS[2] = {{7603, 3, 44, 45, 36, 37, -1, -1, "Rotted Woods"},
                                               {7605, 5, 42, 43, 36, 37, 44, 37, "Noklateo"}};
-#define TWO_ADDED (TWO_ADDED_PAIRS[g_settings[S_PAIR] == 1 || g_settings[S_PAIR] == 3])  // pairs 1 / 3 Noklateo, 0 / 2 the Rotted Woods
+#define TWO_ADDED (TWO_ADDED_PAIRS[PAIR_NOW == 1 || PAIR_NOW == 3])  // pairs 1 / 3 Noklateo, 0 / 2 the Rotted Woods
 static int two_on_tile(const two_region *r, unsigned x, unsigned z) {
     return ((int)x >= r->x0 && (int)x <= r->x1 && (int)z >= r->z0 && (int)z <= r->z1) || ((int)x == r->xe && (int)z == r->ze);
 }
@@ -3268,7 +3269,7 @@ static void hook_acceptance(void) {
     hook_call(0xc27a41, 0x6b06f0, (void *)map_request_hook, "two-regions: map request");
     hook_call(0x5e7ff6, 0x6ab300, (void *)tile_flag_space_hook, "two-regions: tile flag space");
     if (setting(S_PACK_TEST)) pack_test_install();
-    if (g_settings[S_PAIR] >= 1 || setting(S_VARIANT_TEST))
+    if (PAIR_NOW >= 1 || setting(S_VARIANT_TEST))
         for (unsigned i = 0; i < sizeof VARIANT_SITES / sizeof *VARIANT_SITES; i++)
             hook_call(VARIANT_SITES[i], 0x6ab7a0, (void *)variant_hook, "pair: per-tile variant");
     // the held radius makes the game answer the rain around the player, the health bar's circle state, the weather side
@@ -4632,7 +4633,7 @@ static void lobby_mark(void) {
         lobby_set(LOBBY_VER_KEY, MOD_VERSION);
         {
             char pt[8];
-            snprintf(pt, sizeof pt, "%d", g_settings[S_PAIR]);
+            snprintf(pt, sizeof pt, "%d", PAIR_NOW);
             lobby_set(LOBBY_PAIR_KEY, pt);
         }
         {  // the expedition's start block: what a solo start put in the pending block (SingleStart ->
@@ -4775,7 +4776,7 @@ static void notice_with(int id, const char *arg) {
 static void version_result(int found_same) {
     if (g_ver_notice_armed && g_party && !found_same && g_pair_team >= 0 && !*g_ver_team) {
         g_ver_notice_armed = 0;
-        logf("pair: the team with our password plays region pair %d (ours %d): notice shown", g_pair_team, g_settings[S_PAIR]);
+        logf("pair: the team with our password plays region pair %d (ours %d): notice shown", g_pair_team, PAIR_NOW);
         notice_with(131186 + g_pair_team, NULL);
     } else if (g_ver_notice_armed && *g_ver_newest) {
         g_ver_notice_armed = 0;
@@ -4844,10 +4845,10 @@ static int lobby_search_frame(const char *who) {
         const char *ver = g_steam.get_data(g_steam.mm, id, LOBBY_VER_KEY);
         const char *pr = g_steam.get_data(g_steam.mm, id, LOBBY_PAIR_KEY);
         int same = proto && !strcmp(proto, LOBBY_PROTO) && ver && !strcmp(ver, MOD_VERSION);
-        int pair_ok = pr && *pr && atoi(pr) == g_settings[S_PAIR];
+        int pair_ok = pr && *pr && atoi(pr) == PAIR_NOW;
         version_seen(ver, g_party != 0);
         if (same && !own && !pair_ok && g_party && pr && *pr && g_pair_team < 0) g_pair_team = atoi(pr) & 3;
-        if (same && !own && !pair_ok) logf("%s:   lobby %llu: map (region pair) '%s', ours %d: not for us", who, id, pr ? pr : "?", g_settings[S_PAIR]);
+        if (same && !own && !pair_ok) logf("%s:   lobby %llu: map (region pair) '%s', ours %d: not for us", who, id, pr ? pr : "?", PAIR_NOW);
         same = same && pair_ok;
         int fits = same && !own && slots > 0 && game && !strcmp(game, LOBBY_GAME);
         // GetLobbyData gives "" for a key that is not set.

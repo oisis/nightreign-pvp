@@ -84,29 +84,20 @@ static void set_texts(void) {
     gtk_button_set_label(GTK_BUTTON(g_settings), T[T_SETTINGS]);
 }
 
-// Settings: the map (random or one of the four pairs) and the debug log; saved when the dialog is closed with OK.
+// Settings: the debug log; saved when the dialog is closed with OK. (The map is drawn at every start; test-settings.toml
+// can fix it: map = 1..4.)
 static void on_settings(GtkButton *b, gpointer u) {
     (void)b; (void)u;
-    int pl = T == UI_TEXT[L_PL];
     GtkWidget *d = gtk_dialog_new_with_buttons(T[T_SETTINGS], GTK_WINDOW(g_window), GTK_DIALOG_MODAL, "_OK", GTK_RESPONSE_OK,
                                                T[T_CLOSE], GTK_RESPONSE_CANCEL, NULL);
     GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(d)), *grid = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
     gtk_container_set_border_width(GTK_CONTAINER(grid), 12);
-    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8), *map = gtk_combo_box_text_new();
-    gtk_box_pack_start(GTK_BOX(row), gtk_label_new(T[T_MAP]), FALSE, FALSE, 0);
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(map), T[T_MAP_RANDOM]);
-    for (int k = 0; k < 4; k++) gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(map), core_pair_name(k, pl));
-    gtk_combo_box_set_active(GTK_COMBO_BOX(map), core_load_choice(CHOICE_MAP) + 1);
-    gtk_box_pack_start(GTK_BOX(row), map, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(grid), row, FALSE, FALSE, 0);
     GtkWidget *debug = gtk_check_button_new_with_label(T[T_DEBUG_LOG]);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(debug), core_load_debug());
     gtk_box_pack_start(GTK_BOX(grid), debug, FALSE, FALSE, 0);
     gtk_container_add(GTK_CONTAINER(area), grid);
     gtk_widget_show_all(d);
     if (gtk_dialog_run(GTK_DIALOG(d)) == GTK_RESPONSE_OK) {
-        int m = gtk_combo_box_get_active(GTK_COMBO_BOX(map));
-        core_save_choice(CHOICE_MAP, m >= 1 && m <= 4 ? m - 1 : -1);
         core_save_debug(gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(debug)));
     }
     gtk_widget_destroy(d);
