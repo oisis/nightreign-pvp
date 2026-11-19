@@ -5256,6 +5256,17 @@ static char *speffect_entry(char *chr, unsigned id) {  // the active entry of Sp
 // Name from 0x140d40640(L, 2), as act 148 in the dispatcher 0x1403f5870 reads it.
 static int (*g_act_real)(void *);
 static volatile LONG g_act_seen, g_act_ours, g_act_all, g_act_148;
+// Walk / run on L3 (owner, 2026-11-19: "Chód <-> bieg"; sprint stays off). The script's speed is MoveSpeedIndex,
+// set only through ChangeMoveSpeedIndex -> SetVariable (act 148): SpeedUpdate gives 0 at a light tilt, 1 above 0.4,
+// 2 (the run) above 1.1, 3 the sprint (ER's names: 0 walk, 1 run, 2 dash). In walk mode our character's every index
+// above WALK_SPEED_INDEX becomes it. L3 (env 1108 ACTION_ARM_L3) is the sprint button: SpeedUpdate pc 529-560 / SpeedUpdate2
+// ask env(1116, 102610) only while it is held (and the character moves, stamina >= 0), every frame; our env_wrap
+// answers that question, so a question after a gap of more than WALK_PRESS_GAP_MS is a new press: it flips the mode.
+// The numeric value of ACTION_ARM_L3 is a game-side global, not in the script, so the press is taken from there.
+// ponytail: a press is only seen while moving; a press-anywhere toggle needs the input value, not located.
+#define WALK_SPEED_INDEX  0
+#define WALK_PRESS_GAP_MS 300
+static volatile int g_walk;  // 0 run (default), 1 walk
 
 static int act_wrap(void *L) {
     if (L && !IsBadReadPtr((char *)L + 0x48, 16)) {
@@ -5263,7 +5274,7 @@ static int act_wrap(void *L) {
         InterlockedIncrement(&g_act_all);
         if (base && top >= base + 16 && *(unsigned *)base == 3 && *(float *)(base + 8) == 148.0f) InterlockedIncrement(&g_act_148);
         if (base && top >= base + 3 * 16 && *(unsigned *)base == 3 && *(float *)(base + 8) == 148.0f && *(unsigned *)(base + 32) == 3 &&
-            *(float *)(base + 40) == 3.0f) {
+            (*(float *)(base + 40) == 3.0f || (g_walk && *(float *)(base + 40) > (float)WALK_SPEED_INDEX))) {
             const char *nm = ((const char *(*)(void *, int))(g_base + 0xd40640))(L, 2);  // as act 148 reads it
             if (nm && !strcmp(nm, "MoveSpeedIndex")) {
                 InterlockedIncrement(&g_act_seen);
@@ -5278,7 +5289,7 @@ static int act_wrap(void *L) {
                 char *m2 = m && !IsBadReadPtr(m + 0x10, 8) ? *(char **)(m + 0x10) : NULL;
                 char **obj = m2 && !IsBadReadPtr(m2 + 0x10, 8) ? *(char ***)(m2 + 0x10) : NULL;
                 char *chr = obj && !IsBadReadPtr(obj, 8) ? *obj : NULL;
-                if (chr && chr == local_player()) InterlockedIncrement(&g_act_ours), *(float *)(base + 40) = 2.0f;
+                if (chr && chr == local_player()) InterlockedIncrement(&g_act_ours), *(float *)(base + 40) = g_walk ? (float)WALK_SPEED_INDEX : 2.0f;
             }
         }
     }
@@ -5310,7 +5321,17 @@ static int env_wrap(void *L) {
         if (base && top >= base + 2 * 16 && *(unsigned *)base == 3 && *(float *)(base + 8) == 1116.0f && *(unsigned *)(base + 16) == 3 &&
             *(float *)(base + 24) == 102610.0f) {
             char *chr = script_chr(L);
-            if (chr && chr == local_player()) { InterlockedIncrement(&g_env_answered); return 1; }
+            if (chr && chr == local_player()) {
+                static DWORD last;
+                DWORD now = GetTickCount();
+                if (now - last > WALK_PRESS_GAP_MS) {
+                    g_walk = !g_walk;
+                    logf("walk: L3: %s", g_walk ? "walk (full tilt walks)" : "run");
+                }
+                last = now;
+                InterlockedIncrement(&g_env_answered);
+                return 1;
+            }
         }
     }
     return g_env_real(L);
