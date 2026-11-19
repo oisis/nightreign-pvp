@@ -39,7 +39,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 35
+#define BUILD_FORMAT 36
 #define BOSS_DEATHS_MIN 100  // the game (1.3.3) has 158 such flags; fewer = its event scripts changed
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
@@ -3038,7 +3038,7 @@ static int build_pair_half(const char *game_dir) {
 // count, one id per line); the game's ids are never shipped. Returns the number of flags, -1 on failure.
 // EMEVD: +0x10 event count, +0x18 events (0x30 each: id u64, instruction count u64, offset u64, ...), +0x28
 // instructions (0x20 each: bank u32, id u32, argument length u64, argument offset s64), +0x78 argument data.
-static int emevd_boss_deaths(buf d, u32 *flags, int have, int cap) {
+static int emevd_boss_deaths(buf d, u32 *flags, int have, int cap, int night_arena) {
     if (d.n < 0x80 || memcmp(d.p, "EVD", 3)) return have;
     u64 ec = rd64(d.p + 0x10), eo = rd64(d.p + 0x18), io = rd64(d.p + 0x28), ao = rd64(d.p + 0x78);
     for (u64 e = 0; e < ec && eo + (e + 1) * 0x30 <= d.n; e++) {
@@ -3051,8 +3051,20 @@ static int emevd_boss_deaths(buf d, u32 *flags, int have, int cap) {
             if (bank != 2000 || (id != 0 && id != 6) || ao + aoff + alen > d.n || alen < 12) continue;
             const u8 *a = d.p + ao + aoff;
             u32 ev_id = rd32(a + 4), flag = 0;
+            // The game's own boss kills: the common_func templates that run "Increment Team Bosses Killed" (2003[101])
+            // and then set the boss's death flag (2003[69]) from the caller's arguments (common_func, 1.3.3): 90015002 /
+            // 90015025 / 90015407 its third argument, 90035013 its first, 90045002 its fourth (its first is the site's
+            // shared flag). Run of dev.67 (pair 3): bosses outside the grace chains below went uncounted (e.g. the
+            // Equilibrious Beast 1044360851, the event bosses of m45_5x, the evergaol-like m46_50 / 60 / 70 duels).
+            // The night bosses' templates (90065900, 90075901 / 904) have no such argument and stay out; so do the
+            // night-boss arenas' scripts (m47, m48, m49, m52: night_arena) and 90035013 (its first argument is a camp
+            // invader's death, m30-m38 / m50-m52 xx705: invaders are not bosses of the day).
+            static const struct { u32 ev; u32 at; } KILL[] = {{90015002, 8}, {90015025, 8}, {90015407, 8}, {90045002, 12}};
+            int kill = -1;
+            for (unsigned t = 0; t < sizeof KILL / sizeof *KILL; t++) if (KILL[t].ev == ev_id) kill = (int)t;
             if (ev_id == 9005810) flag = rd32(a + 8);
             else if (ev_id == 90015006 && alen >= 20) flag = rd32(a + 16);
+            else if (kill >= 0 && !night_arena && alen >= 8 + KILL[kill].at + 4) flag = rd32(a + 8 + KILL[kill].at);
             else continue;
             if (flag < 10000000u) continue;
             int seen = 0;
@@ -3061,6 +3073,11 @@ static int emevd_boss_deaths(buf d, u32 *flags, int have, int cap) {
         }
     }
     return have;
+}
+static int night_arena_file(const char *name) {  // "/event/mAA_BB_00_00.emevd.dcx" of AA 47, 48, 49 or 52
+    const char *m = strstr(name, "/m");
+    int aa = m ? atoi(m + 2) : 0;
+    return aa == 47 || aa == 48 || aa == 49 || aa == 52;
 }
 static int cmp_u32(const void *a, const void *b) { u32 x = *(const u32 *)a, y = *(const u32 *)b; return x < y ? -1 : x > y; }
 // The boss character of each death flag (for hiding bosses while the night boss is active): a boss's death is set by
@@ -3232,7 +3249,7 @@ static int build_boss_deaths(const char *game_dir, buf bhd, const char *bdt) {
     int failed = -1;
     char kind[8] = "";
     for (int i = 0; i < found; i++) {
-        if (out[i].p) read++, have = emevd_boss_deaths(out[i], flags, have, 2048);
+        if (out[i].p) read++, have = emevd_boss_deaths(out[i], flags, have, 2048, night_arena_file(names[i]));
         else if (failed < 0) failed = i, snprintf(kind, sizeof kind, "%.4s", in[i].p && in[i].n >= 0x2C ? (const char *)in[i].p + 0x28 : "?");
     }
     if (failed >= 0) logf_("Boss deaths: %s not unpacked (compression %s)", names[failed], kind);
@@ -3543,7 +3560,7 @@ int core_selftest(void) {
         const u32 args[] = {0, 9005810, 46500800, 0, 0, 90015006, 30301510, 30300510, 30300810, 0, 0, 9005810, 46500800};
         for (unsigned i = 0; i < sizeof args / sizeof *args; i++) wr32(ev + 0x180 + i * 4, args[i]);
         u32 got[4];
-        int k = emevd_boss_deaths((buf){ev, sizeof ev}, got, 0, 4);
+        int k = emevd_boss_deaths((buf){ev, sizeof ev}, got, 0, 4, 0);
         if (k != 2 || got[0] != 46500800 || got[1] != 30300810) { ok = 0; logf_("selftest: boss deaths from an event script failed"); }
     }
     {  // test settings: values, comments, CRLF, case, a retired key (no-rain), unknown keys and bad values, a missing file
