@@ -226,6 +226,30 @@ static void df_tier_apply(char *chr) {
     for (int i = 0; i < nd; i++) ((unsigned char (*)(char *, int))(g_base + 0x601210))(chr, DF_TIER_FIRST + drop[i]);
     if (want && !have) ((void (*)(void *, int, unsigned char))(g_base + RVA_ADD_SPEFFECT))(chr, DF_TIER_FIRST + want, 0);
     g_df_pass_count++;
+    // Proof of the scaling on the night boss (owner, 2026-11-19): a character in a night-boss arena with a big HP pool
+    // (max HP above 3000; the arena's adds are below) is logged once per challenge, with its NpcParam row id, whether
+    // it carries the tier SpEffect now and its HP data (module [chr +0x1b8] +0x140 HP, +0x144 / +0x148 raw: max HP as
+    // the game keeps it, its base).
+    if (night_boss_map && g_df_go) {
+        static char *seen[16];
+        static int nseen, for_seq = -1;
+        if (for_seq != g_df_day) for_seq = g_df_day, nseen = 0;
+        char **pd = !IsBadReadPtr(chr + 0x1b8, 8) ? *(char ***)(chr + 0x1b8) : NULL;
+        char *m = pd && !IsBadReadPtr(pd, 8) ? *pd : NULL;
+        int known = 0;
+        for (int i = 0; i < nseen; i++) known |= seen[i] == chr;
+        if (!known && nseen < 16 && m && !IsBadReadPtr(m + 0x140, 12) && *(int *)(m + 0x144) > 3000) {
+            seen[nseen++] = chr;
+            unsigned npc = 0;
+            if (!IsBadReadPtr(*(void **)chr, 0x1a8)) {
+                char **ref = ((char **(*)(char *))(*(void ***)chr)[0x1a0 / 8])(chr);
+                if (ref && !IsBadReadPtr(ref, 12)) npc = *(unsigned *)(ref + 1);
+            }
+            logf("day flow: night boss seen (block %08x, NpcParam %u): tier SpEffect %d %s, HP %d, +0x144 %d, +0x148 %d", *(unsigned *)(chr + CHR_BLOCK_ID),
+                 npc, want ? DF_TIER_FIRST + want : 0, want ? (have ? "already on" : "put on now") : "(none wanted)", *(int *)(m + 0x140),
+                 *(int *)(m + 0x144), *(int *)(m + 0x148));
+        }
+    }
 }
 static void df_chr_pass_hook(char *chr) {
     if (df_on()) df_tier_apply(chr);
