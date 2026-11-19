@@ -39,7 +39,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 33
+#define BUILD_FORMAT 34
 #define BOSS_DEATHS_MIN 100  // the game (1.3.3) has 158 such flags; fewer = its event scripts changed
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
@@ -1167,16 +1167,15 @@ static int scarab_rows(buf p) {
     return changed == 30;
 }
 
-// No rain (decision 27, always, for every player): PlayAreaCreateCommonParam row 0's rain SpEffects 99810 (+0x28) and
-// 99811 (+0x2c) become -1, in place. 0 if unexpected.
+// The rain's damage: PlayAreaCreateCommonParam row 0's rain SpEffects 99810 (+0x28) and 99811 (+0x2c) stay the game's
+// (until the fire ring they were set to -1, decision 27). By day the DLL holds the circle at 5000 m, so nobody is
+// outside it; after the challenge the ring around the arena does damage (owner, BRIEF 2026-11-18). Only checked here:
+// 0 if the row is not as expected.
 static int no_rain(buf p) {
     const u8 *d = p.p + 0x40;
     if (rd16(p.p + 0x0A) < 1 || rd32(d) != 0) return 0;
-    u8 *row = p.p + rd64(d + 8);
-    if (rd32(row + 0x28) != 99810 || rd32(row + 0x2C) != 99811) return 0;
-    wr32(row + 0x28, 0xFFFFFFFF);
-    wr32(row + 0x2C, 0xFFFFFFFF);
-    return 1;
+    const u8 *row = p.p + rd64(d + 8);
+    return rd32(row + 0x28) == 99810 && rd32(row + 0x2C) == 99811;
 }
 
 // Test settings (test phase only): test-settings.toml next to the launcher, read at every build
