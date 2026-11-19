@@ -338,6 +338,22 @@ static int df_chr_pos(char *chr, float out[3]) {  // the game's position getter 
     out[0] = v[0], out[1] = v[1], out[2] = v[2];
     return 1;
 }
+// The challenge's move is hidden behind the game's own fade (owner, 2026-11-19: the move through walls looked bad). As
+// the scripts do it (common_func 90075770: Fade to Black 1.0 / 0.5 s / freeze, 0.5 s, the warp, ..., Fade to Black
+// 0.0 / 0.5 s): 2004[77] (bank 2004 table 0x14058aa04, case 0x1405891e4) takes the fade colour 0x14015de60(out, 8)
+// and calls 0x14061d490(*(0x143c117c8)+8, {r, g, b, ratio}, time, freeze, delay), the delay kept only when
+// 0 <= delay < time (else time). The screen goes black first, the warp follows 0.55 s later, and it clears 0.4 s
+// after the landing is set (the drop onto the arena is seen), or after 20 s at the latest.
+static DWORD g_df_fade_in_at, g_df_move_at;
+static void df_fade(float ratio, float time, int freeze) {
+    char *m = *(char **)(g_base + 0x3c117c8);
+    if (!m || IsBadReadPtr(m + 8, 8) || !*(char **)(m + 8)) return (void)logf("day flow: fade: no fade manager");
+    _Alignas(16) float col[4] = {0, 0, 0, 0}, rgba[4];
+    ((void (*)(float *, int))(g_base + 0x15de60))(col, 8);
+    rgba[0] = col[0], rgba[1] = col[1], rgba[2] = col[2], rgba[3] = ratio;
+    ((void (*)(char *, float *, float, unsigned char, float))(g_base + 0x61d490))(*(char **)(m + 8), rgba, time, (unsigned char)(freeze != 0), time);
+    logf("day flow: fade %s (%.1f s)", ratio > 0 ? "to black" : "back", time);
+}
 static DWORD g_df_track_until, g_df_track_next;
 static void df_after_warp(char *me, int dest) {
     char *mgr = *(char **)(g_base + 0x3c123f8);
@@ -363,6 +379,7 @@ static void df_after_warp(char *me, int dest) {
              DF_DROP_M);
     }
     g_df_track_until = GetTickCount() + 10000, g_df_track_next = 0;
+    if (g_df_fade_in_at) g_df_fade_in_at = (GetTickCount() + 400) | 1;
 }
 static void df_track_frame(void) {
     if (!g_df_track_until) return;
@@ -450,11 +467,19 @@ static void df_start_local(const char *who) {
     notice_with(131184, NULL);
     logf("day flow: day %d's challenge (%s): warp, night", g_df_day, who);
     g_df_warp_until = 0, g_df_load_until = 0;
-    if (!df_warp()) {
-        if (df_arena_load()) g_df_load_until = GetTickCount() + 30000;
-        else g_df_warp_until = GetTickCount() + 120000;  // fallback: retry while the player nears the circle
-    }
+    df_fade(1.0f, 0.5f, 1);
+    g_df_move_at = (GetTickCount() + 550) | 1, g_df_fade_in_at = (GetTickCount() + 20000) | 1;
     df_repass("challenge: night bosses get the tier");
+}
+static void df_move_frame(void) {  // the warp once the screen is black; the fade back
+    if (g_df_move_at && (int)(GetTickCount() - g_df_move_at) >= 0) {
+        g_df_move_at = 0;
+        if (!df_warp()) {
+            if (df_arena_load()) g_df_load_until = GetTickCount() + 30000;
+            else g_df_warp_until = GetTickCount() + 120000;  // fallback: retry while the player nears the circle
+        }
+    }
+    if (g_df_fade_in_at && (int)(GetTickCount() - g_df_fade_in_at) >= 0) g_df_fade_in_at = 0, df_fade(0.0f, 0.5f, 0);
 }
 static void df_item_used(void) {
     if (!g_df_met || g_df_used) {  // the item is not consumed (launcher: isConsume off), nothing to give back
@@ -621,7 +646,8 @@ static void day_flow_frame(int in_world) {
         logf("day flow: expedition start (pattern %u / %u): map %s (region pair %d); challenge after %d bosses and the special boss",
              gm0 ? *(unsigned *)(gm0 + 0xb48) : 0, gm0 ? *(unsigned *)(gm0 + 0xb4c) : 0, DF_PAIR_NAME[pr], pr, df_needed());
         notice_with(131185, NULL);  // "Map: <name>" (launcher: the pair's name)
-        g_df_warp_until = 0, g_df_load_until = 0, g_df_ended = 0;
+        g_df_warp_until = 0, g_df_load_until = 0, g_df_ended = 0, g_df_move_at = 0;
+        if (g_df_fade_in_at) g_df_fade_in_at = 0, df_fade(0.0f, 0.1f, 0);
     }
     if (!day2_seen && bf_flag(7505)) {  // day 2: the game's own day-2 level, our count starts again
         day2_seen = 1, g_df_day = 2;
@@ -683,6 +709,7 @@ static void day_flow_frame(int in_world) {
         else if ((int)(GetTickCount() - next) >= 0 && (next = GetTickCount() + 1000, df_warp())) g_df_warp_until = 0;
     }
     df_lobby_watch();
+    df_move_frame();
     df_notice_frame();
     df_track_frame();
     if (g_join != 4) df_events_frame();
