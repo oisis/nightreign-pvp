@@ -66,7 +66,7 @@ static const char *const KEY_LINES[] = {
     "not hooked", "not as expected", "not expected", "cannot", "failed", "NOT ", "not started", "not written",
     "host: session up", "host: expedition reached", "host: expedition over", "host: member admitted", "role: ",
     "host: no member left", "leave done", "join: search started", "joining lobby", "join -> ", "stopping (",
-    "in the host's world", "world sync at step", "invasion won", "invasion lost", "invasion neither", "level: ", "map test", "two-regions", "expedition: result", "reward test: won", "reward test: lost",
+    "in the host's world", "world sync at step", "invasion won", "invasion lost", "invasion neither", "level: ", "map test", "two-regions", "expedition: result", "reward test: won", "reward test: lost", "extra life", "game over requested", "the game's result",
     "expedition end requested", "flags: ", "lag: ", "move check: ", "map pin: ", "name tag: ", "scaling: ", "version: ", "counts overlay: ", "capacity: ", "slot: ", "map test",  "still down", "watchdog", "no map load", "went back", "code patch", "crash"};
 static void logf(const char *fmt, ...) {
     char line[1024];
@@ -2162,6 +2162,9 @@ static void reward_hook(unsigned long long a1, unsigned a2) {
                      REWARD_MURK_MIN, before, *(int *)(pd + 0xd0), *(unsigned short *)(ps + 0x36c));
             } else
                 logf("reward: the expedition gave %u murk (at least the minimum %d)", got, REWARD_MURK_MIN);
+            char *res = *(char **)(ps + 0x40);  // the result (0x210c20 set +0x3c before this call: 1 = a clear)
+            logf("reward: the game's result: %s (reward clear argument %llu, result +0x3c %d)", a1 ? "clear" : "not a clear (game over)", a1,
+                 res && !IsBadReadPtr(res + 0x3c, 1) ? res[0x3c] : -1);
         }
         return;
     }
@@ -2317,6 +2320,7 @@ static int boss_death(unsigned id) {
 static void df_kill(unsigned id);
 static void df_chr_pass_hook(char *chr);
 static void df_death_restart_install(void);
+static int df_extra_life(char *me, int use);
 static void summon_at_host_install(void);
 static void flag_note(char *man, unsigned id, int on, int before) {
     (void)man;
@@ -4112,8 +4116,8 @@ static void remote_chr_log(void) {
 }
 // Decision 21 (finish-test): the host killed while an invader is in its session loses. A down that
 // ends in death goes from state 1 straight to 0 (a revive goes 1 -> 2); with an invader admitted
-// (g_host_switched) such a death ends the host's expedition through the same request the invader's
-// way home uses (gm+0xaf1, 0x6af8f0): InGameStep then runs Result / EndFlow back to the Roundtable
+// (g_host_switched) such a death ends the host's expedition through the game's game over (gm+0xaf2,
+// 0x6af900; the invader's way home is gm+0xaf1): InGameStep then runs Result / EndFlow back to the Roundtable
 // Hold, the session closes with the world, and the invader's "no longer a client" path sends it home.
 // ponytail: a solo host only; with squad mates the condition must become "the whole squad is dead".
 // Both sides (finish-test): the downed state of the other player characters as this machine sees it,
@@ -4148,11 +4152,23 @@ static void host_death_watch(void) {
     // with an ally in the session the squad lives on: left to the game (its own rule for a dead squad member)
     // day flow (boss-flow 4, the owner's rule): the host's final death (downed, then finished or bled out) ends the
     // expedition for the whole squad, whoever is in the session
+    // The host lost: the game's own game over (0x6af900, gm+0xaf2; gm+0xaf1 would count a clear, see day_flow.h).
+    // Day flow with an extra life (df_extra_life): left to the game's death restart, which uses it and revives; if no
+    // death restart comes within 30 s and the host is still at HP 0, the game over after all.
+    static DWORD wait;
+    char **pd = chr && !IsBadReadPtr(chr + 0x1b8, 8) ? *(char ***)(chr + 0x1b8) : NULL;
+    int hp = pd && !IsBadReadPtr(pd, 8) && *pd && !IsBadReadPtr(*pd, 0x148) ? *(int *)(*pd + 0x140) : -1;
+    int end = wait && GetTickCount() - wait > 30000 && hp == 0;
+    if (wait && (end || hp > 0)) wait = 0;
     if (last == 1 && now == 0 && (g_settings[S_BOSS_FLOW] == 4 || (g_host_switched && side_count(0) > 0 && side_count(1) == 0))) {
-        ((void (*)(void))(g_base + 0x6af8f0))();
+        if (g_settings[S_BOSS_FLOW] == 4 && df_extra_life(chr, 0))
+            wait = GetTickCount() | 1, logf("day flow: the host's death (downed state over): an extra life is there, left to the game's death restart");
+        else end = 1;
+    }
+    if (end) {
+        ((void (*)(void))(g_base + 0x6af900))();
         char *gm = *(char **)(g_base + 0x3c13258);
-        logf("finish test: the host's final death: expedition end requested (gm+0xaf1 = %u)",
-             gm ? (unsigned char)gm[0xaf1] : 0);
+        logf("finish test: the host's final death: the game's game over requested (gm+0xaf2 = %u)", gm ? (unsigned char)gm[0xaf2] : 0);
     }
     last = now;
 }
@@ -5128,10 +5144,14 @@ static void join_over(const char *why) {
                  g_reward_pending == 1 ? REWARD_MURK : REWARD_MURK_LOST);
         }
         {
-            ((void (*)(void))(g_base + 0x6af8f0))();
+            // an ally's own final death is a lost expedition: the game's game over (0x6af900, gm+0xaf2; gm+0xaf1 counts
+            // a clear, day_flow.h); every other ending as before
+            int over = g_as_ally && strstr(why, "final death") != NULL;
+            ((void (*)(void))(g_base + (over ? 0x6af900 : 0x6af8f0)))();
             char *gm = *(char **)(g_base + 0x3c13258);
-            logf("move test: expedition end requested (gm+0xaf1 = %u, 0x6af8f0): back to the Roundtable Hold (%s)",
-                 gm ? (unsigned char)gm[0xaf1] : 0, strstr(why, "died") ? "invader died" : "invasion over");
+            logf("move test: expedition end requested (%s: gm+0xaf1 = %u, gm+0xaf2 = %u): back to the Roundtable Hold (%s)",
+                 over ? "game over, 0x6af900" : "0x6af8f0", gm ? (unsigned char)gm[0xaf1] : 0, gm ? (unsigned char)gm[0xaf2] : 0,
+                 strstr(why, "died") ? "invader died" : over ? "ally's final death" : "invasion over");
         }
     } else if (g_move >= 2 && g_qm_ctrl && (g_qm_step == 21 || g_qm_step == 22)) {
         ((void (*)(void *, int))(*(void ***)g_qm_ctrl)[QM_CTRL_VT_SET_STEP])(g_qm_ctrl, QM_STEP_NONE);

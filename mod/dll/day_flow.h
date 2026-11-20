@@ -620,9 +620,43 @@ static void df_events_frame(void) {
 // path after a death that is not revived: CS::CSLuaEventScriptImitation::CSDeathRestartEvent, whose first state
 // 0x1405c38f0 sets the level (0x140729200: the death's -1) and brings the player back (the respawn block, then the
 // placement). It is bound as a state at 0x1405c3ffa (lea rax, 0x1405c38f0, in 0x1405c3f80). Under boss-flow 4 that state
-// is taken over: instead of the revive, our own player's expedition ends: the host (or solo) through the way home
-// of a lost invasion (0x6af8f0, gm+0xaf1), which ends it for the squad; an ally through join_over (it may join again).
+// is taken over: instead of the revive, our own player's expedition ends: the host (or solo) through the game's game
+// over (0x6af900, gm+0xaf2), which ends it for the squad; an ally through join_over (it may join again).
 // So the downed state and its countdown stay the game's; only what follows the death changes.
+// The ending is the game's own game over: common.emevd 1180 / 1181 set flag 7001 (GameSystemCommonParam +0xfc) for a
+// lost expedition, which MoveMapStep::_CheckEndingRequest (0xc37420) turns into gm+0xaf2 (0x6af900); +0xf8 = 7000, the
+// game clear, gives gm+0xaf1 (0x6af8f0). Both lead to Result, through MoveMapStep::GameClearOrOver (0xc322e0, called
+// from 0xc381e4 with (af1, af2)): with af1 the result is a clear (result +0x3c = 1 by 0x210c20, the reward 0x1fd620
+// gets clear = 1, 0x2034f0 counts a won expedition: play state +0x170 wins, +0x174 the streak) - deck run 2: +0x170
+// 55 -> 56, +0x174 1 -> 2 after a death. So the final death ends with af2.
+// Extra lives, the game's own (common.emevd 1181 solo, 1180 squad): at a death at night (7515) or on day 3 (7510) the
+// event revives the player in the near-death idle (540157), one life per death, in this order: 8970061 (an event's own
+// revive, nothing used), 6999500 "[Solo] Automatic Revival Available" (given at the start of day 1 / day 2 in
+// single-player only, common 1101 / 1104, with flag 82100) -> trigger 6999505 + 6999501 "Unavailable"; 540155, the
+// carry effect of goods 700 Wending Grace (EquipParamGoods carrySpEffectId) -> trigger 540150 and the item removed;
+// 6999100 "Favor of Noklateo" (m60_42_36_50) -> 6999101 "Unavailable" + its boosts 6999104 / 06 / 07, trigger 6999105.
+// In the day the events do nothing: the game's day death is the death restart's revive, a level less. Under boss-flow 4
+// that death is final, so an extra life is used up here as the events use it (without the triggers: they act in the
+// near-death idle, which the death restart is past) and the game's own revive runs instead of the ending.
+static int df_extra_life(char *me, int use) {
+    static const struct { unsigned have, set[4]; int goods; const char *name; } L[3] = {
+        {6999500, {6999501}, 0, "the solo automatic revival (6999500)"},
+        {540155, {0}, 700, "Wending Grace (goods 700, 540155)"},
+        {6999100, {6999101, 6999104, 6999106, 6999107}, 0, "the Favor of Noklateo (6999100)"}};
+    for (int i = 0; me && i < 3; i++) {
+        if (!speffect_on(me, L[i].have)) continue;
+        if (!use) return i + 1;
+        for (int k = 0; k < 4 && L[i].set[k]; k++) ((void (*)(void *, int, unsigned char))(g_base + RVA_ADD_SPEFFECT))(me, (int)L[i].set[k], 0);
+        if (L[i].goods) {  // 2003[24]'s removal, as the challenge item's (0x5fdb10, goods code 0x59a7b0(3))
+            int code = ((int (*)(int))(g_base + 0x59a7b0))(3);
+            ((void (*)(int, int, int))(g_base + 0x5fdb10))(code, L[i].goods, -1);
+        }
+        logf("day flow: extra life used: %s; after it: 6999500 %d, 540155 %d, 6999100 %d", L[i].name, speffect_on(me, 6999500),
+             speffect_on(me, 540155), speffect_on(me, 6999100));
+        return i + 1;
+    }
+    return 0;
+}
 static int g_df_ended;
 static void df_death_restart_hook(long long *ev, void *sm) {
     if (!df_on() || !g_in_exped) {
@@ -634,22 +668,29 @@ static void df_death_restart_hook(long long *ev, void *sm) {
     int hp = pd && !IsBadReadPtr(pd, 8) && *pd && !IsBadReadPtr(*pd, 0x148) ? *(int *)(*pd + 0x140) : -1;
     float p[3] = {0, 0, 0};
     int have = me && df_chr_pos(me, p);
-    logf("day flow: death restart state: HP %d, downed %u, block %08x, position %s%.1f %.1f %.1f", hp, me ? (unsigned char)me[0x710] : 0,
-         me ? *(unsigned *)(me + CHR_BLOCK_ID) : 0, have ? "" : "(none) ", p[0], p[1], p[2]);
+    logf("day flow: death restart state: HP %d, downed %u, block %08x, position %s%.1f %.1f %.1f; extra lives: 6999500 %d (82100 %d), "
+         "540155 %d, 6999100 %d, 8970061 %d; night 7515 %d, day 3 7510 %d", hp, me ? (unsigned char)me[0x710] : 0,
+         me ? *(unsigned *)(me + CHR_BLOCK_ID) : 0, have ? "" : "(none) ", p[0], p[1], p[2], me && speffect_on(me, 6999500), bf_flag(82100),
+         me && speffect_on(me, 540155), me && speffect_on(me, 6999100), me && speffect_on(me, 8970061), bf_flag(7515), bf_flag(7510));
     if (hp > 0) {  // not a death: the game's own state, unchanged
         ((void (*)(long long *, void *))(g_base + 0x5c38f0))(ev, sm);
         return;
     }
     if (g_df_ended) return;
+    if (g_join != 4 && df_extra_life(me, 1)) {  // the host (or solo): the life goes, the game's own revive (a level less)
+        logf("day flow: not the final death: the game's death restart revives (an extra life used)");
+        ((void (*)(long long *, void *))(g_base + 0x5c38f0))(ev, sm);
+        return;
+    }
     g_df_ended = 1;
     if (g_join == 4 && g_as_ally) {
         logf("day flow: final death (the game's death restart, ally): home instead of the revive");
         join_over("ally's final death");
     } else if (g_join != 4) {
-        ((void (*)(void))(g_base + 0x6af8f0))();
+        ((void (*)(void))(g_base + 0x6af900))();
         char *gm = *(char **)(g_base + 0x3c13258);
-        logf("day flow: final death (the game's death restart): expedition end requested (gm+0xaf1 = %u) instead of the revive with a level less",
-             gm ? (unsigned char)gm[0xaf1] : 0);
+        logf("day flow: final death (the game's death restart, no extra life): the game's game over requested (gm+0xaf2 = %u, af1 %u) "
+             "instead of the revive with a level less", gm ? (unsigned char)gm[0xaf2] : 0, gm ? (unsigned char)gm[0xaf1] : 0);
     } else {
         g_df_ended = 0;
         ((void (*)(long long *, void *))(g_base + 0x5c38f0))(ev, sm);  // an invader: the game's own way
