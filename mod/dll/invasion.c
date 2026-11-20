@@ -67,7 +67,7 @@ static const char *const KEY_LINES[] = {
     "host: session up", "host: expedition reached", "host: expedition over", "host: member admitted", "role: ",
     "host: no member left", "leave done", "join: search started", "joining lobby", "join -> ", "stopping (",
     "in the host's world", "world sync at step", "invasion won", "invasion lost", "invasion neither", "level: ", "map test", "two-regions", "expedition: result", "reward test: won", "reward test: lost", "extra life", "game over requested", "the game's result",
-    "expedition end requested", "flags: ", "lag: ", "move check: ", "map pin: ", "name tag: ", "scaling: ", "version: ", "counts overlay: ", "capacity: ", "slot: ", "map test",  "still down", "watchdog", "no map load", "went back", "code patch", "crash"};
+    "expedition end requested", "flags: ", "lag: ", "move check: ", "map pin: ", "name tag: ", "scaling: ", "version: ", "counts overlay: ", "capacity: ", "slot: ", "map test",  "still down", "watchdog", "no map load", "went back", "code patch", "crash", "small-base registry"};
 static void logf(const char *fmt, ...) {
     char line[1024];
     va_list ap;
@@ -6995,6 +6995,7 @@ static void step_hook(void *ctrl, void *time, int step) {
     no_sprint_frame();
     g_in_exped = step == QM_STEP_INGAME || g_join_in_world();
     night_hide_frame(g_in_exped);
+    df_sb_registry_frame(g_in_exped);
     day_flow_frame(g_in_exped);
     if (step == QM_STEP_INGAME || g_join_in_world()) invader_notice_frame();
     summon_kill_reward();

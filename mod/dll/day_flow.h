@@ -325,6 +325,70 @@ static void df_bases_check(void) {
     logf("small bases: pattern %u: %d of %d sites with their point not known now (player block %08x):%s", pat, missing, all,
          me ? *(unsigned *)(me + CHR_BLOCK_ID) : 0, missing ? line : " none");
 }
+// Diagnostic for the crash at world teardown (deck-run3b, deck-run4: 0x14214e298 from 0x1406420d9): the
+// WorldGridAreaInfo destructor 0x140641f70 fires DL_PANIC "WorldGridAreaInfo::m_smallBaseBlocks" (leak) when its
+// small-base multimap is not empty (+0xd0 head, +0xd8 size; node +0x20 key, +0x28 entry, entry[0] the small base's
+// block info, +8 its block id). Entries come only from 0x1406427b0 (the tile loader's MSB pass, at state 2 -> 3) and
+// go per key in 0x140645db0, called with a tile's block info (+0x28 its grid area, +0x34 the key) at its unload (state
+// 5) and in the WorldBlockResBase destructor 0x1406270f0, which runs for every resident tile (world +0x8870, 0x510
+// each, count +0x8868; +8 the block info, +0x38 the state) before the grid areas (0x140683d30). So an entry whose key
+// no resident tile of that grid area has is never erased: such "orphans" are logged with their small base and key, on
+// every change, so the line before a crash names the one left (world = [0x143c123f8] +0x10, grid areas +0x20, 0xe0
+// each, count +0x18).
+static void df_sb_registry_frame(int in_world) {
+    static DWORD next;
+    static unsigned last_sig = 0xffffffff;
+    static int was_in = -1;
+    if (in_world != was_in) was_in = in_world, last_sig = 0xffffffff;  // the state at each change is logged
+    if (in_world && (int)(GetTickCount() - next) < 0) return;
+    next = GetTickCount() + 5000;
+    char *mgr = *(char **)(g_base + 0x3c123f8), *w = mgr && !IsBadReadPtr(mgr + 0x10, 8) ? *(char **)(mgr + 0x10) : NULL;
+    if (!w || IsBadReadPtr(w, 0x8878)) return;
+    int areas = *(int *)(w + 0x18), nres = *(int *)(w + 0x8868);
+    char *ga = *(char **)(w + 0x20), *res = *(char **)(w + 0x8870);
+    if (areas <= 0 || areas > 10 || !ga || IsBadReadPtr(ga, areas * 0xe0) || nres < 0 || nres > 128 || (nres && IsBadReadPtr(res, nres * 0x510))) return;
+    char line[700];
+    int at = 0, total = 0, orphans = 0;
+    unsigned sig = 0;
+    for (int a = 0; a < areas; a++) {
+        char *ai = ga + a * 0xe0, *head = *(char **)(ai + 0xd0);
+        if (!head || IsBadReadPtr(head, 0x30)) continue;
+        int guard = 0;
+        for (char *n = *(char **)head; n && n != head && guard < 512; guard++) {  // in order: from the leftmost
+            if (IsBadReadPtr(n, 0x30)) break;
+            unsigned key = *(unsigned *)(n + 0x20);
+            char **e = *(char ***)(n + 0x28), *sb = e && !IsBadReadPtr(e, 8) ? *e : NULL;
+            unsigned sb_id = sb && !IsBadReadPtr(sb + 8, 4) ? *(unsigned *)(sb + 8) : 0;
+            int st = -1, other = 0;
+            for (int r = 0; r < nres; r++) {
+                char *bi = *(char **)(res + r * 0x510 + 8);
+                if (!bi || IsBadReadPtr(bi, 0x38) || *(unsigned *)(bi + 0x34) != key) continue;
+                if (*(char **)(bi + 0x28) == ai) st = *(int *)(res + r * 0x510 + 0x38);
+                else other = 1;
+            }
+            total++;
+            if (st < 0) {
+                orphans++, sig = sig * 31 + key + sb_id;
+                if (at < 620)
+                    at += snprintf(line + at, sizeof line - (size_t)at, " [area %d key %08x small base %08x%s]", a, key, sb_id,
+                                   other ? ", key resident in another grid area" : "");
+            }
+            if (*(char *)(*(char **)(n + 0x10) + 0x19) == 0) {  // successor: the right subtree's leftmost
+                n = *(char **)(n + 0x10);
+                while (*(char *)(*(char **)n + 0x19) == 0) n = *(char **)n;
+            } else {  // or up while we come from the right
+                char *p = *(char **)(n + 8);
+                while (*(char *)(p + 0x19) == 0 && n == *(char **)(p + 0x10)) n = p, p = *(char **)(p + 8);
+                n = p;
+            }
+        }
+    }
+    sig = sig * 31 + (unsigned)orphans;
+    if (sig == last_sig) return;
+    last_sig = sig;
+    logf("small-base registry (%s): %d entries in %d grid area(s), %d resident tile(s); %d with no resident tile of their key (never erased: the teardown leak check fires on them)%s",
+         in_world ? "in the world" : "out of the world", total, areas, nres, orphans, orphans ? line : "");
+}
 // The game's own way to an unloaded spot: the death restart (CS::CSLuaEventScriptImitation::CSDeathRestartEvent,
 // 0x1405c38f0 -> states 0x1405c3670 / 0x1405c37b0 / 0x1405c4360) asks the world for the respawn block when it is not
 // loaded (0x140639150(mgr [0x143c123f8], &block) false): 0x140639760(mgr, &block, &pos, &rot) with the default
