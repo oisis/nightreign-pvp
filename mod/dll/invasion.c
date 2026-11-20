@@ -1166,6 +1166,7 @@ static int g_as_ally;                       // joiner: this join is as an ally
 // gathered over our Steam lobby instead of FromSoftware's matchmaking. Phases below (party code).
 enum { PARTY_OFF, PARTY_PENDING, PARTY_GUEST_WAIT, PARTY_HOST_CREATE, PARTY_HOST_STARTED, PARTY_GUEST };
 static int g_party, g_party_host, g_party_guest;
+static int g_party_waited;  // guest: it waited in the hub for the host's go (an early summon, it starts with the host)
 static char g_party_code[16];  // the pool key: "p" + hash of base, game version, protocol, password, test salt
 static unsigned long long g_party_old_lobby;  // our own last lobby: never taken for another host's
 static unsigned long long g_party_lowest;  // the lowest-id lobby with our key in the last party search (not ours)
@@ -2316,6 +2317,7 @@ static int boss_death(unsigned id) {
 static void df_kill(unsigned id);
 static void df_chr_pass_hook(char *chr);
 static void df_death_restart_install(void);
+static void summon_at_host_install(void);
 static void flag_note(char *man, unsigned id, int on, int before) {
     (void)man;
     if (on && before == 0 && id >= 10000000u && boss_death(id)) df_kill(id);
@@ -3256,6 +3258,7 @@ static void hook_acceptance(void) {
         flask_log_install();
         hook_call(0x5186ac, 0x3c7e50, (void *)df_chr_pass_hook, "day flow: enemy tiers (correction re-apply pass)");
         df_death_restart_install();
+        summon_at_host_install();
         pkt_guard_install();
         hook_call(0xba0e42, 0xddb9c0, (void *)pin_read_73, "map pin: pin packet read (1)");
         hook_call(0xba11aa, 0xddb9c0, (void *)pin_read_73, "map pin: pin packet read (2)");
@@ -5048,8 +5051,10 @@ static void level_restore(void) {
         *(int *)(pd + 0x10c) = g_own_top_level;
     logf("level: restore done (own level %d, highest level %d)", g_own_level, g_own_top_level);
 }
+static void summon_at_host_off(const char *why);
 static void join_over(const char *why) {
     level_restore();
+    summon_at_host_off(why);
     g_ver_notice_armed = 1;  // back in the hub: the version notice may show once more
     if (g_as_ally) {  // the ally's gold look (row 90071611) has no time limit: it goes when our part ends
         char *me = local_player();
@@ -6348,6 +6353,7 @@ static void party_frame(char *ctrl) {
         if (c && party_lobby_go(c)) {  // the host is in its expedition's field map: join it as an ally
             join_test_start();
             g_candidate = c, g_as_ally = 1, g_searching = 1;
+            g_party_waited = g_party == PARTY_GUEST_WAIT;
             g_party = PARTY_GUEST, g_party_guest = 1;
             logf("party: the host (lobby %llu) is in the field: joining as its squad's ally", c);
         } else if (c) {
@@ -6585,6 +6591,148 @@ static void toggle_search(const char *where) {
     logf("invasion: search %s (%s)", g_searching ? "started" : "called off", where);
 }
 
+// Late summon at the host (owner, 2026-11-20: an ally joining an expedition already in the field appears next to the
+// host, not on the hawk at the start; moving him after the landing was rejected). The game's own return-after-
+// disconnect entry is used, pointed at the host. What was read:
+//  - rejoin mode gm+0xc96: setter 0x1406b0570, getter 0x1406aeaf0. MoveMapStep's constructor 0x140c2fc30 builds
+//    CS::RejoinMapEnterStep at +0x270 when it is set (and then PlayerGameData+0x871 = 0, Setup_Pre 0x140c3fb50 /
+//    Setup_PostApply 0x140c3fa10: flags 9015 / 9018 read, 9016 written). The map request 0x140c27870 in rejoin mode
+//    with gm+0xaac loads the start point's block (gm+0xb60, 0x140e80ad0), as without it. HorseWait 0x140c347d0 calls
+//    the step's start 0x140c3ee60(step, &MoveMapStep+0xdc) at 0x140c34e87 and, for a field block, clears gm+0xc96
+//    itself (0x1406b0570(0)); the step then runs every frame from 0x140c35830 (vt+0xc0).
+//  - start: a field block gives +0xac = -1, step 2 Branch_DyingOrRespawn 0x140c3f0f0: +0xc2 bit0 (flag 9015, "was
+//    dying") stays put (step 5), else step 3 RespawnEnter 0x140c3f230: the death penalty 0x140729200(gdm, 0) at
+//    0x140c3f2da (StablizeWarp 0x140c3f460 calls it at 0x140c3f4e0 instead when +0xc2 bit1, block 0x0c000000 only),
+//    the respawn point 0x140ba2b80 at 0x140c3f326 (respawn manager *(0x143c17c88): block +0x18, position +0x20,
+//    rotation +0x30, +0x40 = these are valid, read back by 0x140ba2f30 / 0x140ba2f40), the rotation towards the death
+//    box 0x140728b00 when +0xc1 == 0, then the warp queue 0x140639760(*(0x143c123f8), &block, &pos, &rot), applied by
+//    0x140638d50 (block load, then the setter 0x1403daa70). StablizeWarp then, with +0xc1 == 0, places a bloodstain
+//    from the death record (0x14072b070: 0x1401fe500, packet 0x7c); with +0xc1 == 1 it clears it (0x140729110:
+//    0x140203d40(0) = record +0x29 off, 0x14072b1f0). Wait_PlayEnterAnim 0x140c3f660 ends the entry (gm+0xc5e = 0,
+//    which the start set to 1 with 0x1406b0580), Wait_LevelDownTextEffect 0x140c3f5e0 shows text 0xc23 only when
+//    SessionInfo+0xe7, which the penalty sets when it took a level.
+//  - the game's "next to a teammate" placement 0x140c3fc80 refuses any block but the four final-boss maps (its first
+//    test), so it is not used; the host's own position is written into the respawn manager instead. Frame: 0x140c3fc80
+//    feeds the getter 0x1403d0e60 (0x14039bd50, the same as 0x1403d0fd0 behind nrpvp_pos) straight into 0x140639760,
+//    while block-local points go through 0x140631530 first: so nrpvp_pos is in the frame the warp takes.
+// Here: only for a late summon (an ally that did not wait in the hub for the host's go), with the host's block and
+// position in its lobby. The three call sites above are taken over only while this entry runs (g_sah >= 2); they
+// belong to RejoinMapEnterStep alone (the death restart 0x1405c38f0 calls 0x140729200 / 0x140ba2b80 at its own sites).
+// Anything missing: the expedition's start on the hawk, as before.
+#define SAH_SIDE_M 2.0f  // beside the host, along x
+#define SAH_UP_M   1.0f  // above his feet, with the no-fall-damage SpEffect 90071613 (launcher row, 15 s)
+static int g_sah;        // 0 off, 1 rejoin mode set, 2 rejoin entry started, 3 respawn point written
+static unsigned g_sah_block;
+static float g_sah_host[3];
+static int summon_at_host_decide(void) {
+    if (!g_as_ally) return 0;  // an invader: the start on the hawk (decision 15)
+    if (g_party_waited) return logf("summon at host: early summon (waited in the hub for the host's go): the start on the hawk"), 0;
+    const char *b = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_BLOCK_KEY), *p = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_POS_KEY);
+    char *end = NULL;
+    unsigned block = b && *b ? (unsigned)strtoul(b, &end, 16) : 0;
+    float v[3];
+    if (!end || *end || block == 0 || block == 0xffffffff || block >> 24 != 0x3c || !p || sscanf(p, "%f,%f,%f", &v[0], &v[1], &v[2]) != 3) {
+        logf("summon at host: late summon, but the host's lobby has no usable field block / position ('%s' / '%s'): the start on the hawk",
+             b ? b : "", p ? p : "");
+        return 0;
+    }
+    g_sah_block = block, memcpy(g_sah_host, v, sizeof v);
+    logf("summon at host: late summon: the host is in block %08x at %.1f %.1f %.1f (its lobby): entering through the game's rejoin",
+         block, v[0], v[1], v[2]);
+    return 1;
+}
+static void summon_at_host_arm(void) {
+    ((void (*)(unsigned char))(g_base + 0x6b0570))(1);
+    g_sah = 1;
+    char *info = *(char **)(g_base + RVA_SESSION_INFO);
+    // HorseWait starts the entry unless SessionInfo+0x164 (0x1401fe1d0) is 0x0c000000 or a final-boss map (0x140c34de7)
+    logf("summon at host: rejoin mode gm+0xc96 set (0x6b0570), getter 0x6aeaf0 says %u; previous map (SessionInfo+0x164) %08x",
+         ((unsigned char (*)(void))(g_base + 0x6aeaf0))(), info ? *(unsigned *)(info + 0x164) : 0);
+}
+static void summon_at_host_off(const char *why) {
+    if (!g_sah) return;
+    char *gm = *(char **)(g_base + RVA_GAME_MAN_PTR);
+    if (gm && gm[0xc96]) ((void (*)(unsigned char))(g_base + 0x6b0570))(0);
+    logf("summon at host: off (%s) at stage %d; rejoin mode now %u", why, g_sah, gm ? (unsigned char)gm[0xc96] : 0);
+    g_sah = 0;
+}
+// 0x140c34e87: RejoinMapEnterStep start (step, &block)
+static void sah_rejoin_start(char *step, int *block) {
+    int ours = g_sah == 1;
+    if (ours) {
+        logf("summon at host: rejoin entry starts for block %08x; +c2 %02x (bit0 'was dying' %s), +a9 %02x", (unsigned)*block,
+             (unsigned char)step[0xc2], step[0xc2] & 1 ? "set: cleared, so the respawn branch runs" : "clear", (unsigned char)step[0xa9]);
+        step[0xc2] &= ~1;
+    }
+    ((void (*)(char *, int *))(g_base + 0xc3ee60))(step, block);
+    if (!ours) return;
+    step[0xc1] = 1;  // no death here: StablizeWarp clears the death record (0x140729110) instead of a bloodstain
+    g_sah = 2;
+    logf("summon at host: branch: +ac %08x (%s), +c2 %02x, enter anim %d, +c1 set to 1", *(unsigned *)(step + 0xac),
+         *(int *)(step + 0xac) == -1 ? "field: Branch_DyingOrRespawn -> RespawnEnter" : "final-boss block: teammate placement, not ours",
+         (unsigned char)step[0xc2], *(int *)(step + 0xb0));
+}
+// 0x140c3f326: RespawnEnter's respawn point (respawn manager)
+static void sah_respawn_point(char *rp) {
+    ((void (*)(char *))(g_base + 0xba2b80))(rp);
+    if (g_sah != 2 || !rp) return;
+    logf("summon at host: the game's respawn point: valid %u block %08x pos %.1f %.1f %.1f", (unsigned char)rp[0x40], *(unsigned *)(rp + 0x18),
+         *(float *)(rp + 0x20), *(float *)(rp + 0x24), *(float *)(rp + 0x28));
+    {  // the host's latest block / position (its lobby is rewritten every few seconds while it moves)
+        const char *b = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_BLOCK_KEY), *p = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_POS_KEY);
+        char *end = NULL;
+        unsigned block = b && *b ? (unsigned)strtoul(b, &end, 16) : 0;
+        float v[3];
+        if (end && !*end && block >> 24 == 0x3c && p && sscanf(p, "%f,%f,%f", &v[0], &v[1], &v[2]) == 3)
+            g_sah_block = block, memcpy(g_sah_host, v, sizeof v);
+        logf("summon at host: host now in block %08x at %.1f %.1f %.1f (its lobby '%s' / '%s')", g_sah_block, g_sah_host[0], g_sah_host[1],
+             g_sah_host[2], b ? b : "", p ? p : "");
+    }
+    float pos[4] = {g_sah_host[0] + SAH_SIDE_M, g_sah_host[1] + SAH_UP_M, g_sah_host[2], 1.0f};
+    *(unsigned *)(rp + 0x18) = g_sah_block;
+    memcpy(rp + 0x20, pos, 16);
+    memcpy(rp + 0x30, g_base + 0x46a9490, 16);  // the default rotation 0x140ba2f40 falls back on
+    rp[0x40] = 1;
+    char *me = local_player();
+    if (me) ((void (*)(void *, int, unsigned char))(g_base + RVA_ADD_SPEFFECT))(me, 90071613, 0);
+    g_sah = 3;
+    logf("summon at host: respawn point written: block %08x pos %.1f %.1f %.1f (host + %.0f m x, + %.0f m up), no-fall-damage %s",
+         g_sah_block, pos[0], pos[1], pos[2], SAH_SIDE_M, SAH_UP_M, me ? "on" : "(no player)");
+}
+// 0x140c3f2da / 0x140c3f4e0: the death penalty in RespawnEnter / StablizeWarp
+static void sah_penalty(char *gdm, char arg) {
+    if (g_sah < 2) return ((void (*)(char *, char))(g_base + 0x729200))(gdm, arg);
+    char *info = *(char **)(g_base + RVA_SESSION_INFO);
+    if (info && info[0xe7]) info[0xe7] = 0;  // no level-down text (0xc23) either
+    logf("summon at host: death penalty 0x729200 skipped (no level lost, no runes dropped); level-down text off");
+}
+static void summon_at_host_install(void) {
+    hook_call(0xc34e87, 0xc3ee60, (void *)sah_rejoin_start, "summon at host: rejoin entry start");
+    hook_call(0xc3f326, 0xba2b80, (void *)sah_respawn_point, "summon at host: respawn point");
+    hook_call(0xc3f2da, 0x729200, (void *)sah_penalty, "summon at host: penalty (RespawnEnter)");
+    hook_call(0xc3f4e0, 0x729200, (void *)sah_penalty, "summon at host: penalty (StablizeWarp)");
+}
+// Every frame: the entry is over when gm+0xc5e is back at 0 (Wait_PlayEnterAnim); where we stand against the host.
+static void summon_at_host_frame(void) {
+    char *gm = *(char **)(g_base + RVA_GAME_MAN_PTR);
+    if (g_sah == 1 && gm && !gm[0xc96]) {  // HorseWait cleared it without starting our entry (its other branch)
+        logf("summon at host: rejoin mode was cleared before the rejoin entry started: the game's own placement");
+        g_sah = 0;
+    }
+    if (g_sah < 2 || !gm || gm[0xc5e]) return;
+    float p[3], h[3];
+    unsigned block;
+    const char *hp = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_POS_KEY);
+    if (!hp || sscanf(hp, "%f,%f,%f", &h[0], &h[1], &h[2]) != 3) memcpy(h, g_sah_host, sizeof h);
+    if (player_position(p, &block)) {
+        float dx = p[0] - h[0], dy = p[1] - h[1], dz = p[2] - h[2];
+        logf("summon at host: entry done (stage %d): we are in block %08x at %.1f %.1f %.1f; host %.1f %.1f %.1f: %.1f m apart%s", g_sah,
+             block, p[0], p[1], p[2], h[0], h[1], h[2], __builtin_sqrtf(dx * dx + dy * dy + dz * dz),
+             g_sah < 3 ? " (the respawn point was not written: the game's own place)" : "");
+    } else logf("summon at host: entry done (stage %d), no local player position", g_sah);
+    g_sah = 0;
+}
+
 // Every step of the machine runs through here (step: its index in the table).
 // With one player a request moves the machine to SingleStart at once, and an Invasion request is
 // stopped there. With more players the machine stays idle offline (the game waits for its own
@@ -6636,6 +6784,8 @@ static int move_force(char *ctrl) {
     // The expedition's start block (as a solo start uses, with +0xaac 1 and reason -14), so the game
     // places the player at the expedition's start; the host's current block only if that key is absent.
     const char *text = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_START_KEY);
+    int at_host = summon_at_host_decide();
+    if (at_host) text = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_BLOCK_KEY);  // the map the host is in now
     if (!text || !*text) {
         logf("move test: the host's lobby has no %s, using %s", LOBBY_START_KEY, LOBBY_BLOCK_KEY);
         text = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_BLOCK_KEY);
@@ -6685,7 +6835,8 @@ static int move_force(char *ctrl) {
     // context's vt+8 (0xb44630: reason -14 = 0xfffffff2 at +0x1c, type 14 at +0x20, +0x18 = 1 when the
     // context is not a rejoin) and applies them with 0x740110, which passes the reason to 0x6b0520.
     ((void (*)(int))(g_base + RVA_SET_PENDING_REASON))(-14);
-    pending_log("after (start block from the host's lobby)");
+    pending_log(at_host ? "after (the host's current block, late summon)" : "after (start block from the host's lobby)");
+    if (at_host) summon_at_host_arm();
     char *ctx = *(char **)(ctrl + 0xa8);
     if (!ctx || *(char **)ctx != g_base + RVA_QM_CTX_VTABLE) {
         join_over("move test: controller context not as expected");
@@ -6799,6 +6950,7 @@ static void step_hook(void *ctrl, void *time, int step) {
     day_flow_frame(g_in_exped);
     if (step == QM_STEP_INGAME || g_join_in_world()) invader_notice_frame();
     summon_kill_reward();
+    summon_at_host_frame();
     crash_watch_members();
     squad_count_tick();
     counts_tick();
