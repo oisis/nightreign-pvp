@@ -39,7 +39,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 36
+#define BUILD_FORMAT 37
 #define BOSS_DEATHS_MIN 100  // the game (1.3.3) has 158 such flags; fewer = its event scripts changed
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
@@ -3236,6 +3236,74 @@ static int build_boss_deaths(const char *game_dir, buf bhd, const char *bdt) {
     return ok ? have : -1;
 }
 
+// The fire ring: the circle that closes around the arena after the challenge (its border effect 807011, and 807800 on
+// a player outside it: SpEffect 99810 / 99811 -> 99871 / 99876 -> SpEffectVfx 200050) is blue in the game. Its
+// textures are grey, the blue is only in the effects' colour floats, so those are rewritten in place (sizes stay the
+// same): each blue colour gets a fire hue (45 - 37 * saturation degrees: pale -> yellow-orange, deep -> red; bloom 38,
+// yellow-orange), its brightest channel and alpha kept, saturation raised to 1 - (1 - s)^2. 807800's white bloom too.
+// Each entry: offset in the .fxr, the game's value, ours. A file whose values differ (a game update) is left as it is.
+static const u32 FIRE_807011[][3] = {
+    {0x3b3c, 0x3f3fbfc0, 0x3f800000}, {0x3b40, 0x3f4acacb, 0x3f52836a}, {0x3b44, 0x3f800000, 0x3f0f9fb0}, {0x3b4c, 0x3f3fbfc0, 0x3f800000},
+    {0x3b50, 0x3f4acacb, 0x3f52836a}, {0x3b54, 0x3f800000, 0x3f0f9fb0}, {0x3b64, 0x3f3fbfc0, 0x3f800000}, {0x3b68, 0x3f4acacb, 0x3f52836a},
+    {0x3b6c, 0x3f800000, 0x3f0f9fb0}, {0x3b74, 0x3f3fbfc0, 0x3f800000}, {0x3b78, 0x3f4acacb, 0x3f52836a}, {0x3b7c, 0x3f800000, 0x3f0f9fb0},
+    {0x3be4, 0x3e800000, 0x3f800000}, {0x3be8, 0x3f000000, 0x3f280000}, {0x3bec, 0x3f800000, 0x3d800000}, {0x3ccc, 0x3e808081, 0x3f800000},
+    {0x3cd0, 0x3ec0c0c1, 0x3eaa781f}, {0x3cd4, 0x3f800000, 0x3d810183}, {0x3cdc, 0x3f008081, 0x3f800000}, {0x3ce0, 0x3f3fbfc0, 0x3f154ff7},
+    {0x3ce4, 0x3f800000, 0x3e810183}, {0x3cfc, 0x3f008081, 0x3f800000}, {0x3d00, 0x3f3fbfc0, 0x3f154ff7}, {0x3d04, 0x3f800000, 0x3e810183},
+    {0x3d0c, 0x3eda740e, 0x3f800000}, {0x3d10, 0x3f232323, 0x3f019e15}, {0x3d14, 0x3f800000, 0x3e3a69dc}, {0x3d1c, 0x3ec0c0c2, 0x3f800000},
+    {0x3d20, 0x3f101010, 0x3ee92cba}, {0x3d24, 0x3f800000, 0x3e1121b4}, {0x3d2c, 0x3e808081, 0x3f800000}, {0x3d30, 0x3ec0c0c1, 0x3eaa781f},
+    {0x3d34, 0x3f800000, 0x3d810183}, {0x3f30, 0x3f008081, 0x3f800000}, {0x3f34, 0x3f3fbfc0, 0x3f154ff7}, {0x3f38, 0x3f800000, 0x3e810183},
+    {0x3f74, 0x3e800000, 0x3f800000}, {0x3f78, 0x3f000000, 0x3f280000}, {0x3f7c, 0x3f800000, 0x3d800000}, {0x4010, 0x3e808081, 0x3f800000},
+    {0x4014, 0x3ec0c0c1, 0x3eaa781f}, {0x4018, 0x3f800000, 0x3d810183}, {0x4020, 0x3f008081, 0x3f800000}, {0x4024, 0x3f3fbfc0, 0x3f154ff7},
+    {0x4028, 0x3f800000, 0x3e810183}, {0x4038, 0x3f008081, 0x3f800000}, {0x403c, 0x3f3fbfc0, 0x3f154ff7}, {0x4040, 0x3f800000, 0x3e810183},
+    {0x4048, 0x3e808081, 0x3f800000}, {0x404c, 0x3ec0c0c1, 0x3eaa781f}, {0x4050, 0x3f800000, 0x3d810183}, {0x40c4, 0x3e808081, 0x3f800000},
+    {0x40c8, 0x3ec0c0c1, 0x3eaa781f}, {0x40cc, 0x3f800000, 0x3d810183}, {0x40d4, 0x3f008081, 0x3f800000}, {0x40d8, 0x3f3fbfc0, 0x3f154ff7},
+    {0x40dc, 0x3f800000, 0x3e810183}, {0x40ec, 0x3f008081, 0x3f800000}, {0x40f0, 0x3f3fbfc0, 0x3f154ff7}, {0x40f4, 0x3f800000, 0x3e810183},
+    {0x40fc, 0x3e808081, 0x3f800000}, {0x4100, 0x3ec0c0c1, 0x3eaa781f}, {0x4104, 0x3f800000, 0x3d810183}, {0x422c, 0x3f3fbfc0, 0x3f800000},
+    {0x4230, 0x3f4acacb, 0x3f52836a}, {0x4234, 0x3f800000, 0x3f0f9fb0}, {0x423c, 0x3f3fbfc0, 0x3f800000}, {0x4240, 0x3f4acacb, 0x3f52836a},
+    {0x4244, 0x3f800000, 0x3f0f9fb0}, {0x4254, 0x3f3fbfc0, 0x3f800000}, {0x4258, 0x3f4acacb, 0x3f52836a}, {0x425c, 0x3f800000, 0x3f0f9fb0},
+    {0x4264, 0x3f3fbfc0, 0x3f800000}, {0x4268, 0x3f4acacb, 0x3f52836a}, {0x426c, 0x3f800000, 0x3f0f9fb0}, {0x42d4, 0x3e800000, 0x3f800000},
+    {0x42d8, 0x3f000000, 0x3f280000}, {0x42dc, 0x3f800000, 0x3d800000}, {0x43f4, 0x3e808081, 0x3f800000}, {0x43f8, 0x3ec0c0c1, 0x3eaa781f},
+    {0x43fc, 0x3f800000, 0x3d810183}, {0x4404, 0x3f008081, 0x3f800000}, {0x4408, 0x3f3fbfc0, 0x3f154ff7}, {0x440c, 0x3f800000, 0x3e810183},
+    {0x4424, 0x3f008081, 0x3f800000}, {0x4428, 0x3f3fbfc0, 0x3f154ff7}, {0x442c, 0x3f800000, 0x3e810183}, {0x4434, 0x3ed62b82, 0x3f800000},
+    {0x4438, 0x3f1ff54b, 0x3efedf0f}, {0x443c, 0x3f800000, 0x3e332cc5}, {0x4444, 0x3eab5601, 0x3f800000}, {0x4448, 0x3f002ad6, 0x3ed3c876},
+    {0x444c, 0x3f800000, 0x3de55804}, {0x4454, 0x3e808081, 0x3f800000}, {0x4458, 0x3ec0c0c1, 0x3eaa781f}, {0x445c, 0x3f800000, 0x3d810183},
+};
+static const u32 FIRE_807800[][3] = {
+    {0x40d0, 0x3f800000, 0x3f39999a}, {0x40d4, 0x3f800000, 0x3e800000}, {0x41c8, 0x3ef8f8f9, 0x3f6bebec}, {0x41cc, 0x3f09898a, 0x3f0fc6f9},
+    {0x41d0, 0x3f6bebec, 0x3e835f6c}, {0x4474, 0x3f800000, 0x3f39999a}, {0x4478, 0x3f800000, 0x3e800000}, {0x456c, 0x3ef8f8f9, 0x3f6bebec},
+    {0x4570, 0x3f09898a, 0x3f0fc6f9}, {0x4574, 0x3f6bebec, 0x3e835f6c}, {0x4814, 0x3e4ccccd, 0x3f800000}, {0x4818, 0x3e4ccccd, 0x3f25e354},
+    {0x481c, 0x3f800000, 0x3d23d70b}, {0x4910, 0x3d20a0a1, 0x3e48c8c9}, {0x4914, 0x3d20a0a1, 0x3d6604bd}, {0x4918, 0x3e48c8c9, 0x3c008081},
+};
+static void build_fire_ring(const char *game_dir, buf bhd, const char *bdt) {
+    static const struct { const char *name; const u32 (*w)[3]; int n; } FX[] = {
+        {"\\f000807011.fxr", FIRE_807011, sizeof FIRE_807011 / sizeof *FIRE_807011},
+        {"\\f000807800.fxr", FIRE_807800, sizeof FIRE_807800 / sizeof *FIRE_807800}};
+    char path[1300];
+    snprintf(path, sizeof path, "%s" SEP "work" SEP "build" SEP "sfx" SEP "sfxbnd_commoneffects.ffxbnd.dcx", g_app);
+    remove(path);  // the last build's, in case nothing is changed this time
+    buf dcx = archive_read(bhd, bdt, "/sfx/sfxbnd_commoneffects.ffxbnd.dcx");
+    buf bnd = dcx.p ? dcx_read(game_dir, dcx) : dcx;
+    free(dcx.p);
+    int done = 0;
+    for (size_t k = 0; bnd.p && k < sizeof FX / sizeof *FX; k++) {
+        int i = bnd4_find(bnd, FX[k].name), ok = i >= 0;
+        buf f = ok ? bnd4_file(bnd, i) : bnd;
+        for (int j = 0; ok && j < FX[k].n; j++) ok = FX[k].w[j][0] + 4 <= f.n && rd32(f.p + FX[k].w[j][0]) == FX[k].w[j][1];
+        for (int j = 0; ok && j < FX[k].n; j++) wr32(f.p + FX[k].w[j][0], FX[k].w[j][2]);
+        if (ok) done++;
+        else logf_("Fire ring: %s not as expected (game update?), left blue", FX[k].name + 1);
+    }
+    if (!bnd.p) logf_("Fire ring: the game's common effects not found, left blue");
+    if (done) {
+        buf out = dcx_write(bnd);
+        free(bnd.p), bnd.p = NULL;  // the unpacked archive is large (316 MB)
+        int written = write_file(path, out.p, out.n);
+        logf_("Fire ring: %d of 2 effects recoloured (%zu bytes)%s", done, out.n, written ? "" : ", file NOT written");
+        free(out.p);
+    }
+    free(bnd.p);
+}
+
 int core_build(const char *game_dir) {
     char bhd_path[1100], bdt_path[1100], from[1300], to[1300];
     if (!core_check_game(game_dir)) return logf_("This is not the game's folder: %s", game_dir), 0;
@@ -3303,6 +3371,7 @@ int core_build(const char *game_dir) {
         ok = 0, logf_("The game's event scripts look different than expected (too few boss deaths). The game may have been updated; the mod needs an update too.");
     if (ok && !build_camp_scripts(game_dir, bhd, bdt_path))
         ok = 0, logf_("The game's camp scripts look different than expected. The game may have been updated; the mod needs an update too.");
+    if (ok) build_fire_ring(game_dir, bhd, bdt_path);
     free(bhd.p);
     if (ok && two_pair()->halves) ok = build_pair_half(game_dir);
     if (!ok) return 0;
