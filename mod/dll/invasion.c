@@ -1174,6 +1174,7 @@ static int g_in_expedition;
 static void party_host_over(void);
 #define LOBBY_PARTY_KEY "nrpvp_party"   // a gathering host's party code
 #define LOBBY_HP_KEY    "nrpvp_hp"      // the host's HP flask charges (+0xff), once its start value is final
+#define LOBBY_OVER_KEY  "nrpvp_over"    // "1": the host's final death (no extra life left: the game over is requested)
 #define ALLY_FLASK_CUT  2                // an ally's charges at arrival = max(ALLY_FLASK_MIN, host's - this)
 #define ALLY_FLASK_MIN  3                // owner, 2026-11-17: a summon never has fewer than 3 HP charges
 #define LOBBY_GO_KEY    "nrpvp_go"      // "1" once the host's expedition is generated (start block, generator results final)
@@ -1186,6 +1187,8 @@ static int member_no_is_invader(int no);    // a remote session member with this
 #define REWARD_MURK_MIN 100    // owner, 2026-11-19: every expedition gives at least this much murk
 #define REWARD_MURK_LOST 1000  // a lost invasion (decision 23, updated): the reward screen always has content
 static int g_host_killed, g_reward_pending;  // decision 23, defined with join_over
+static int g_host_down;  // invader: the host died (downed state 1 -> 0); a win only once its death is final (LOBBY_OVER_KEY)
+static void lobby_set(const char *key, const char *value);
 static int g_host_player_no = -1;  // invader: the session host's player number (member +0xd4), -1 unknown
 static char *g_hud_invaders[4];
 static unsigned long long pin_read_73(void *a, unsigned long long *sender, void *buf);
@@ -2169,7 +2172,7 @@ static void reward_hook(unsigned long long a1, unsigned a2) {
         return;
     }
     int won = g_reward_pending == 1;
-    g_reward_pending = 0, g_host_killed = 0;
+    g_reward_pending = 0, g_host_killed = 0, g_host_down = 0;
     logf("reward test: game's reward computation skipped; was +0x36c %u +0x36e %u goods %u relics %u (result id %u)",
          *(unsigned short *)(ps + 0x36c), *(unsigned short *)(ps + 0x36e), (unsigned char)ps[0x372], (unsigned char)ps[0x373],
          *(unsigned *)(ps + 0x368));
@@ -4137,9 +4140,13 @@ static void other_down_watch(const char *side) {
         int st = (unsigned char)c[0x710];
         if (chr_[i] != c) chr_[i] = c, last_[i] = st;
         else if (st != last_[i]) {
-            if (last_[i] == 1 && st == 0 && g_invader_in_world() && our_speffect_active(c) != 1) g_host_killed = 1;
+            // an extra life (day flow) revives the host after this death: the invader's win waits for the host's final
+            // death, which the host publishes (LOBBY_OVER_KEY, read in enter_watch)
+            int host_died = last_[i] == 1 && st == 0 && g_invader_in_world() && our_speffect_active(c) != 1;
+            if (host_died) g_host_down = 1;
             logf("finish test (%s): other player %d (%s): downed state %d -> %d%s", side, i,
-                 our_speffect_active(c) == 1 ? "the invader" : "not ours", last_[i], st, last_[i] == 1 && st == 0 ? " (died)" : "");
+                 our_speffect_active(c) == 1 ? "the invader" : "not ours", last_[i], st,
+                 host_died ? " (died; the win only when it is the host's final death)" : last_[i] == 1 && st == 0 ? " (died)" : "");
             last_[i] = st;
         }
     }
@@ -4167,6 +4174,7 @@ static void host_death_watch(void) {
     }
     if (end) {
         ((void (*)(void))(g_base + 0x6af900))();
+        if (g_lobby) lobby_set(LOBBY_OVER_KEY, "1");  // the invader's win (other_down_watch)
         char *gm = *(char **)(g_base + 0x3c13258);
         logf("finish test: the host's final death: the game's game over requested (gm+0xaf2 = %u)", gm ? (unsigned char)gm[0xaf2] : 0);
     }
@@ -4647,6 +4655,7 @@ static void lobby_mark(void) {
         logf("host: session up, Steam lobby %llu (%016llx), type left as the game made it", g_lobby, g_lobby);
         log_pending_state("host");
         lobby_set(LOBBY_MARK_KEY, "1");
+        lobby_set(LOBBY_OVER_KEY, "0");
         lobby_set(LOBBY_PROTO_KEY, LOBBY_PROTO);
         lobby_set(LOBBY_GAME_KEY, LOBBY_GAME);
         lobby_set(LOBBY_VER_KEY, MOD_VERSION);
@@ -5144,14 +5153,15 @@ static void join_over(const char *why) {
                  g_reward_pending == 1 ? REWARD_MURK : REWARD_MURK_LOST);
         }
         {
-            // an ally's own final death is a lost expedition: the game's game over (0x6af900, gm+0xaf2; gm+0xaf1 counts
-            // a clear, day_flow.h); every other ending as before
-            int over = g_as_ally && strstr(why, "final death") != NULL;
-            ((void (*)(void))(g_base + (over ? 0x6af900 : 0x6af8f0)))();
+            // an ally's ending is a lost expedition (owner, 2026-11-20: its own final death, the host closing the session
+            // "no longer a client", the host migration, a watchdog): the game's game over (0x6af900, gm+0xaf2; gm+0xaf1
+            // counts a clear, day_flow.h), unless the game itself already asked for the clear; an invader as before
             char *gm = *(char **)(g_base + 0x3c13258);
+            int over = g_as_ally && !(gm && gm[0xaf1]);
+            ((void (*)(void))(g_base + (over ? 0x6af900 : 0x6af8f0)))();
             logf("move test: expedition end requested (%s: gm+0xaf1 = %u, gm+0xaf2 = %u): back to the Roundtable Hold (%s)",
                  over ? "game over, 0x6af900" : "0x6af8f0", gm ? (unsigned char)gm[0xaf1] : 0, gm ? (unsigned char)gm[0xaf2] : 0,
-                 strstr(why, "died") ? "invader died" : over ? "ally's final death" : "invasion over");
+                 strstr(why, "died") ? "invader died" : over ? "ally: a lost expedition" : g_as_ally ? "ally: the game's clear" : "invasion over");
         }
     } else if (g_move >= 2 && g_qm_ctrl && (g_qm_step == 21 || g_qm_step == 22)) {
         ((void (*)(void *, int))(*(void ***)g_qm_ctrl)[QM_CTRL_VT_SET_STEP])(g_qm_ctrl, QM_STEP_NONE);
@@ -6065,6 +6075,10 @@ static void enter_watch(char *sm) {
         team_log("enter test, 1 s after the team effect");
     }
     if (1 || 1) other_down_watch("invader");
+    if (g_host_down && !g_host_killed && g_candidate) {
+        const char *o = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_OVER_KEY);
+        if (o && *o == '1') g_host_killed = 1, logf("finish test (invader): the host's final death (lobby %s=1): the invasion is won", LOBBY_OVER_KEY);
+    }
     if (1) name_watch(sm, "invader", g_enter_world != 0), slot_hp_watch("invader"), other_downed_watch("invader");
     // finish-test guard: the stand-up was refused and the timer set to 0, but the character is still
     // down 10 s later (the behaviour did not take its death): the invader counts as dead.
@@ -6159,8 +6173,14 @@ static int bf_flag(unsigned id) {
 // is hidden too; when 9019 goes off the ones disabled here are enabled again. A boss = a character of
 // boss-deaths.txt (entity id -> 0x5190c0, the world character manager's lookup), alive (HP +0x140 of [chr +0x1b8] > 0)
 // and enabled. Not done: the map markers (left as they are).
+// Day flow (boss-flow 4): the window starts already at the day's challenge (warp, clock to 23:00), 49 s before 9019
+// (deck-run3: the field bosses stayed up in that time), and takes in the camp invaders (df_night_window,
+// df_invader_entity_at: day_flow.h); world events are not started in it (df_events_frame).
 static unsigned g_hidden[HIDE_MAX];
 static int g_hidden_n, g_hide_on;
+static int df_night_window(void);
+static unsigned df_invader_entity_at(int i);
+static void df_night_events_log(const char *when);
 static char *boss_chr(unsigned ent) {
     char *wcm = *(char **)(g_base + RVA_WORLD_CHR_MAN);
     int e = (int)ent;
@@ -6172,29 +6192,37 @@ static void night_hide_frame(int in_world) {
     static DWORD next;
     if ((int)(GetTickCount() - next) < 0) return;
     next = GetTickCount() + 500;
-    int on = in_world && bf_flag(9019);
+    int f9019 = in_world && bf_flag(9019), on = f9019 || (in_world && df_night_window());
     if (on) {
         int now = 0;
-        for (int i = 0; i < g_hide_n; i++) {
-            char *c = boss_chr(g_hide_ent[i]);
+        char ids[160] = "";
+        if (!g_hide_on) df_night_events_log("the night boss fight starts");
+        for (int i = 0; i < g_hide_n + 16; i++) {
+            unsigned ent = i < g_hide_n ? g_hide_ent[i] : df_invader_entity_at(i - g_hide_n);
+            char *c = ent ? boss_chr(ent) : NULL;
             if (!c || !chr_enabled(c)) continue;
             char **pd = *(char ***)(c + 0x1b8);
             if (!pd || IsBadReadPtr(pd, 8) || !*pd || IsBadReadPtr(*pd, 0x148) || *(int *)(*pd + 0x140) <= 0) continue;
             int known = 0;
-            for (int k = 0; k < g_hidden_n; k++) known |= g_hidden[k] == g_hide_ent[i];
-            if (!known && g_hidden_n < HIDE_MAX) g_hidden[g_hidden_n++] = g_hide_ent[i];
+            for (int k = 0; k < g_hidden_n; k++) known |= g_hidden[k] == ent;
+            if (!known && g_hidden_n < HIDE_MAX) g_hidden[g_hidden_n++] = ent;
             ((char (*)(char *, char))(g_base + 0x608c60))(c, 0);
             now++;
+            size_t n = strlen(ids);
+            snprintf(ids + n, sizeof ids - n, " %u%s", ent, i < g_hide_n ? "" : " (camp invader)");
         }
-        if (!g_hide_on || now) logf("night boss: 9019 on, %d boss(es) hidden now (%d in all this night)", now, g_hidden_n);
+        if (!g_hide_on || now)
+            logf("night boss: %s, %d boss(es) hidden now (%d in all this night):%s", f9019 ? "9019 on" : "the day's challenge (before 9019)", now,
+                 g_hidden_n, *ids ? ids : " none");
         g_hide_on = 1;
     } else if (g_hide_on) {
+        if (in_world) df_night_events_log("the night boss fight is over");
         int back = 0;
         for (int k = 0; k < g_hidden_n; k++) {
             char *c = in_world ? boss_chr(g_hidden[k]) : NULL;
             if (c && !chr_enabled(c)) ((char (*)(char *, char))(g_base + 0x608c60))(c, 1), back++;
         }
-        logf("night boss: 9019 off%s, %d of %d hidden boss(es) enabled again (the rest not loaded)", in_world ? "" : " (out of the world)", back,
+        logf("night boss: 9019 off / day 2%s, %d of %d hidden boss(es) enabled again (the rest not loaded)", in_world ? "" : " (out of the world)", back,
              g_hidden_n);
         g_hide_on = 0, g_hidden_n = 0;
     }

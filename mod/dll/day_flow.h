@@ -579,6 +579,25 @@ static void df_lobby_watch(void) {
 // game's own all-at-once start 9013 (common 1129, 9:25-16:43) is kept off (flag_store_hook).
 static int g_df_events, g_df_started;
 static DWORD g_df_event_tick;
+// From the day's challenge until day 2 (7505 clears g_df_go) no event starts here, and night_hide_frame hides the
+// other bosses and the camp invaders. Ending a running event: the game's own end at night exists only for the
+// night-boss interference family (common 1142: with 8061 on, at play-area time 23:00-23:59, it sets 8025 and 8062
+// "finished"; its creatures, e.g. the Equilibrious Beast of m45_55 (common_func 90035247) and of the field tiles
+// (90015163), get SpEffect 45831 at 23:00 and are disabled, 8110), which the challenge's jump to 23:00 triggers.
+// The hordes' (90035040..48) and the meteorite's scripts have no time or night condition; their end flags 8024 /
+// 8021 are the "cleared" flags that common 90015003 rewards (SpEffect 6999000), so they are not set here.
+static int df_night_window(void) { return df_on() && g_df_go; }
+static unsigned df_invader_entity_at(int i) { return i < g_df_ninv && g_df_inv[i].entity > 0 ? (unsigned)g_df_inv[i].entity : 0; }
+static void df_night_events_log(const char *when) {
+    static const int F[] = {8040, 8042, 8043, 8044, 8021, 8055, 8056, 8057, 8024, 8060, 8061, 8062, 8025, 8105, 8110, 8071, 8072, 8027};
+    char t[256] = "";
+    for (unsigned i = 0; i < sizeof F / sizeof *F; i++) {
+        size_t n = strlen(t);
+        snprintf(t + n, sizeof t - n, " %d=%d", F[i], bf_flag((unsigned)F[i]));
+    }
+    logf("day flow: %s: world event flags (meteorite 8040..8044 / 8021, hordes 8055..8057 / 8024, interference 8060..8062 / 8025, "
+         "Libra 8105 / 8110, frenzy 8071 / 8072 / 8027):%s; our starter holds until day 2", when, t);
+}
 static void df_net_flag(int id) {
     char *man = *(char **)(g_base + 0x3c115a8);
     if (!man) return;
@@ -591,7 +610,7 @@ static void df_events_frame(void) {
     static const struct { int flag; const char *name; } FAM[3] = {{8040, "meteorite"}, {8055, "hordes"}, {8060, "special event"}};
     char *gdm = *(char **)(g_base + 0x3c078d0), *pgd = gdm ? *(char **)(gdm + 8) : NULL;
     int level = pgd && !IsBadReadPtr(pgd, 0x70) ? *(int *)(pgd + 0x68) : 0;
-    if (g_df_events >= 3 || level < 5 || g_df_kills_day < 2 * (g_df_started + 1) || GetTickCount() - g_df_event_tick < 30000) return;
+    if (g_df_go || g_df_events >= 3 || level < 5 || g_df_kills_day < 2 * (g_df_started + 1) || GetTickCount() - g_df_event_tick < 30000) return;
     int k = g_df_events++;
     g_df_event_tick = GetTickCount();
     // a family's scripts are in its own small maps (meteorite m20 / m21: one in the game's 19 meteorite patterns, at a
@@ -688,6 +707,7 @@ static void df_death_restart_hook(long long *ev, void *sm) {
         join_over("ally's final death");
     } else if (g_join != 4) {
         ((void (*)(void))(g_base + 0x6af900))();
+        if (g_lobby) lobby_set(LOBBY_OVER_KEY, "1");  // the invader's win (other_down_watch)
         char *gm = *(char **)(g_base + 0x3c13258);
         logf("day flow: final death (the game's death restart, no extra life): the game's game over requested (gm+0xaf2 = %u, af1 %u) "
              "instead of the revive with a level less", gm ? (unsigned char)gm[0xaf2] : 0, gm ? (unsigned char)gm[0xaf1] : 0);
