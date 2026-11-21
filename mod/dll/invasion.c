@@ -1179,8 +1179,9 @@ static void party_host_over(void);
 #define LOBBY_PARTY_KEY "nrpvp_party"   // a gathering host's party code
 #define LOBBY_HP_KEY    "nrpvp_hp"      // the host's HP flask charges (+0xff), once its start value is final
 #define LOBBY_OVER_KEY  "nrpvp_over"    // "1": the host's final death (no extra life left: the game over is requested)
-#define ALLY_FLASK_CUT  2                // an ally's charges at arrival = max(ALLY_FLASK_MIN, host's - this)
-#define ALLY_FLASK_MIN  3                // owner, 2026-11-17: a summon never has fewer than 3 HP charges
+// A late summon's HP charges by the host's (owner, 2026-11-21): host 1..9 -> 1, 2, 3, 3, 4, 4, 5, 6, 7; above 9: host's - 2.
+static const unsigned char ALLY_FLASKS[10] = {0, 1, 2, 3, 3, 4, 4, 5, 6, 7};
+#define ALLY_FLASK_MIN  3                // owner, 2026-11-17: an early summon (the host's count) never has fewer than 3
 #define LOBBY_GO_KEY    "nrpvp_go"      // "1" once the host's expedition is generated (start block, generator results final)
 static int g_invader_in_world(void);        // joined as an invader and in the host's world
 static int side_count(int want_allies);     // remote session members that are allies / invaders (not the host)
@@ -1586,6 +1587,7 @@ static float gscp_u16(unsigned off) {
 #define REWARD_RUNES_SUMMON_KILL 10000
 static void summon_finished_by(char *attacker);
 static void summon_kill_reward_give(unsigned long long summon);  // the one place that decides who gets it and how much
+static void death_drop(const char *why);
 static int finish_side_ok(char *chr) {  // a down of this local character counts as by the other side
     return chr && chr == local_player() && (our_speffect_active(chr) == 1 || side_count(0) > 0);
 }
@@ -1610,6 +1612,7 @@ static void finish_down_hook(char *chr, char state, float t) {
             *(float *)(chr + 0x714) = 0.5f, *(float *)(chr + 0x718) = 0;
             logf("finish test: invader down %d (game count %u): the last chance was the third: gauge 0.5, timer %.2f -> 0 (death)", n, count,
                  timer_was);
+            death_drop("fourth down");
             return;
         }
         static const unsigned off[3] = {0x380, 0x384, 0x388};
@@ -1680,6 +1683,7 @@ static void finish_hit_hook(char *chr, char *attacker, char *hit) {
     *(float *)(chr + 0x714) = 0.5f;
     *(float *)(chr + 0x718) = 0;
     logf("finish test: emptied by the other side: gauge 0 -> 0.5 (no stand-up), timer %.2f -> 0 (bleed-out death)", timer);
+    death_drop("finished while down");
     if (g_as_ally && g_join == 4) summon_finished_by(attacker);
 }
 // Task 2 (finish-test). Whether an attack may hit a character is decided on the attacker's machine in
@@ -5043,7 +5047,7 @@ static int g_reward_pending; // 1 won, 2 lost: applied at the expedition's rewar
 // module (0x427b70 / 0x427b80 / 0x427b90, 0x428bf0). The same calls here. Runes (+0x6c) are not touched;
 // the highest level +0x10c is put back to its own value when the level is restored.
 static int g_level_set, g_own_level, g_own_top_level;
-#define JOIN_LEVEL_CUT_PERCENT 40  // a cut joiner's level = max(1, floor(host level * (100 - this) / 100))
+#define JOIN_LEVEL_CUT_PERCENT 20  // a cut joiner's level = max(1, floor(host level * (100 - this) / 100)); owner, 2026-11-21: 80 %
 #define JOIN_LEVEL_CUT_ALLIES 1    // the host's summons: cut (the user's rule)
 #define JOIN_LEVEL_CUT_INVADERS 0  // invaders: the host's level exactly (decision 24)
 #define JOIN_CUT_FROM_LEVEL 4      // the cuts (level and flasks) apply only when the host is at least this level
@@ -5086,8 +5090,117 @@ static void level_restore(void) {
         *(int *)(pd + 0x10c) = g_own_top_level;
     logf("level: restore done (own level %d, highest level %d)", g_own_level, g_own_top_level);
 }
+// Death drop (owner, 2026-11-21): an invader or a host's summon that dies for good in our sessions leaves its own items
+// on the ground where it died, vanilla ground items that anyone may take, and its runes vanish (no bloodstain). On the
+// dead player's own machine, once per join:
+// - the items, read the way the game's player-data serializer 0x14020ca00 reads them. The 6 weapons: handle by
+//   0x140381890(ChrAsm pgd+0x270, &handle, slot); empty = handle 0 or weapon 110000 (the game's own empty-slot test
+//   0x1401f46f0); each entry (skill, passives) by 0x140578950(entry, &handle, 1). The 5 talismans: param id by
+//   0x140381350(ChrAsm, i), -1 empty, kind 0x20000000 (0x1406a1570: handle type 2); entry 0x140578a60(entry, &id, 1).
+//   The quick slots 0x20..0x31 of pgd+0x1d8: 0x1401f2610 -> inventory index (-1 empty) into pgd+0x3a0 (0x1401f29d0),
+//   valid 0x1401f5ff0, id 0x1401f5a20 (kind bits included: the pickup 0x14057a0f0 finds entries by the full id), count
+//   0x1401f5ca0; entry 0x140578a60(entry, &id, count).
+// - the drop as the DeathBox opening 0x14053d070 makes it: 0x140576110(*(0x143c10b68), &{alloc, begin, end}, &pos,
+//   &block, yaw), 0x50-byte entries, read from begin/end only; its 0x1405759e0 spreads each (a client: packet 0x2c type 4
+//   to the host, which registers it and sends type 5 to all). The position is block-local (the entry's +0x78, which
+//   the player drop spawners 0x140575b90 / 0x1405769d0 fill from 0x140631740(&local, &world 0x1403d0e60, &block); the
+//   packet packs it in 24 bits, 0x140574320), block = the character handle's high half (chr+0xc) or *(0x143c123f8)+0x2c.
+// - runes pgd+0x6c = 0. join_over waits DROP_HOLD_MS after the drop, so the request gets through before we leave.
+#define DROP_HOLD_MS 2500
+#define DROP_MAX 32
+static int g_drop_done;
+static DWORD g_drop_tick;
+static const char *g_drop_held;
+static int df_on(void);
+static void death_drop(const char *why) {
+    if (g_drop_done || g_join != 4 || (g_as_ally && !(df_on() && g_in_exped))) return;
+    char *me = local_player(), *ps = *(char **)(g_base + 0x3c078d0), *pd = ps ? *(char **)(ps + 8) : NULL;
+    char *mim = *(char **)(g_base + 0x3c10b68), *fm = *(char **)(g_base + 0x3c123f8);
+    if (!me || IsBadReadPtr(me, 0x740) || !pd || IsBadReadPtr(pd, 0x400)) {
+        logf("death drop (%s): no local player or player data, nothing done", why);
+        return;
+    }
+    g_drop_done = 1;
+    const char *who = g_as_ally ? "ally" : "invader";
+    _Alignas(16) unsigned char e[DROP_MAX][0x50] = {{0}};
+    int n = 0, seen[18], ns = 0;
+    char *chrasm = pd + 0x270, *qs = pd + 0x1d8, *inv = ((char *(*)(char *))(g_base + 0x1f29d0))(qs);
+    for (int i = 0; i < 6; i++) {
+        unsigned h = 0;
+        ((void *(*)(char *, unsigned *, int))(g_base + 0x381890))(chrasm, &h, i);
+        if (h) ((void (*)(void *, unsigned *, unsigned short))(g_base + 0x578950))(e[n], &h, 1);
+        unsigned *w = (unsigned *)e[n], id = h ? w[0] : ~0u;
+        int empty = id == ~0u || (id & 0xfffffff) == 110000;
+        if (!h) logf("death drop: weapon slot %d: handle 0, empty, skipped", i);
+        else
+            logf("death drop: weapon slot %d: handle %08x id %u (kind %x)%s | +4 %d, +8 %d %d %d, +14 %d %d, +1c %u +1d %u, +28 %d +2c %d +3c %d "
+                 "+40 %d, count %u +4a %u", i, h, id & 0xfffffff, id >> 28, empty ? " empty, skipped" : "", (int)w[1], (int)w[2], (int)w[3],
+                 (int)w[4], (int)w[5], (int)w[6], e[n][0x1c], e[n][0x1d], (int)w[10], (int)w[11], (int)w[15], (int)w[16],
+                 *(unsigned short *)(e[n] + 0x48), *(unsigned short *)(e[n] + 0x4a));
+        if (!empty) n++;
+    }
+    for (int i = 0; i < 5; i++) {
+        int id = ((int (*)(char *, int))(g_base + 0x381350))(chrasm, i);
+        logf("death drop: talisman slot %d: id %d%s", i, id, id < 0 ? " empty, skipped" : "");
+        if (id < 0) continue;
+        unsigned full = (unsigned)id | 0x20000000;
+        ((void (*)(void *, unsigned *, unsigned short))(g_base + 0x578a60))(e[n++], &full, 1);
+    }
+    for (int s = 0x20; s < 0x32 && n < DROP_MAX; s++) {
+        int idx = ((int (*)(char *, int))(g_base + 0x1f2610))(qs, s), dup = 0;
+        for (int k = 0; k < ns; k++) dup |= seen[k] == idx;
+        if (idx < 0 || dup) continue;
+        seen[ns++] = idx;
+        if (!((unsigned char (*)(char *, int))(g_base + 0x1f5ff0))(inv, idx)) {
+            logf("death drop: quick slot %x: inventory %d not valid, skipped", s, idx);
+            continue;
+        }
+        unsigned long long q = ~0ull;
+        ((void *(*)(char *, unsigned long long *, int))(g_base + 0x1f5a20))(inv, &q, idx);
+        unsigned id = (unsigned)q;
+        int count = ((int (*)(char *, int))(g_base + 0x1f5ca0))(inv, idx);
+        logf("death drop: quick slot %x: inventory %d id %u (kind %x) count %d%s", s, idx, id & 0xfffffff, id >> 28, count,
+             id == ~0u || count <= 0 ? " skipped" : "");
+        if (id == ~0u || count <= 0) continue;
+        ((void (*)(void *, unsigned *, unsigned short))(g_base + 0x578a60))(e[n++], &id, (unsigned short)(count > 0xffff ? 0xffff : count));
+    }
+    int runes = *(int *)(pd + 0x6c);
+    *(int *)(pd + 0x6c) = 0;
+    logf("death drop (%s, %s): runes %d -> %d (gone, no bloodstain)", who, why, runes, *(int *)(pd + 0x6c));
+    char *ctrl = *(char **)(me + 0x60), *a = ctrl && !IsBadReadPtr(ctrl + 0x10, 8) ? *(char **)(ctrl + 0x10) : NULL;
+    char *b = a && !IsBadReadPtr(a + 0x1b8, 8) ? *(char **)(a + 0x1b8) : NULL;
+    if (!b || IsBadReadPtr(b + 0x68, 8) || IsBadReadPtr(*(char **)(b + 0x68), 0x80) || !mim || !n) {
+        logf("death drop: %d items, map item manager %p, position %s: not dropped", n, (void *)mim, b ? "readable" : "not readable");
+        return;
+    }
+    _Alignas(16) float wpos[4];
+    ((void *(*)(char *, float *))(g_base + 0x3d0e60))(me, wpos);
+    unsigned block = *(unsigned *)(me + 0xc);
+    if (!block) block = ~0u;
+    if (block == ~0u && fm) block = *(unsigned *)(fm + 0x2c);
+    float pos[3] = {0, 0, 0};
+    unsigned char ok = ((unsigned char (*)(float *, float *, unsigned *))(g_base + 0x631740))(pos, wpos, &block);
+    logf("death drop: world %.2f %.2f %.2f, block %08x (chr+0x38 %08x, area +0x2c %08x) -> local %.2f %.2f %.2f (conversion %u)",
+         wpos[0], wpos[1], wpos[2], block, *(unsigned *)(me + 0x38), fm ? *(unsigned *)(fm + 0x2c) : 0, pos[0], pos[1], pos[2], ok);
+    if (!ok) {
+        logf("death drop: no block-local position, %d items not dropped", n);
+        return;
+    }
+    void *vec[4] = {NULL, e, e + n, e + n};
+    unsigned long long r = ((unsigned long long (*)(char *, void **, float *, unsigned *, unsigned))(g_base + 0x576110))(mim, vec, pos, &block, 0);
+    g_drop_tick = GetTickCount() | 1;
+    logf("death drop: %d items dropped through 0x140576110 -> %llu (session state %d); leaving held %d ms", n, r,
+         *(char **)(g_base + 0x3c21ec8) ? *(int *)(*(char **)(g_base + 0x3c21ec8) + 0xc) : -1, DROP_HOLD_MS);
+}
 static void summon_at_host_off(const char *why);
 static void join_over(const char *why) {
+    if (strstr(why, "invader died") || strstr(why, "ally's final death")) death_drop(why);
+    if (g_drop_tick && GetTickCount() - g_drop_tick < DROP_HOLD_MS) {
+        if (!g_drop_held) g_drop_held = why, logf("death drop: join over (%s) held until %d ms after the drop", why, DROP_HOLD_MS);
+        return;
+    }
+    if (g_drop_held) logf("death drop: hold over (%lu ms after the drop): join over (%s)", GetTickCount() - g_drop_tick, why);
+    g_drop_tick = 0, g_drop_held = NULL;
     level_restore();
     summon_at_host_off(why);
     g_ver_notice_armed = 1;  // back in the hub: the version notice may show once more
@@ -5190,6 +5303,10 @@ static void enter_watch(char *sm);
 
 // Idle step, every frame while searching with the join test on (and every step while an enter test watches).
 static void join_frame(void) {
+    if (g_drop_held && GetTickCount() - g_drop_tick >= DROP_HOLD_MS) {  // a join over held for the death drop
+        join_over(g_drop_held);
+        return;
+    }
     char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
     if (!sm || g_join == 3) return;
     unsigned state = *(unsigned *)(sm + SM_LOBBY_STATE);
@@ -5266,6 +5383,7 @@ static void join_frame(void) {
             }
             if (g_enter_test) {
                 g_join = 4;
+                g_drop_done = 0, g_drop_tick = 0, g_drop_held = NULL;
                 g_enter_tick = GetTickCount();
                 g_enter_world = 0;
                 g_enter_effect = 0;
@@ -6026,7 +6144,7 @@ static void enter_watch(char *sm) {
         applied = nowt;
         team_log("enter test, team effect lost right after the sync: put on again");
     }
-    // The host's summons: HP flask charges = max(ALLY_FLASK_MIN, host's - ALLY_FLASK_CUT), once, as soon as the host's
+    // The host's summons: HP flask charges = ALLY_FLASKS[host's] (late) or max(ALLY_FLASK_MIN, host's) (early), once, as soon as the host's
     // lobby carries its final count (nrpvp_hp); set with the game's own 0x20d9d0 and filled with 0x60ad60 as a church
     // does, so later churches still add one each (0x5fdad0 raises +0xff by one). The host's slot +0xff is logged too:
     // whether the slot carries the count is not established (its level at +0x68 is).
@@ -6036,15 +6154,15 @@ static void enter_watch(char *sm) {
         const char *hp = g_candidate ? g_steam.get_data(g_steam.mm, g_candidate, LOBBY_HP_KEY) : NULL;
         char *ps = *(char **)(g_base + 0x3c078d0), *pd = ps ? *(char **)(ps + 8) : NULL, *slots = ps ? *(char **)(ps + 0x10) : NULL;
         if (hp && *hp && pd && !IsBadReadPtr(pd, 0x110)) {
-            int host = atoi(hp), n = g_join_cut ? host - ALLY_FLASK_CUT : host, before = (unsigned char)pd[0xff];
-            if (n < ALLY_FLASK_MIN) n = ALLY_FLASK_MIN;
+            int host = atoi(hp), before = (unsigned char)pd[0xff];
+            int n = !g_join_cut ? (host < ALLY_FLASK_MIN ? ALLY_FLASK_MIN : host) : host < 1 ? 1 : host <= 9 ? ALLY_FLASKS[host] : host - 2;
             if (n > 14) n = 14;
             flask_done_for = g_enter_tick;
             ((void (*)(char *, unsigned char, unsigned char))(g_base + 0x20d9d0))(pd, (unsigned char)n, (unsigned char)pd[0x100]);
             ((void (*)(void))(g_base + 0x60ad60))();
             int s0 = slots && !IsBadReadPtr(slots, 2 * 0x8a0) ? (unsigned char)slots[0xff] : -1, s1 = slots && !IsBadReadPtr(slots, 2 * 0x8a0) ? (unsigned char)slots[0x8a0 + 0xff] : -1;
             logf("ally flasks: host has %d HP charges (its lobby); ours %d -> %d (%s), filled | slots +0xff: %d %d", host, before,
-                 (unsigned char)pd[0xff], g_join_cut ? "late summon: host's - 2, at least 3" : "early summon: the host's, at least 3", s0, s1);
+                 (unsigned char)pd[0xff], g_join_cut ? "late summon: the owner's table" : "early summon: the host's, at least 3", s0, s1);
         }
     }
     // decision 24: once the world sync is through and the host's slot holds its level, take that level
@@ -6057,8 +6175,8 @@ static void enter_watch(char *sm) {
             int no = *(int *)(sl + 8), lv = *(int *)(sl + 0x68);
             if (no != host_no || lv < 1 || lv > 15) continue;
             g_own_level = *(int *)(pd + 0x68), g_own_top_level = *(int *)(pd + 0x10c);
-            // the user's formula: an ally gets the host's level less JOIN_LEVEL_CUT_PERCENT, never below 1 (host 1 -> 1,
-            // 2 -> 1, 3 -> 1, 5 -> 3, 10 -> 6, 15 -> 9); an invader the host's level (decision 24)
+            // the user's formula: an ally gets the host's level less JOIN_LEVEL_CUT_PERCENT, never below 1 (host 4 -> 3,
+            // 5 -> 4, 10 -> 8, 15 -> 12); an invader the host's level (decision 24)
             // the user's rule: a summon of a host below JOIN_CUT_FROM_LEVEL is not late: the host's level and flasks
             int cut = (g_as_ally ? JOIN_LEVEL_CUT_ALLIES : JOIN_LEVEL_CUT_INVADERS) && lv >= JOIN_CUT_FROM_LEVEL;
             int want = cut ? lv * (100 - JOIN_LEVEL_CUT_PERCENT) / 100 : lv;
@@ -7005,6 +7123,7 @@ static void step_hook(void *ctrl, void *time, int step) {
     }
     no_sprint_frame();
     g_in_exped = step == QM_STEP_INGAME || g_join_in_world();
+    if (!g_in_exped) g_df_inv_dead = NULL;
     night_hide_frame(g_in_exped);
     df_sb_registry_frame(g_in_exped);
     day_flow_frame(g_in_exped);

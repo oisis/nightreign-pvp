@@ -741,7 +741,20 @@ static int df_extra_life(char *me, int use) {
     return 0;
 }
 static int g_df_ended;
+static char *g_df_inv_dead;  // the dead invader whose death restart is taken over
 static void df_death_restart_hook(long long *ev, void *sm) {
+    // An invader's death in our session (owner, 2026-11-21: its runes vanish, never a bloodstain): the restart is not run,
+    // so neither its revive nor the bloodstain of its 0x1405c4360 state (0x1405c44b2 -> 0x140729920 -> 0x14072b070, packet
+    // 0x7c); the invader goes home through join_over, which drops its items first (death_drop). Kept for that character
+    // until it is out of the expedition (g_df_inv_dead, cleared by the step hook), so no later call runs the restart.
+    char *dead = local_player();
+    if ((g_join == 4 && !g_as_ally && chr_hp(dead) <= 0) || (dead && dead == g_df_inv_dead)) {
+        if (dead != g_df_inv_dead || !dead)
+            logf("day flow: the invader's death restart taken over (HP %d): no revive, no bloodstain", chr_hp(dead));
+        g_df_inv_dead = dead;
+        if (g_join == 4) join_over("invader died (the game's death restart)");
+        return;
+    }
     if (!df_on() || !g_in_exped) {
         ((void (*)(long long *, void *))(g_base + 0x5c38f0))(ev, sm);
         return;
