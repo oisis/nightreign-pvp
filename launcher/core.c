@@ -39,19 +39,21 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 37
+#define BUILD_FORMAT 39
 #define BOSS_DEATHS_MIN 100  // the game (1.3.3) has 158 such flags; fewer = its event scripts changed
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
                               "porbr", "rusru", "spaar", "spaes", "thath", "zhocn", "zhotw"};
-// Our own menu lines (UTF-8): "Team" in the "Number of Players" option and the "Invasion" entry of the
+// Our own menu lines (UTF-8): the "Number of Players" option's entries and the "Invasion" entry of the
 // expedition menu's Target list.
 // Polish for the Polish game, English for every other language. Keep in sync with mod/build_msg.py.
 // (Adjacent string literals keep \x escapes from swallowing the letters that follow them.)
 static const struct { u32 id; const char *english, *polish; } OUR_TEXT[] = {
-    {130305, "Commence Team Expedition", "Rozpocznij wypraw\xc4\x99 dru\xc5\xbcyny"},
-    {130408, "Team", "Dru\xc5\xbcyna"},  // the game's "three players": a team too (the list cannot lose an entry)
-    {130417, "Team", "Dru\xc5\xbcyna"},  // the game's "two players": team (the DLL joins or hosts a session)
+    // "Number of Players" (the DLL: 2 Solo, no session; 1 the game's solo start plus our host session; 0 party)
+    {130305, "Solo + invaders", "Solo + naje\xc5\xba" "d\xc5\xba" "cy"},  // the start button for value 1
+    {130408, "Team", "Dru\xc5\xbcyna"},  // the game's "three players" (value 0)
+    {130409, "Solo", "Solo"},  // the game's "one player" (value 2)
+    {130417, "Solo + invaders", "Solo + naje\xc5\xba" "d\xc5\xba" "cy"},  // the game's "two players" (value 1)
     {131170, "A newer mod version (%s) is available. Update to play with others.",  // %s: the DLL puts the number in
              "Dost\xc4\x99pna jest nowsza wersja moda (%s). Zaktualizuj, \xc5\xbc" "eby gra\xc4\x87 z innymi."},
     {131171, "Your team (same password) plays mod version %s. Everyone needs the same version.",
@@ -108,16 +110,15 @@ static const char *const PAIR_SPECIAL[4][2] = {
 };
 static int g_pair_given;  // test-settings.toml names the map (map = 1..4); otherwise it is drawn
 static int pair_now(void);
-// Texts that depend on the pair: 131180 / 131183 (the special boss), 131185 (the map's name, at the expedition start),
+// Texts that depend on the pair: 131183 (the special boss); 131180 / 131181 (kill notices, here with them), 131185 (the map's name, at the expedition start),
 // 131186 + k (a team with our password plays pair k), the item's caption. (id, text) for the language, n of them.
 static int pair_texts(int polish, u32 *ids, char text[][400]) {  // up to 8
     int p = pair_now(), l = polish != 0, n = 0;
     const char *sp = PAIR_SPECIAL[p][l];
-    // 131180 / 131181: %s = "N/6" (always the release target, DF_BOSSES; owner, 2026-11-19); 131183: %s = 6
-    ids[n] = 131180, snprintf(text[n++], 400, l ? "Zabi\xc5\x82" "e\xc5\x9b %%s wymaganych boss\xc3\xb3w, aby wyzwa\xc4\x87 bossa nocy. Zabij te\xc5\xbc bossa specjalnego (%s)."
-                                                  : "Bosses defeated: %%s of those required to challenge the night boss. Defeat the special boss too (%s).", sp);
-    ids[n] = 131181, snprintf(text[n++], 400, l ? "Zabi\xc5\x82" "e\xc5\x9b %%s wymaganych boss\xc3\xb3w, aby wyzwa\xc4\x87 bossa nocy."
-                                                  : "Bosses defeated: %%s of those required to challenge the night boss.");
+    // 131180: %s = "6/6", the special boss still alive; 131181: %s = "N/6" (always the release target, DF_BOSSES; owner,
+    // 2026-11-19 / 2026-11-21); 131183: %s = 6
+    ids[n] = 131180, snprintf(text[n++], 400, l ? "Pokonano boss\xc3\xb3w: %%s. Zabij bossa regionu specjalnego" : "Bosses defeated: %%s. Defeat the special region boss");
+    ids[n] = 131181, snprintf(text[n++], 400, l ? "Pokonano boss\xc3\xb3w: %%s" : "Bosses defeated: %%s");
     ids[n] = 131183, snprintf(text[n++], 400, l ? "Wyzwanie nie jest jeszcze dost\xc4\x99pne: pokonaj %%s boss\xc3\xb3w i bossa specjalnego (%s)"
                                                   : "The challenge is not available yet: defeat %%s bosses and the special boss (%s)", sp);
     ids[n] = 131185, snprintf(text[n++], 400, l ? "Mapa: %s" : "Map: %s", PAIR_NAME[p][l]);
@@ -3017,7 +3018,12 @@ static int emevd_boss_deaths(buf d, u32 *flags, int have, int cap, int night_are
             // The night bosses' templates (90065900, 90075901 / 904) have no such argument and stay out; so do the
             // night-boss arenas' scripts (m47, m48, m49, m52: night_arena) and 90035013 (its first argument is a camp
             // invader's death, m30-m38 / m50-m52 xx705: invaders are not bosses of the day).
-            static const struct { u32 ev; u32 at; } KILL[] = {{90015002, 8}, {90015025, 8}, {90015407, 8}, {90045002, 12}};
+            // 90045002 (the m46_50 / 60 / 70 / 80 duels, one call per variant): after one Increment it sets both its first
+            // argument (the site's shared flag, the same as the site's 9005810 grace flag) and its fourth (the variant's;
+            // variant 0 of m46_70 / m46_80 passes the shared flag there too), and ends at once when the shared flag is on
+            // (1003[2]). So only the shared flag is taken: one duel = one flag whatever the variant (run of 2026-11-21:
+            // 46600800 + 46600820 counted 2). Its boss characters are listed under it (emevd_boss_entities).
+            static const struct { u32 ev; u32 at; } KILL[] = {{90015002, 8}, {90015025, 8}, {90015407, 8}, {90045002, 0}};
             int kill = -1;
             for (unsigned t = 0; t < sizeof KILL / sizeof *KILL; t++) if (KILL[t].ev == ev_id) kill = (int)t;
             if (ev_id == 9005810) flag = rd32(a + 8);
@@ -3581,22 +3587,23 @@ int core_selftest(void) {
         memset(ev, 0, sizeof ev);
         memcpy(ev, "EVD", 3);
         wr64(ev + 0x10, 1), wr64(ev + 0x18, 0x80), wr64(ev + 0x28, 0x100), wr64(ev + 0x78, 0x180);
-        wr64(ev + 0x80, 1), wr64(ev + 0x88, 3), wr64(ev + 0x90, 0);
-        const u32 ins[3][4] = {{2000, 6, 12, 0}, {2000, 0, 20, 16}, {2000, 6, 12, 40}};  // bank, id, length, offset
-        for (int i = 0; i < 3; i++) wr32(ev + 0x100 + i * 0x20, ins[i][0]), wr32(ev + 0x104 + i * 0x20, ins[i][1]), wr64(ev + 0x108 + i * 0x20, ins[i][2]), wr64(ev + 0x110 + i * 0x20, ins[i][3]);
-        const u32 args[] = {0, 9005810, 46500800, 0, 0, 90015006, 30301510, 30300510, 30300810, 0, 0, 9005810, 46500800};
+        wr64(ev + 0x80, 1), wr64(ev + 0x88, 4), wr64(ev + 0x90, 0);
+        const u32 ins[4][4] = {{2000, 6, 12, 0}, {2000, 0, 20, 16}, {2000, 6, 12, 40}, {2000, 0, 24, 52}};  // bank, id, length, offset
+        for (int i = 0; i < 4; i++) wr32(ev + 0x100 + i * 0x20, ins[i][0]), wr32(ev + 0x104 + i * 0x20, ins[i][1]), wr64(ev + 0x108 + i * 0x20, ins[i][2]), wr64(ev + 0x110 + i * 0x20, ins[i][3]);
+        const u32 args[] = {0, 9005810, 46500800, 0, 0, 90015006, 30301510, 30300510, 30300810, 0, 0, 9005810, 46500800,
+                            0, 90045002, 46600800, 2, 46605820, 46600820};  // a duel: its shared flag only, not the variant's
         for (unsigned i = 0; i < sizeof args / sizeof *args; i++) wr32(ev + 0x180 + i * 4, args[i]);
         u32 got[4];
         int k = emevd_boss_deaths((buf){ev, sizeof ev}, got, 0, 4, 0);
-        if (k != 2 || got[0] != 46500800 || got[1] != 30300810) { ok = 0; logf_("selftest: boss deaths from an event script failed"); }
+        if (k != 3 || got[0] != 46500800 || got[1] != 30300810 || got[2] != 46600800) { ok = 0; logf_("selftest: boss deaths from an event script failed"); }
     }
-    {  // test settings: values, comments, CRLF, case, a retired key (no-rain), unknown keys and bad values, a missing file
+    {  // test settings: values, comments, CRLF, case, retired keys (no-rain, challenge-bosses), unknown keys and bad values, a missing file
         static const char t[] = "# c\r\nteam-test = true\r\n  NO-RAIN=FALSE # x\r\nslow-time\t= True\r\ntwo-regions = true\r\n"
                                 "nope = true\r\nloot-test = yes\r\n\r\ndebug-log = false\r\ntest-level = 15\r\nmap-group = 3\r\nult-pvp = 250\r\none-region = 1000\r\n"
-                                "pair = -1\r\nboss-flow = 3";
+                                "pair = -1\r\nboss-flow = 3\r\nchallenge-bosses = 2";
         short v[SETTINGS_COUNT];
         char bad[96];
-        static const short want[SETTINGS_COUNT] = {-1, 0, -1, 15, -1, -1, 3, -1, -1, -1, 250, -1, -1, -1, -1, -1, -1};
+        static const short want[SETTINGS_COUNT] = {-1, 0, -1, 15, -1, -1, 3, -1, -1, -1, 250, -1, -1, -1, -1, -1};
         int good = settings_parse(t, sizeof t - 1, v, bad, sizeof bad) == 4 && !memcmp(v, want, sizeof v) &&
                    !strcmp(bad, "nope = true, loot-test = yes, one-region = 1000, boss-flow = 3");
         char bad2[8];

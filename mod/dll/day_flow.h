@@ -34,18 +34,18 @@ static void df_kill(unsigned id) {  // flag_note, any thread: a boss death flag 
     InterlockedIncrement(&g_df_kills);
 }
 static int df_on(void) { return g_settings[S_BOSS_FLOW] == 4; }
-static int df_needed(void) { return g_settings[S_CHALLENGE_BOSSES] > 0 ? g_settings[S_CHALLENGE_BOSSES] : DF_BOSSES; }
 static int df_target_tier(void) {
     int t = g_df_met ? g_df_met_at * 5 + g_df_after * 50 : g_df_bosses * 5;
     return t > DF_TIER_COUNT * 5 ? DF_TIER_COUNT * 5 : t;
 }
-// The text always shows the release target (owner, 2026-11-19: "Zawsze N/6"): challenge-bosses only shortens the
-// condition, silently. The game keeps a summon message up about 5.9 s by itself (run of dev.60: 5924 ms).
+// After a kill (owner, 2026-11-21): the condition met -> 131182 (challenge available); 6/6 without the special boss ->
+// 131180 ("6/6. Defeat the special region boss"); otherwise (fewer than 6, special boss dead or not) -> 131181 ("N/6").
+// The game keeps a summon message up about 5.9 s by itself (run of dev.60: 5924 ms).
 static void df_progress_notice(void) {
     char arg[24];
     snprintf(arg, sizeof arg, "%d/%d", g_df_bosses < DF_BOSSES ? g_df_bosses : DF_BOSSES, DF_BOSSES);
     if (g_df_met) notice_with(131182, NULL);
-    else notice_with(g_df_special ? 131181 : 131180, arg);
+    else notice_with(g_df_bosses >= DF_BOSSES && !g_df_special ? 131180 : 131181, arg);
 }
 // --- enemy tiers: through the game's own re-apply of the player-count correction (ChrFinder -> 0x1405186a0, which
 // calls 0x1403c7e50(chr) for each character at 0x1405186ac; the pass runs when WCM+0x17558 differs from the count,
@@ -844,7 +844,7 @@ static void day_flow_frame(int in_world) {
         char *gm0 = *(char **)(g_base + 0x3c13258);
         int pr = PAIR_NOW >= 0 && PAIR_NOW <= 3 ? PAIR_NOW : 0;
         logf("day flow: expedition start (pattern %u / %u): map %s (region pair %d); challenge after %d bosses and the special boss",
-             gm0 ? *(unsigned *)(gm0 + 0xb48) : 0, gm0 ? *(unsigned *)(gm0 + 0xb4c) : 0, DF_PAIR_NAME[pr], pr, df_needed());
+             gm0 ? *(unsigned *)(gm0 + 0xb48) : 0, gm0 ? *(unsigned *)(gm0 + 0xb4c) : 0, DF_PAIR_NAME[pr], pr, DF_BOSSES);
         notice_with(131185, NULL);  // "Map: <name>" (launcher: the pair's name)
         g_df_warp_until = 0, g_df_load_until = 0, g_df_ended = 0, g_df_move_at = 0;
         if (g_df_fade_in_at) g_df_fade_in_at = 0, df_fade(0.0f, 0.1f, 0);
@@ -878,7 +878,7 @@ static void day_flow_frame(int in_world) {
     if (k > 0 || sk > 0) {
         if (g_df_met) g_df_after += (int)(k + sk);
         else g_df_bosses += (int)k, g_df_special = g_df_special || sk > 0;
-        if (!g_df_met && g_df_bosses >= df_needed() && g_df_special) {
+        if (!g_df_met && g_df_bosses >= DF_BOSSES && g_df_special) {
             g_df_met = 1, g_df_met_at = g_df_bosses + 1;  // the special boss counts as one more for the tier
             logf("day flow: condition met (%d bosses and the special boss)", g_df_bosses);
         }

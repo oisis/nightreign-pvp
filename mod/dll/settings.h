@@ -6,18 +6,19 @@
 #include <stddef.h>
 #include <string.h>
 
-enum { S_LOOT_TEST, S_DEBUG_LOG, S_NO_HOST, S_TEST_LEVEL, S_FLAG_LOG, S_MAP_DUMP, S_MAP_GROUP, S_ONE_REGION, S_BOSS_FLOW, S_REVIVE_HITS, S_ULT_PVP, S_MAP, S_PARTY, S_SLOT_TEST, S_CHALLENGE_BOSSES, S_VARIANT_TEST, S_PACK_TEST, SETTINGS_COUNT };
+enum { S_LOOT_TEST, S_DEBUG_LOG, S_NO_HOST, S_TEST_LEVEL, S_FLAG_LOG, S_MAP_DUMP, S_MAP_GROUP, S_ONE_REGION, S_BOSS_FLOW, S_REVIVE_HITS, S_ULT_PVP, S_MAP, S_PARTY, S_SLOT_TEST, S_VARIANT_TEST, S_PACK_TEST, SETTINGS_COUNT };
 static const char *const SETTING_NAMES[SETTINGS_COUNT] = {"loot-test",
                                                           "debug-log", "no-host", "test-level", "flag-log",
-                                                          "map-dump", "map-group", "one-region", "boss-flow", "revive-hits", "ult-pvp", "map", "party", "slot-test", "challenge-bosses", "variant-test", "pack-test"};
+                                                          "map-dump", "map-group", "one-region", "boss-flow", "revive-hits", "ult-pvp", "map", "party", "slot-test", "variant-test", "pack-test"};
 // Keys of settings that became fixed behaviour or were dropped; old files may still have them: skipped silently.
 // (no-rain: decision 27, the rain outside the circle never does damage. two-regions, map-test-control, map-region,
 // map-pair-a / -b: every map is a Mountaintop + Rotted Woods map now (decision 35). no-circle: to be redone. ally: the
-// menu's "team" choice joins as an ally now.)
+// menu's "team" choice joins as an ally now. challenge-bosses: the challenge always needs 6 bosses and the special one.)
 static const char *const SETTING_RETIRED[] = {"pair", "team-test", "slow-time", "full-sync", "no-sprint", "show-ping", "show-counts",
-                                               "rain-hooks-legacy", "ally", "no-rain", "two-regions", "map-test-control", "map-region", "map-pair-a", "map-pair-b", "no-circle"};
+                                               "rain-hooks-legacy", "ally", "no-rain", "two-regions", "map-test-control", "map-region", "map-pair-a", "map-pair-b", "no-circle",
+                                               "challenge-bosses"};
 // Settings that take a whole number 0..999 instead of true / false (0 = off).
-static int setting_is_number(int i) { return i == S_TEST_LEVEL || i == S_MAP_GROUP || i == S_ONE_REGION || i == S_BOSS_FLOW || i == S_ULT_PVP || i == S_MAP || i == S_PARTY || i == S_CHALLENGE_BOSSES; }
+static int setting_is_number(int i) { return i == S_TEST_LEVEL || i == S_MAP_GROUP || i == S_ONE_REGION || i == S_BOSS_FLOW || i == S_ULT_PVP || i == S_MAP || i == S_PARTY; }
 // Settings that are on when the file does not mention them.
 static int setting_default(int i) { return i == S_BOSS_FLOW ? 4 : 0; }  // boss-flow: 4, the day flow
 

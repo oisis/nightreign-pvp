@@ -765,6 +765,9 @@ static void host_test_watch(void) {
 }
 static unsigned long long g_lobby;      // Steam lobby id of our host session, once read
 static unsigned g_marked_squad;         // squad size last written to the lobby, ~0 = not yet
+// The menu's "Number of Players" at the last own start (fill_context_hook): 0 Team, 1 Solo + invaders, 2 Solo.
+static const char *const PLAYERS_MODE[3] = {"Team", "Solo + invaders", "Solo"};
+static int g_players_choice = 1;  // until a start request is seen: a host session, as before
 static int g_someone_joining;           // Steam lobby members beyond the session's (set by lobby_mark)
 static void host_test_start(void) {
     g_lobby = 0;
@@ -772,7 +775,8 @@ static void host_test_start(void) {
     g_marked_squad = ~0u;
     // every player hosts its own expeditions (no switch since 14c271a); no-host (test setting): the own
     // expedition opens no host session (to test whether item pickup breaks inside our host session)
-    g_host_test = setting(S_NO_HOST) ? 0 : 1;
+    // and the menu's "Solo" does the same for that expedition
+    g_host_test = setting(S_NO_HOST) || g_players_choice == 2 ? 0 : 1;
     g_host_test_tick = 0;
 }
 // InGame step, every frame until called: create once the network is ready.
@@ -3665,14 +3669,15 @@ static void hook_target_list(void) {
     hook_call(0x9e7fcc, 0x9e9b60, (void *)builder_second_hook, "target list builder (second)");
 }
 
-// --- "Number of Players": only "1 player" and "Team" ---------------------------------------------
+// --- "Number of Players": Solo, Solo + invaders, Team -----------------------------------------------
 //
 // The option is a CS::ComboItemList<MENU_MATCHING_SORTIE_NUM, 3>: a vtable, three 0x50-byte items
 // stored inline at +8 and the item count at +0x100; the menu reads it through its virtual methods
 // (1 = count, 2..5 = item by index). The game fills it itself (0x146dbe7b9 -> 0x1409fb0xx): outside its
 // own team session [1 player (value 2), 2 players (1), 3 players (0)]; in a team session [2, 3] or [3],
-// putting the request's value (+0x49) on a remaining item first. Our vtable shows [1 player, 3 players]
-// for the full list and [3 players] for [2, 3]; 130408 reads "Team". Value 1 becomes 0 the same way.
+// putting the request's value (+0x49) on a remaining item first. The full list stays as it is, relabelled
+// (launcher): 130409 "Solo" (2: no host session), 130417 "Solo + invaders" (1: the game's solo start, our host
+// session; fill_context_hook), 130408 "Team" (0: party). [2, 3] shows only [3] ("Team"), value 1 becomes 0 there.
 // The list sits at dialog +0x3f58, the request pointer at dialog +0x3e08 (both from the refresh code); the refresh's
 // own count calls (returns 0x1409fb070 / 0x1409fb175 / 0x1409fb318) get the real count.
 
@@ -3690,15 +3695,15 @@ static unsigned combo_count(char *list) {
     if (from == 0x9fb070 || from == 0x9fb175 || from == 0x9fb318) return n;
     if (n == 2 || n == 3) {
         char *req = *(char **)(list + COMBO_REQUEST);
-        if (req && !IsBadReadPtr(req + 0x49, 1) && (req[0x49] == 1 || req[0x49] == 3)) req[0x49] = 0;  // not shown (3: the old fourth option): "Team"
+        // not shown: 3 (the old fourth option) and, in [2, 3], 1: "Team"
+        if (req && !IsBadReadPtr(req + 0x49, 1) && (req[0x49] == 3 || (n == 2 && req[0x49] == 1))) req[0x49] = 0;
     }
-    return n == 3 ? 2 : n == 2 ? 1 : n;
+    return n == 2 ? 1 : n;
 }
 
 static char *combo_item(char *list, int index) {
     unsigned n = *(unsigned *)(list + COMBO_COUNT);
-    if (n == 3 && index == 1) index = 2;  // [1 player, 3 players]
-    else if (n == 2 && index == 0) index = 1;  // [3 players]
+    if (n == 2 && index == 0) index = 1;  // [3 players]
     char *items = list + COMBO_ITEMS;
     return items + ((0 - (unsigned)(SIZE_T)items) & 7) + (long long)index * COMBO_ITEM_SIZE;
 }
@@ -4349,7 +4354,12 @@ static void host_player_no_update(char *mb, char *me) {  // the member whose Ste
 }
 // The lobby this machine is in: its own (host) or the one it joined.
 static u64 our_lobby(void) { return g_lobby ? g_lobby : g_candidate; }
+// Our own host session from "Solo + invaders": host and invaders only. No ally place is published (lobby_mark), the
+// lobby never carries a party code (only a party host sets it), and a member who still claims "ally" counts as an
+// invader here (member_ally), so it takes the one invader slot and is the host's enemy.
+static int solo_invaders_host(void) { return g_players_choice == 1 && !g_party_host; }
 static int member_ally(u64 lobby, u64 id) {
+    if (lobby && lobby == g_lobby && solo_invaders_host()) return 0;
     const char *r = g_diag.get_member && g_steam.mm && lobby ? g_diag.get_member(g_steam.mm, lobby, id, LOBBY_ROLE_KEY) : NULL;
     return r && !strcmp(r, "ally");
 }
@@ -4725,9 +4735,9 @@ static void lobby_mark(void) {
     unsigned key = members | (unsigned)(in_lobby & 0xff) << 8 | allies << 16 | (unsigned)(g_df_used != 0) << 24;
     if (key == g_marked_squad) return;
     g_marked_squad = key;
-    unsigned squad = g_squad + allies, allowed = invaders_allowed(squad);
+    unsigned squad = solo_invaders_host() ? 1 : g_squad + allies, allowed = invaders_allowed(squad);  // Solo + invaders: 1v1
     unsigned room = SESSION_PLAYERS_MAX > squad + others ? SESSION_PLAYERS_MAX - squad - others : 0;  // places left in the session
-    unsigned free_slots = allowed > others ? allowed - others : 0, ally_free = SQUAD_MAX > squad ? SQUAD_MAX - squad : 0;
+    unsigned free_slots = allowed > others ? allowed - others : 0, ally_free = SQUAD_MAX > squad && !solo_invaders_host() ? SQUAD_MAX - squad : 0;
     if (free_slots > room) free_slots = room;
     if (ally_free > room) ally_free = room;
     if (g_party_host && !g_in_expedition) free_slots = 0;  // no invaders before the host is in its expedition
@@ -6488,7 +6498,8 @@ static void host_expedition(int step) {
                 logf("party: host's session from the Roundtable Hold %s (role %d)", kept ? "went on into the expedition" : "is gone: a new one is made",
                      sm0 ? *(int *)(sm0 + 0x10) : -1);
             }
-            logf("host: expedition reached its world%s", g_host_test ? ", opening a host session" : " (no host session: no-host is on)");
+            logf("host: expedition reached its world (mode %s%s)%s", PLAYERS_MODE[g_players_choice], g_party_host ? ", party host" : "",
+                 g_host_test ? ", opening a host session" : g_players_choice == 2 ? " (no host session: Solo)" : " (no host session: no-host is on)");
             if (g_host_test) {
                 if (g_stop_pending) finish_pending_stop(1);
                 if (!g_network_on) set_network(1);
@@ -7055,7 +7066,7 @@ static void step_hook(void *ctrl, void *time, int step) {
 
 // The menu's start request reaches the context through "fill context" (0xb67cc0, two call sites):
 // u64 (self*, request*), with the context at self+8. In the request: the "Number of Players" choice
-// at +0x49 (0 three, 1 two, 2 one) and the chosen Target rows as a u32
+// at +0x49 (0 three, 1 two, 2 one; ours: 0 Team, 1 Solo + invaders, 2 Solo) and the chosen Target rows as a u32
 // vector at +0x58 (begin) / +0x60 (end). The function turns rows into boss numbers, where our row
 // becomes boss 0, and the choice into a player count.
 #define RVA_FILL_CONTEXT       0xb67cc0
@@ -7066,6 +7077,11 @@ static void step_hook(void *ctrl, void *time, int step) {
 #define PLAYERS_CHOICE_FOUR    3         // the old fourth option's value; the offline compare below still admits it (harmless)
 static char *g_dialog;                       // defined with the start button code below
 static int cursor_on_invasion(char *dialog);
+// The game's own use of the choice (0x140b67cc0, read 2026-11-21): +0x49 is read once, at the top: 0 -> 3 players,
+// 1 -> 2, 2 -> 1 (ctx vt+0x28); mode (ctx vt+0x48) = choice != 2 ? 2 (squad: matching steps 1-11) : 1 (solo); ctx+8 =
+// 4 for two players (5 with the special row), else 0 / 1 (password). So "two players" would start FromSoftware's
+// matching for a second player. For "Solo + invaders" the call sees 2 (the plain solo context) and the request
+// gets its 1 back afterwards: the menu (combo list, start button label 0x1409ef445) reads it again next time.
 static unsigned long long fill_context_hook(char *self, char *request) {
     unsigned *begin = *(unsigned **)(request + REQ_ROWS_BEGIN), *end = *(unsigned **)(request + REQ_ROWS_BEGIN + 8);
     size_t count = begin && end >= begin ? (size_t)(end - begin) : 0;
@@ -7073,16 +7089,22 @@ static unsigned long long fill_context_hook(char *self, char *request) {
     // fall back on the chosen rows, where the game itself looks at the last one for its special row.
     int invasion = cursor_on_invasion(g_dialog);
     if (invasion < 0) invasion = count && count <= 64 && begin[count - 1] == INVASION_ROW;
+    unsigned char choice = (unsigned char)request[REQ_PLAYERS_CHOICE];
+    if (choice == 1) request[REQ_PLAYERS_CHOICE] = 2;  // Solo + invaders: the game's solo start
     unsigned long long result = ((unsigned long long (*)(char *, char *))(g_base + RVA_FILL_CONTEXT))(self, request);
+    request[REQ_PLAYERS_CHOICE] = (char)choice;
     g_invasion_pending = invasion;
     g_request_tick = GetTickCount();
-    unsigned char choice = (unsigned char)request[REQ_PLAYERS_CHOICE];
-    if (g_party && !g_party_host && (invasion || choice == 2)) {  // something else chosen: the party wait ends
+    if (g_party && !g_party_host && (invasion || choice != 0)) {  // something else chosen: the party wait ends
         if (g_searching) toggle_search(invasion ? "party: Invasion chosen" : "party: a solo expedition chosen");
         party_end(invasion ? "Invasion chosen" : "a solo expedition chosen");
     }
-    if (!invasion && (choice == 0 || choice == 1)) party_request(self, request);
-    logf("start request: players choice %u, %u target rows, invasion %d", (unsigned char)request[REQ_PLAYERS_CHOICE],
+    // a party host still gathering in the hub (its session is the party's) gives it up for a solo start: no squad
+    // mate can follow it into Solo or Solo + invaders
+    if (g_party && g_party_host && !g_in_expedition && !invasion && choice != 0) party_end("a solo expedition chosen (host)");
+    if (!invasion && choice < 3) g_players_choice = choice;
+    if (!invasion && choice == 0) party_request(self, request);
+    logf("start request: players choice %u (%s), %u target rows, invasion %d", choice, choice < 3 ? PLAYERS_MODE[choice] : "?",
          (unsigned)count, invasion);
     return result;
 }
@@ -7103,7 +7125,7 @@ static unsigned char online_check_hook(char *request) {
     size_t count = begin && end >= begin ? (size_t)(end - begin) : 0;
     for (size_t i = 0; i < count && i < 64; i++)
         if (begin[i] == INVASION_ROW) return 1;
-    if (request[REQ_PLAYERS_CHOICE] <= 1) return 1;  // a squad expedition: gathered by us over Steam (party), never by the server
+    if (request[REQ_PLAYERS_CHOICE] <= 1) return 1;  // Team / Solo + invaders: our own session over Steam, never the server
     return ((unsigned char (*)(void))(g_base + RVA_IS_ONLINE))();
 }
 

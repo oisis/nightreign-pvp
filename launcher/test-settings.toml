@@ -6,7 +6,6 @@ loot-test = false   # logging only: what lies on the ground, every pickup and eq
 no-host = false           # test: your own expedition opens no host session (nobody can invade you)
 test-level = 0            # test: your own expedition sets your level to this number 5 s after the start (0 = off)
 boss-flow = 4             # the day clock (host): 4 = the day flow (held at 18:00 until the squad uses Challenge the Night; enemy tiers per boss; default); 0 = the game's clock (comparison tests)
-challenge-bosses = 1      # test: bosses needed before the challenge (the special boss as well); 0 = 6 (default)
 revive-hits = false       # test, invasions: a downed player is finished by the other side in 2 hits, raised by its own side in 5
 ult-pvp = 100             # test, invasions: ultimate damage against players of the other side in percent (100 = unchanged, 0..999)
 party = 0                 # test only: a number mixed into the squad matchmaking key, to keep test runs apart (0 = off)

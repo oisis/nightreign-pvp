@@ -14,9 +14,11 @@ from fsformats import bnd4_read, bnd4_replace, dcx_write_deflate, fmg_read, fmg_
 OUR_TEXT = {
     # Entry in the expedition menu's Target list (NightBossMenuParam row 101, mod/build_regulation.py).
     "CL_MenuText.fmg": {
-        130305: ("Commence Team Expedition", "Rozpocznij wyprawę drużyny"),
-        130408: ("Team", "Drużyna"),  # the game's "three players": a team too (the list cannot lose an entry)
-        130417: ("Team", "Drużyna"),  # the game's "two players": team (the DLL joins or hosts a session)
+        # "Number of Players" (the DLL: 2 Solo, no session; 1 the game's solo start plus our host session; 0 party)
+        130305: ("Solo + invaders", "Solo + najeźdźcy"),  # the start button for value 1
+        130408: ("Team", "Drużyna"),  # the game's "three players" (value 0)
+        130409: ("Solo", "Solo"),  # the game's "one player" (value 2)
+        130417: ("Solo + invaders", "Solo + najeźdźcy"),  # the game's "two players" (value 1)
         131170: ("A newer mod version (%s) is available. Update to play with others.",
                  "Dostępna jest nowsza wersja moda (%s). Zaktualizuj, żeby grać z innymi."),  # %s: filled in by the DLL
         131171: ("Your team (same password) plays mod version %s. Everyone needs the same version.",
