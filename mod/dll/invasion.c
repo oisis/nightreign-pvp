@@ -1478,6 +1478,7 @@ static void finish_event_hook(void *msg, char *chr, unsigned long long kind, uns
 }
 // Every 250 ms while our local player is down (this thread, reads only): the fields above.
 static int chr_hp(char *c);
+static int speffect_on(char *chr, unsigned id);
 static int ring_on(void);
 static void ring_where(const char *why);
 static void finish_tick(void) {
@@ -1501,9 +1502,9 @@ static void finish_tick(void) {
     next = GetTickCount() + 250;
     static DWORD ring_next;
     if (ring_on() && (int)(GetTickCount() - ring_next) >= 0) ring_next = GetTickCount() + 1000, ring_where("while down");
-    logf("finish test: state %u gauge %.1f timer %.2f grace %.2f HP %d still-down %u stand-up %u down count %u%s", (unsigned char)chr[0x710],
+    logf("finish test: state %u gauge %.1f timer %.2f grace %.2f HP %d still-down %u stand-up %u down count %u 102120 %d%s", (unsigned char)chr[0x710],
          *(float *)(chr + 0x714), *(float *)(chr + 0x718), *(float *)(chr + 0x71c), chr_hp(chr), (unsigned char)chr[0x731],
-         (unsigned char)chr[0x732], (unsigned char)chr[0x730], g_finish_tick && chr == g_finish_chr ? " (stand-up refused)" : "");
+         (unsigned char)chr[0x732], (unsigned char)chr[0x730], speffect_on(chr, 102120), g_finish_tick && chr == g_finish_chr ? " (stand-up refused)" : "");
     if (chr == g_finish_chr && chr[0x710] != 1) g_finish_tick = 0, g_finish_chr = NULL;
 }
 // loot-test (logging only): what a killed invader leaves and what the local player can take.
@@ -3967,6 +3968,7 @@ static DWORD g_request_tick;  // when the last start request arrived
 #define LOBBY_FPOS_KEY   "nrpvp_fpos"    // host's position local to that tile "x,y,z" (0x140631740): the same on every machine
 #define LOBBY_GEN_KEY    "nrpvp_gen"     // host's generator results gm +0xb48,+0xb54,+0xb5c (hex)
 #define LOBBY_START_KEY  "nrpvp_start"   // host's expedition start block (game manager +0xa74), 8 hex digits
+#define LOBBY_TARGET_KEY "nrpvp_target"  // host's targeted Nightlord: play state +0xdf (NightBossMenuParam row, 255 none)
 #define LOBBY_ALLY_FREE_KEY "nrpvp_ally_free"  // free places in the host's squad for allies (squad of three)
 #define LOBBY_ROLE_KEY   "nrpvp_role"    // a joiner's own lobby member data: "ally" or "invader"
 #define LOBBY_VER_KEY    "nrpvp_ver"     // the mod version (MOD_VERSION); only the same version pairs up
@@ -4743,6 +4745,12 @@ static void lobby_mark(void) {
                 snprintf(gen, sizeof gen, "%x,%x,%x", *(unsigned *)(gm + 0xb48), *(unsigned *)(gm + 0xb54), *(unsigned *)(gm + 0xb5c));
                 lobby_set(LOBBY_GEN_KEY, gen);
                 expedition_log("host");
+            }
+            char *pd = *(char **)(g_base + 0x3c078d0);
+            if (pd) {  // the targeted Nightlord (see target_from_host): set by our own start, the same for the whole expedition
+                snprintf(text, sizeof text, "%u", (unsigned char)pd[0xdf]);
+                lobby_set(LOBBY_TARGET_KEY, text);
+                logf("host: targeted Nightlord published: play state +0xdf %u", (unsigned char)pd[0xdf]);
             }
         }
         g_squad = g_party_host ? 1 : members;  // a party host's squad mates are allies (their member data says so)
@@ -7088,6 +7096,27 @@ static void pending_log(const char *when) {
     if (gm) logf("move test: %s: pending block %08x +aac %u type %u reason %d +dc1 %u", when, *(unsigned *)(gm + 0xa74),
                  (unsigned char)gm[0xaac], (unsigned char)gm[0xdc0], *(int *)(gm + 0xdbc), (unsigned char)gm[0xdc1]);
 }
+// The targeted Nightlord. EMEVD "Targeting Boss" (EcTestTargetBoss::vfunc1 0x1405a9200 -> 0x1401fea90) compares the
+// play state's byte +0xdf (*(0x143c078d0)) with a NightBossMenuParam row: common.emevd 1312 turns it into flags
+// 9090..9099 (which Nightlord), and m12_00 12002001 (day 3) warps to m18 / m16_00 / m16_10 for rows 7 / 8 / 9 and to
+// m19 for every other value. The game writes +0xdf only in SingleStart 0xb5c010, GuestReadyWait 0xb545a0 and
+// 0x140b57150 (setter 0x140202340, value: the quick-match context's +0x17c, vt+0x188); a joiner enters through the
+// move test (step 21), past all three, so it kept 255 (run of 2026-11-21: the ally's +0xdf 255 all expedition, the
+// host's 5). Set to the host's before the world loads, with the game's own setter.
+static void target_from_host(void) {
+    char *pd = *(char **)(g_base + 0x3c078d0);
+    const char *t = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_TARGET_KEY);
+    char *end = NULL;
+    unsigned long v = t && *t ? strtoul(t, &end, 10) : 0;
+    if (!pd || !end || *end || v > 255) {
+        logf("move test: targeted Nightlord: the host's lobby has no usable %s ('%s'): ours kept (+0xdf %d)", LOBBY_TARGET_KEY, t ? t : "",
+             pd ? (unsigned char)pd[0xdf] : -1);
+        return;
+    }
+    unsigned was = (unsigned char)pd[0xdf];
+    ((void (*)(unsigned char))(g_base + 0x202340))((unsigned char)v);
+    logf("move test: targeted Nightlord: play state +0xdf %u -> %u (the host's)", was, (unsigned char)pd[0xdf]);
+}
 static int move_force(char *ctrl) {
     g_move = 2;
     g_move_tick = GetTickCount();
@@ -7135,6 +7164,7 @@ static int move_force(char *ctrl) {
             logf("move test: generator results set to the host's: %x,%x,%x", g1, g2, g3);
         }
     }
+    target_from_host();
     // Play state as a group guest's start sets it (SingleStart 0xb5c010 / GuestReadyWait 0xb545a0:
     // 0x200a20(2) requested mode expedition; 0x200a30 requested +0xdd = 2 so that after the switch
     // +0xdc is 2 and the equipment packet 0xc is sent; gm+0xaf0 cleared with 0x6abae0, or the move
@@ -7206,6 +7236,58 @@ static int move_force(char *ctrl) {
 static int cursor_on_invasion(char *dialog);
 static char *g_dialog;
 static DWORD g_request_tick;
+// A downed player with nobody of its squad left in the session to raise it (owner's rule, 2026-11-21). In a boss
+// fight (flag 9015: common.emevd 1301 sets it at night 7515 in the play area and on day 3 7510) event 1302 puts SpEffect
+// 102120 on the host, and the down itself (0x14066e8e0) adds it: while it is on, 0x140674eb0 (at 0x140674fcd) puts
+// the bleed-out timer +0x718 back to GameSystemCommonParam +0x2f4 (15 s) every frame, so the down never ends by
+// itself. The game's own end is then the squad wipe, common.emevd 1180, over the players' flags 7005..7007 (1182 /
+// 1184): a member that left in a split never completes it (run of 2026-11-21: the host alone in the session from
+// 22:25:52, down at 22:27:57 in m19, "timer 15.00" until the end). Here, every frame: our player down (+0x710 1), no
+// remote session member of our side whose character is up or not seen here (not loaded: it may come), no invader in
+// the session (decision 22: a downed host stays down for the invader to finish, 1-2 hits), and the game's solo revival (6999500, solo only: common 1101 / 1104, used by 1181 in the down) not on us: 102121
+// (same SpEffect category 201 and priority, endurance 0: 1302's own way to end 102120) and the timer 0, the bleed-out
+// death of the finish test. The death then takes the death restart (df_death_restart_hook: extra lives, game over).
+// An invader keeps its own down rule (decision 22: it has no squad).
+static int someone_to_act_in_session(char *why, size_t cap) {
+    char *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR), *wcm = *(char **)(g_base + RVA_WORLD_CHR_MAN);
+    char *b = sm ? *(char **)(sm + SM_PLAYERS_BEGIN) : NULL, *e = sm ? *(char **)(sm + SM_PLAYERS_BEGIN + 8) : NULL;
+    int up = 0, n = 0;
+    why[0] = 0;
+    for (char *x = b; b && x < e && !IsBadReadPtr(x, SM_PLAYER_SIZE); x += SM_PLAYER_SIZE) {
+        if (x[0xe1]) continue;  // us
+        int no = *(int *)(x + 0xd4), inv = member_no_is_invader(no);
+        char *c = wcm ? ((char *(*)(void *, int))(g_base + 0x5197e0))(wcm, no) : NULL;  // by player number, as 0x7c5710
+        int ok = c && !IsBadReadPtr(c, 0x740), hp = ok ? chr_hp(c) : -1, down = ok && c[0x710] == 1;
+        if (inv || !ok || (hp > 0 && !down)) up++;  // an invader can act on us (decision 22: it finishes a downed host)
+        n += snprintf(why + n, n < (int)cap ? cap - n : 0, "%s[no %d %s %s HP %d%s]", n ? " " : "", no, inv ? "invader" : "squad",
+                      ok ? "seen" : "not seen", hp, down ? " down" : "");
+        if (n >= (int)cap) n = (int)cap - 1;
+    }
+    if (!why[0]) snprintf(why, cap, "nobody else");
+    return up;
+}
+static void lone_down_frame(void) {
+    static char *ended;
+    char *me = local_player();
+    if (!me || IsBadReadPtr(me, 0x740) || me[0x710] != 1) {
+        ended = NULL;
+        return;
+    }
+    if (!g_in_exped || (g_join == 4 && !g_as_ally) || speffect_on(me, 6999500)) return;
+    char why[300];
+    if (someone_to_act_in_session(why, sizeof why)) {
+        if (ended == me) logf("lone down: a squad member up or an invader in the session again (%s): left to the game", why);
+        ended = NULL;
+        return;
+    }
+    if (ended != me) {
+        logf("lone down: down (gauge %.1f, timer %.2f, HP %d, 102120 %d) and nobody to act on us in the session (no squad member up, no invader: %s): 102121 and timer 0, "
+             "the bleed-out death", *(float *)(me + 0x714), *(float *)(me + 0x718), chr_hp(me), speffect_on(me, 102120), why);
+        ((void (*)(void *, int, unsigned char))(g_base + RVA_ADD_SPEFFECT))(me, 102121, 0);
+        ended = me;
+    }
+    *(float *)(me + 0x718) = 0;
+}
 static void step_hook(void *ctrl, void *time, int step) {
     g_last_frame = GetTickCount();
     if (1) marker_clear();
@@ -7273,6 +7355,7 @@ static void step_hook(void *ctrl, void *time, int step) {
     }
     no_sprint_frame();
     ground_frame();
+    lone_down_frame();
     g_in_exped = step == QM_STEP_INGAME || g_join_in_world();
     if (!g_in_exped) g_df_inv_dead = NULL;
     night_hide_frame(g_in_exped);
