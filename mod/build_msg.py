@@ -12,7 +12,7 @@ from fsformats import bnd4_read, bnd4_replace, dcx_write_deflate, fmg_read, fmg_
 
 # Our own lines: text table -> id -> (English, Polish). Keep in sync with launcher/core.c.
 OUR_TEXT = {
-    # Entry in the expedition menu's Target list (NightBossMenuParam row 101, mod/build_regulation.py).
+    # Entries in the expedition menu's Target list (NightBossMenuParam rows 101 / 102, mod/build_regulation.py).
     "CL_MenuText.fmg": {
         # "Number of Players" (the DLL: 2 Solo, no session; 1 the game's solo start plus our host session; 0 party)
         130305: ("Solo + invaders", "Solo + najeźdźcy"),  # the start button for value 1
@@ -39,6 +39,16 @@ OUR_TEXT = {
         131167: ("Waiting for the squad's host...", "Oczekiwanie na hosta drużyny..."),  # party: the host is not in the field yet
         131168: ("The invader has left", "Najeźdźca odszedł"),  # host / allies: an invader left without dying
         131169: ("You have invaded another squad's expedition!", "Wkroczyłeś do wyprawy innej drużyny!"),  # the invader on arrival
+        # "Play as a summon" (NightBossMenuParam row 102): name, description, searching / cancelled notices and the
+        # start button's labels while searching / otherwise
+        131175: ("Play as a summon", "Graj jako summon"),
+        131176: ("Join another squad's expedition as its host's summon.\nWith a password: only that squad.",
+                 "Dołącz do wyprawy innej drużyny jako summon jej hosta.\nZ hasłem: tylko do tej drużyny."),
+        131177: ("Searching for a host to join...", "Szukanie hosta do dołączenia..."),
+        131178: ("Summon search cancelled", "Anulowano szukanie hosta"),
+        131194: ("You are offline: no host can be found", "Jesteś offline: nie można znaleźć hosta"),
+        131179: ("Cancel search", "Anuluj szukanie"),
+        131185: ("Begin search", "Rozpocznij szukanie"),
     },
 }
 

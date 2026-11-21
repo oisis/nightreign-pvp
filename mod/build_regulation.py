@@ -6,7 +6,8 @@
     uv run build_regulation.py <game's regulation.bin> <out regulation.bin> [--no-row]
 
 The Target list is NightBossMenuParam. Row 100 is the game's own non-boss entry ("The Deep of Night");
-our row 101 is a copy of it with our texts (ids in CL_MenuText, added by build_msg.py).
+our rows 101 (Invasion) and 102 (Play as a summon) are copies of it with our texts (ids in CL_MenuText,
+added by build_msg.py).
 Experiment: the launcher cannot do this yet (it has no zstd), and selecting the entry is not handled.
 """
 import struct
@@ -22,13 +23,15 @@ from fsformats import bnd4_read, bnd4_replace
 from regulation import KEYS, decrypt, undcx
 
 PARAM = "\\NightBossMenuParam.param"
-TEMPLATE_ROW, NEW_ROW = 100, 101
+TEMPLATE_ROW, NEW_ROW, SUMMON_ROW = 100, 101, 102
 # field values of the template row -> ours (each must occur exactly once in the row)
 CHANGES = {131150: 131160,   # expeditionNameId
            131151: 131161,   # descriptionId
            41812: 41813,     # bossIconId: our icon (build_icon.py)
            300: 5,           # sortId: before the first Nightlord (the DLL also places it first)
            130: 0}           # unlockEventFlag: always available
+# Row 102, "Play as a summon": the same as 101 with its own texts, sorted right after it
+SUMMON_CHANGES = {**CHANGES, 131150: 131175, 131151: 131176, 300: 6}
 
 
 FIRST_LARGE_ICON, LARGE_ICON = 41820, 41814   # row 0's largeBossIconId; ours (build_icon.py)
@@ -150,8 +153,8 @@ def ally_row(row):
     struct.pack_into("<i", row, SPEFFECT_VFX1, ALLY_PHANTOM_VFX)
 
 
-def add_row(param):
-    """Append a copy of TEMPLATE_ROW as NEW_ROW. Layout: 0x40 header, 24-byte row descriptors
+def add_row(param, new_id=NEW_ROW, changes=CHANGES):
+    """Append a copy of TEMPLATE_ROW as new_id. Layout: 0x40 header, 24-byte row descriptors
     (id, pad, data offset, name offset), row data, strings."""
     strings_off, = struct.unpack_from("<I", param, 0)
     count, = struct.unpack_from("<H", param, 0x0A)
@@ -160,10 +163,10 @@ def add_row(param):
     data_start = rows[0][2]
     size = rows[1][2] - rows[0][2]
     assert data_start == 0x40 + count * 24 and strings_off == data_start + count * size
-    assert all(r[0] < NEW_ROW for r in rows), "row id already used"
+    assert all(r[0] < new_id for r in rows), "row id already used"
     template = next(r for r in rows if r[0] == TEMPLATE_ROW)
     row = bytearray(param[template[2]:template[2] + size])
-    for old, new in CHANGES.items():
+    for old, new in changes.items():
         hits = [o for o in range(0, size - 3) if struct.unpack_from("<i", row, o)[0] == old]
         assert len(hits) == 1, f"value {old} found {len(hits)} times in the template row"
         struct.pack_into("<i", row, hits[0], new)
@@ -182,7 +185,7 @@ def add_row(param):
     struct.pack_into("<q", out, 0x30, data_start + 24)
     for rid, pad, data_off, name_off in rows:
         out += struct.pack("<iiqq", rid, pad, data_off + 24, name_off + shift)
-    out += struct.pack("<iiqq", NEW_ROW, 0, data_start + 24 + count * size, template[3] + shift)
+    out += struct.pack("<iiqq", new_id, 0, data_start + 24 + count * size, template[3] + shift)
     out += param[data_start:strings_off] + row + param[strings_off:]
     return bytes(out)
 
@@ -196,7 +199,7 @@ def main(src, dst, no_row=False, rain=True):
     npc = next(b for n, b in bnd4_read(bundle) if n.endswith(NPC_PARAM))
     # --no-row: repack without changing anything, to tell packing problems from param problems.
     patched = bundle if no_row else bnd4_replace(bundle, {
-        PARAM: add_row(param),
+        PARAM: add_row(add_row(param), SUMMON_ROW, SUMMON_CHANGES),
         SPEFFECT_PARAM: insert_row(insert_row(speffect, SPEFFECT_TEMPLATE, SPEFFECT_TEAM_ROW, SPEFFECT_SIZE, team_row),
                                    SPEFFECT_TEMPLATE, SPEFFECT_ALLY_ROW, SPEFFECT_SIZE, ally_row),
         NPC_PARAM: scarab_rows(npc),
@@ -220,7 +223,7 @@ def main(src, dst, no_row=False, rain=True):
     p = next(b for n, b in bnd4_read(check) if n.endswith(PARAM))
     count, = struct.unpack_from("<H", p, 0x0A)
     ids = [struct.unpack_from("<i", p, 0x40 + i * 24)[0] for i in range(count)]
-    assert (ids[-1] == NEW_ROW) != no_row and len(bnd4_read(check)) == len(bnd4_read(bundle))
+    assert (ids[-2:] == [NEW_ROW, SUMMON_ROW]) != no_row and len(bnd4_read(check)) == len(bnd4_read(bundle))
     if not no_row:  # our SpEffect row reads back with its two fields, between its neighbours
         p = next(b for n, b in bnd4_read(check) if n.endswith(SPEFFECT_PARAM))
         count, = struct.unpack_from("<H", p, 0x0A)

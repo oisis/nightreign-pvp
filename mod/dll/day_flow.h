@@ -11,7 +11,9 @@
 #define DF_TIER_FIRST   90071700
 #define DF_TIER_COUNT   200
 #define DF_BOSSES       6
-#define LOBBY_CHAL_KEY  "nrpvp_chal"   // host lobby: the challenge's number this expedition ("1", "2"); members: the same as member data
+#define LOBBY_CHAL_KEY  "nrpvp_chal"   // host lobby: "seq,day" (the challenges this expedition, the day of the last; "0,0" none); members: the seq they ask for, as member data
+#define LOBBY_DF_KEY    "nrpvp_df"     // host lobby: the day flow's state (df_state_sync)
+#define LOBBY_WF_KEY    "nrpvp_wf"     // host lobby: world flags for late joiners (df_world_flags_sync)
 // The special bosses, one per region (owner, 2026-11-19; death flags, 2003[69] after death through common_func 90015002 /
 // 90015407; see 08-flagi-gry): the Mountaintop's ice dragon (m60_42_38_10, 42_39_10, 43_39_10), the Rotted Woods'
 // Captain (m60_45_36_30), the Crater's Magma Wyrm (m60_44_38_20), Noklateo's Naturalborn of the Void (m60_42_36_50).
@@ -120,6 +122,7 @@ static void df_day2_count(void) {
 // in the night-boss maps m47, m48, m49, m52: block >> 24) before this day's challenge.
 static char *g_df_rows[DF_TIER_COUNT + 1];
 static int g_df_rows_ready;
+static int g_df_d2_with, g_df_d2_on, g_df_d2_fixed, g_df_d2_host = -1, g_df_samples;  // the day-2 SpEffect (df_tier_apply)
 static unsigned g_df_pass_count;
 static int df_is_player(char *chr) {
     char *wcm = *(char **)(g_base + RVA_WORLD_CHR_MAN);
@@ -291,6 +294,35 @@ static void df_tier_apply(char *chr) {
     for (int i = 0; i < nd; i++) ((unsigned char (*)(char *, int))(g_base + 0x601210))(chr, DF_TIER_FIRST + drop[i]);
     if (want && !have) ((void (*)(void *, int, unsigned char))(g_base + RVA_ADD_SPEFFECT))(chr, DF_TIER_FIRST + want, 0);
     g_df_pass_count++;
+    // The game's day-2 strength: NpcParam +0x2dc (day2SpEffectID, 7400..7467; 7440 = HP and attack x1.3), which
+    // CS::NpcSpEffectEquipCtrl::vfunc11 (0x1405000d0) gives out for the ctrl at chr +0x228 (made by 0x1403dce00 in the
+    // character's set-up; its +0x30 set by 0x140500040). Run of 2026-11-21: camp invader 30300050 at day 2's challenge
+    // HP 1764 on the host, 1357 on the ally (1043 on both on day 1, tier 30 % on both): 1043 x 1.3 x 1.3 against
+    // 1043 x 1.3, so the ally lacked it. What switches it on goes through protected code (not read), so it is not
+    // re-derived here: the host counts how many characters with such an id carry it (g_df_d2_*), publishes whether
+    // most do (df_state_sync), and a joiner puts it on / takes it off to match (g_df_d2_host, -1 not known).
+    int d2 = 0, d2_on = 0;
+    unsigned npc = 0;
+    if (!IsBadReadPtr(*(void **)chr, 0x1a8)) {
+        char **ref = ((char **(*)(char *))(*(void ***)chr)[0x1a0 / 8])(chr);
+        if (ref && !IsBadReadPtr(ref, 12) && *ref && !IsBadReadPtr(*ref + 0x2dc, 4)) d2 = *(int *)(*ref + 0x2dc), npc = *(unsigned *)(ref + 1);
+    }
+    if (d2 > 0) {
+        d2_on = speffect_on(chr, (unsigned)d2);
+        if (g_join == 4 && g_df_d2_host == 1 && !d2_on) ((void (*)(void *, int, unsigned char))(g_base + RVA_ADD_SPEFFECT))(chr, d2, 0), g_df_d2_fixed++;
+        else if (g_join == 4 && g_df_d2_host == 0 && d2_on) ((unsigned char (*)(char *, int))(g_base + 0x601210))(chr, d2), g_df_d2_fixed++;
+        g_df_d2_with++, g_df_d2_on += d2_on;
+    }
+    if (g_df_samples > 0 && (d2 > 0 || want)) {  // a few characters per window (day_flow_frame), on every machine alike
+        g_df_samples--;
+        char **pd = !IsBadReadPtr(chr + 0x1b8, 8) ? *(char ***)(chr + 0x1b8) : NULL;
+        char *m = pd && !IsBadReadPtr(pd, 8) ? *pd : NULL;
+        int ok = m && !IsBadReadPtr(m + 0x140, 12);
+        logf("day flow: strength sample: chr block %08x NpcParam %u: tier SpEffect %d %s, day-2 SpEffect %d %s; HP %d of max %d (base %d)",
+             *(unsigned *)(chr + CHR_BLOCK_ID), npc, want ? DF_TIER_FIRST + want : 0, want ? (speffect_on(chr, DF_TIER_FIRST + want) ? "on" : "OFF") : "(none)",
+             d2, d2 > 0 ? (speffect_on(chr, (unsigned)d2) ? "on" : "off") : "(none)", ok ? *(int *)(m + 0x140) : -1, ok ? *(int *)(m + 0x144) : -1,
+             ok ? *(int *)(m + 0x148) : -1);
+    }
     // Proof of the scaling on the night boss (owner, 2026-11-19): a character in a night-boss arena with a big HP pool
     // (max HP above 3000; the arena's adds are below) is logged once per challenge, with its NpcParam row id, whether
     // it carries the tier SpEffect now and its HP data (module [chr +0x1b8] +0x140 HP, +0x144 / +0x148 raw: max HP as
@@ -619,21 +651,24 @@ static void bf4_frame(int first) {
     if (first) held = 0, released_day = 0, base_pa = 0;
     if (!pa || !clock) return;
     if (!base_pa) base_pa = *(float *)(pa + PA_BASE_RATE), base_clock = *(float *)(clock + CLOCK_BASE_RATE);
+    unsigned long long v = *(unsigned long long *)(pa + PA_TIME);
+    unsigned secs = (((unsigned)(v >> 34) & 0x1f) * 60 + ((unsigned)(v >> 39) & 0x3f)) * 60 + ((unsigned)(v >> 45) & 0x3f);
+    const char *who = g_join == 4 ? " (joiner, the host's challenge)" : "";
     if (g_df_go && released_day != g_df_day) {
         released_day = g_df_day, held = 0;
         *(float *)(pa + PA_RATE) = base_pa, *(float *)(pa + PA_BASE_RATE) = base_pa;
         *(float *)(clock + CLOCK_RATE) = base_clock, *(float *)(clock + CLOCK_BASE_RATE) = base_clock;
-        ((void (*)(char *, int, int, int))(g_base + RVA_PA_SET_TIME))(pa, 23, 0, 0);
-        logf("clock: boss flow 4: day %d's challenge: clock set to 23:00:00 and released (the night follows)", g_df_day);
+        int jump = secs < 23 * 3600;  // a joiner arriving in a running night is past it already
+        if (jump) ((void (*)(char *, int, int, int))(g_base + RVA_PA_SET_TIME))(pa, 23, 0, 0);
+        logf("clock: boss flow 4%s: day %d's challenge: clock %s and released (the night follows)", who, g_df_day,
+             jump ? "set to 23:00:00" : "already past 23:00, left");
         return;
     }
     if (released_day == g_df_day) return;
-    unsigned long long v = *(unsigned long long *)(pa + PA_TIME);
-    unsigned secs = (((unsigned)(v >> 34) & 0x1f) * 60 + ((unsigned)(v >> 39) & 0x3f)) * 60 + ((unsigned)(v >> 45) & 0x3f);
     if (secs >= DF_HOLD_H * 3600 && secs < 23 * 3600) {
         if (!held) {
             ((void (*)(char *, int, int, int))(g_base + RVA_PA_SET_TIME))(pa, DF_HOLD_H, 0, 0);
-            held = 1, logf("clock: boss flow 4: day %d at %d:00:00, held until the challenge", g_df_day, DF_HOLD_H);
+            held = 1, logf("clock: boss flow 4%s: day %d at %d:00:00, held until the challenge", who, g_df_day, DF_HOLD_H);
         }
         *(float *)(pa + PA_RATE) = 0.0f, *(float *)(pa + PA_BASE_RATE) = 0.0f;
         *(float *)(clock + CLOCK_RATE) = 0.0f, *(float *)(clock + CLOCK_BASE_RATE) = 0.0f;
@@ -680,10 +715,11 @@ static void df_item_used(void) {
         logf("day flow: item used %s: kept, not consumed", g_df_used ? "after this day's challenge" : "before the condition");
         return;
     }
-    char text[8];
+    char text[16];
     g_df_used_here = 1;
     snprintf(text, sizeof text, "%d", ++g_df_seq);
     if (g_join != 4) {
+        snprintf(text, sizeof text, "%d,%d", g_df_seq, g_df_day);
         if (g_lobby) lobby_set(LOBBY_CHAL_KEY, text);
         df_start_local("ours, as the host");
     } else if (g_as_ally && g_diag.set_member && g_steam.mm && g_candidate) {
@@ -691,9 +727,17 @@ static void df_item_used(void) {
         logf("day flow: item used as an ally: challenge %s asked of the host (member data)", text);
     }
 }
+// Joiner (owner, 2026-11-22): the host's lobby keeps the last challenge ("seq,day") for the whole expedition, so a
+// joiner takes it as the state it arrives in (g_df_chal_seen -1 until then) instead of replaying it. Only a challenge
+// of the host's current day (its LOBBY_DF_KEY day) is one the squad is in: an ally is warped into it, an invader goes
+// home; an older day's is history. Members that were in the session before a challenge see it as a new seq, as before.
+static int g_df_chal_seen = -1;
+static int df_host_day(void) {  // the host's current day from its day-flow state; 0 not known yet
+    const char *v = g_candidate ? g_steam.get_data(g_steam.mm, g_candidate, LOBBY_DF_KEY) : NULL;
+    return v && *v ? atoi(v) : 0;
+}
 static void df_lobby_watch(void) {
     static DWORD next;
-    static int seen = 0;
     if ((int)(GetTickCount() - next) < 0 || !g_steam.mm || g_steam_down) return;
     next = GetTickCount() + 500;
     if (g_join != 4 && g_lobby) {  // host: an ally's request
@@ -703,22 +747,27 @@ static void df_lobby_watch(void) {
             const char *v = g_diag.get_member(g_steam.mm, g_lobby, id, LOBBY_CHAL_KEY);
             int k = v && *v ? atoi(v) : 0;
             if (k > g_df_seq && g_df_met && !g_df_used) {
-                char text[8];
-                snprintf(text, sizeof text, "%d", g_df_seq = k);
+                char text[16];
+                snprintf(text, sizeof text, "%d,%d", g_df_seq = k, g_df_day);
                 lobby_set(LOBBY_CHAL_KEY, text);
                 df_start_local("an ally's");
             }
         }
     } else if (g_join == 4 && g_candidate) {  // joiner: the host's challenge
         const char *v = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_CHAL_KEY);
-        int k = v && *v ? atoi(v) : 0;
-        if (k > seen) {
-            seen = k, g_df_seq = k > g_df_seq ? k : g_df_seq;
-            if (!g_as_ally) join_over("the host's squad took the night challenge");
-            else if (!g_df_used) df_start_local("the host's");
-        }
+        int k = 0, day = 0, hd = df_host_day();
+        if (v && *v) sscanf(v, "%d,%d", &k, &day);
+        if (!hd) return;  // the host's state first
+        int current = k > 0 && day >= hd, arrival = g_df_chal_seen < 0;
+        if (!arrival && k <= g_df_chal_seen) return;
+        g_df_chal_seen = k, g_df_seq = k > g_df_seq ? k : g_df_seq;
+        logf("day flow: the host's challenge %s: %d this expedition, the last on day %d; the host's day %d: %s", arrival ? "state at our arrival" : "changed",
+             k, day, hd, !k ? "none yet" : current ? (g_as_ally ? "this day's, we join it" : "this day's: the squad is in the arena") : "an older day's, not replayed");
+        if (!current) return;
+        if (!g_as_ally) join_over("the host's squad took the night challenge");
+        else if (!g_df_used) df_start_local("the host's");
     }
-    if (g_join != 4) seen = 0;
+    if (g_join != 4) g_df_chal_seen = -1;
 }
 // --- world events (host): the launcher gives every composition the day-1 flag of each family, so the handlers wait;
 // from the host's level 5 on, every 2 bosses (this day) the next family's start flag goes on as a network flag
@@ -858,8 +907,12 @@ static void df_death_restart_hook(long long *ev, void *sm) {
         return;
     }
     if (g_df_ended) return;
-    if (g_join != 4 && df_extra_life(me, 1)) {  // the host (or solo): the life goes, the game's own revive (a level less)
-        logf("day flow: not the final death: the game's death restart revives (an extra life used)");
+    // The host (summons in the session or not) and an ally alike (owner, 2026-11-22): the life a player has goes, the game's
+    // own revive (a level less). As the game's events: 1180 (squad) gives each squad member 10002..10004 its 540155 /
+    // 6999100; 1181 (solo) also 6999500, which only 1101 / 1104 give and only alone (with 82100), so it is never on in a
+    // squad. Each player's own SpEffects decide, read here on our own character. An invader returned above.
+    if ((g_join != 4 || g_as_ally) && df_extra_life(me, 1)) {
+        logf("day flow: not the final death (%s): the game's death restart revives (an extra life used)", g_join == 4 ? "ally" : "host");
         ((void (*)(long long *, void *))(g_base + 0x5c38f0))(ev, sm);
         return;
     }
@@ -896,7 +949,6 @@ static void df_death_restart_install(void) {
 // it in its lobby data (LOBBY_DF_KEY "day,bosses,special,met,met_at,after,kills_day,second,need", on change); a joiner
 // takes it at its arrival and on every change instead of counting itself (its boss count, the condition, the tier,
 // the camps' second invaders, the progress notice). The challenge itself goes as before (LOBBY_CHAL_KEY).
-#define LOBBY_DF_KEY "nrpvp_df"
 static int g_df_host_state;  // joiner: the host's state was taken (from then on it does not count itself)
 static void df_state_sync(void) {
     static DWORD next;
@@ -907,26 +959,94 @@ static void df_state_sync(void) {
     if (g_join != 4) {
         g_df_host_state = 0;
         if (!g_lobby) return;
-        snprintf(text, sizeof text, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d", g_df_day, g_df_bosses, g_df_special, g_df_met, g_df_met_at, g_df_after,
-                 g_df_kills_day, g_df_second, g_df_need, g_df_killed1, g_df_killed2);
+        snprintf(text, sizeof text, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d", g_df_day, g_df_bosses, g_df_special, g_df_met, g_df_met_at, g_df_after,
+                 g_df_kills_day, g_df_second, g_df_need, g_df_killed1, g_df_killed2, g_df_d2_host);
         if (strcmp(text, last)) snprintf(last, sizeof last, "%s", text), lobby_set(LOBBY_DF_KEY, text);
         return;
     }
     const char *v = g_candidate ? g_steam.get_data(g_steam.mm, g_candidate, LOBBY_DF_KEY) : NULL;
-    int d[11];
-    if (!v || sscanf(v, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d", &d[0], &d[1], &d[2], &d[3], &d[4], &d[5], &d[6], &d[7], &d[8], &d[9], &d[10]) != 11) return;
+    int d[12];
+    if (!v || sscanf(v, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d", &d[0], &d[1], &d[2], &d[3], &d[4], &d[5], &d[6], &d[7], &d[8], &d[9], &d[10], &d[11]) != 12) return;
     if (g_df_host_state && !strcmp(v, last)) return;
     // a notice for a change of the host's (not at the arrival): more bosses, or the condition, also at once on day 2
     int more = g_df_host_state && (d[1] > g_df_bosses || d[2] > g_df_special || d[3] > g_df_met || (d[0] > g_df_day && d[3]));
     snprintf(last, sizeof last, "%s", v);
     g_df_day = d[0], g_df_bosses = d[1], g_df_special = d[2], g_df_met = d[3], g_df_met_at = d[4], g_df_after = d[5];
-    g_df_kills_day = d[6], g_df_second = d[7], g_df_need = d[8], g_df_killed1 = d[9], g_df_killed2 = d[10];
+    g_df_kills_day = d[6], g_df_second = d[7], g_df_need = d[8], g_df_killed1 = d[9], g_df_killed2 = d[10], g_df_d2_host = d[11];
     logf("day flow: the host's state %s: day %d, %d bosses, special %d, condition %d, after it %d, this day %d, second invaders %d, "
-         "needed on day 2 %d, ordinary bosses day 1 %d / day 2 %d", g_df_host_state ? "changed" : "taken", d[0], d[1], d[2], d[3], d[5], d[6], d[7], d[8], d[9], d[10]);
+         "needed on day 2 %d, ordinary bosses day 1 %d / day 2 %d, day-2 SpEffect %d", g_df_host_state ? "changed" : "taken", d[0], d[1], d[2], d[3], d[5], d[6], d[7],
+         d[8], d[9], d[10], d[11]);
     if (!g_df_host_state) g_df_told_met = g_df_met, g_df_told_tier = df_target_tier();  // arrival: nothing new to tell yet
     g_df_host_state = 1;
     if (more) g_df_notice_due = GetTickCount() + 6000 | 1;
     df_repass("the host's state");
+}
+// World flags a late joiner missed (owner, 2026-11-22): the host publishes (LOBBY_WF_KEY "<map>;<bosses>", hex, on
+// change, every 2 s) the Rotted Woods tower's map flags (1056304580 / 81: their block's d digit is 4, not one of the
+// death flags' 0, and the joiner must see the woods map as the host does) and every boss death flag of boss-deaths.txt
+// that is on: bit i * 10 + n for list entry i (sorted) and instance n (small-map ids: n * 10^8 + id; tile ids n = 0),
+// the hex digit k holding bits 4k..4k+3, trailing zeros cut. A joiner, once it has taken the host's state (its own
+// count no longer runs, so these do not count as kills there), sets each one that is off here through the game's
+// setter (two_flag: 0x5e79f0); one without a block yet (its tile not laid out) is tried again every 2 s.
+static const unsigned DF_WF_MAP[] = {1056304580, 1056304581};
+static char g_df_wf_last[2200];  // the value last published / applied ("" again at each expedition's start)
+static void df_world_flags_sync(void) {
+    static DWORD next;
+    char *last = g_df_wf_last;
+    static int pending;
+    static u64 for_lobby;
+    char *man = flag_man();
+    if ((int)(GetTickCount() - next) < 0 || !g_steam.mm || g_steam_down || !man) return;
+    next = GetTickCount() + 2000;
+    enum { NMAP = sizeof DF_WF_MAP / sizeof *DF_WF_MAP };
+    if (g_join != 4) {
+        char text[2100];
+        unsigned char nib[2048] = {0};  // ponytail: 819 list entries at most (191 now); a longer list is cut
+        int nb = 0, map = 0;
+        if (!g_lobby) return;
+        if (for_lobby != g_lobby) for_lobby = g_lobby, last[0] = 0;  // a new lobby gets it again
+        for (int k = 0; k < NMAP; k++) map |= (flag_state_in(man, DF_WF_MAP[k]) == 1) << k;
+        for (int i = 0; i < g_boss_deaths; i++)
+            for (unsigned n = 0; n < (g_boss_death[i] >= 1000000000u ? 1u : 10u); n++) {
+                int b = i * 10 + (int)n;
+                if (b / 4 >= (int)sizeof nib) break;
+                if (flag_state_in(man, g_boss_death[i] + n * 100000000u) == 1) nib[b / 4] |= 1 << (b % 4), nb = b / 4 + 1;
+            }
+        int at = snprintf(text, sizeof text, "%x;", map);
+        for (int k = 0; k < nb; k++) text[at++] = "0123456789abcdef"[nib[k]];
+        text[at] = 0;
+        if (strcmp(text, last)) snprintf(last, sizeof g_df_wf_last, "%s", text), lobby_set(LOBBY_WF_KEY, text);
+        return;
+    }
+    if (!g_df_host_state || !g_candidate) return;
+    const char *v = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_WF_KEY);
+    if (!v || !*v || (!pending && !strcmp(v, last))) return;
+    int changed = strcmp(v, last) != 0, map = (int)strtol(v, NULL, 16), set = 0, already = 0, set_map = 0;
+    snprintf(last, sizeof g_df_wf_last, "%s", v);
+    pending = 0;
+    for (int k = 0; k < NMAP; k++) {
+        if (!(map >> k & 1)) continue;
+        int s = flag_state_in(man, DF_WF_MAP[k]);
+        if (s == 0) two_flag((int)DF_WF_MAP[k], 1, 1), set_map++;
+        else if (s < 0) pending++;
+    }
+    const char *hex = strchr(v, ';');
+    for (int k = 0; hex && hex[1 + k]; k++) {
+        char c = hex[1 + k];
+        int nibble = c >= 'a' ? c - 'a' + 10 : c - '0';
+        for (int j = 0; j < 4; j++) {
+            int b = k * 4 + j, i = b / 10;
+            if (!(nibble >> j & 1) || i >= g_boss_deaths) continue;
+            unsigned id = g_boss_death[i] + (unsigned)(b % 10) * 100000000u;
+            int s = flag_state_in(man, id);
+            if (s == 1) already++;
+            else if (s == 0) two_flag((int)id, 1, 1), set++;
+            else pending++;
+        }
+    }
+    if (changed || set || set_map)
+        logf("day flow: world flags from the host (%.80s): boss deaths set here %d (%d already on), the woods' map flags set %d (host's bits %x), "
+             "%d without a block yet (tried again)", v, set, already, set_map, map, pending);
 }
 static void day_flow_frame(int in_world) {
     static int was, marker_was, day2_seen, last_tier = -1, down_last = -1;
@@ -938,7 +1058,7 @@ static void day_flow_frame(int in_world) {
     if (first) {
         g_df_bosses = g_df_special = g_df_met = g_df_met_at = g_df_after = 0, g_df_day = 1, g_df_go = g_df_used = 0, g_df_seq = 0;
         g_df_tier = 0, day2_seen = 0, last_tier = -1, marker_was = 0, down_last = -1, g_df_kills_day = 0, g_df_camps = 0, g_df_ninv = 0, g_df_notice_due = 0;
-        g_df_second = 0, g_df_host_state = 0, g_df_need = DF_BOSSES, g_df_killed1 = 0, g_df_killed2 = 0;
+        g_df_second = 0, g_df_host_state = 0, g_df_need = DF_BOSSES, g_df_killed1 = 0, g_df_killed2 = 0, g_df_d2_host = -1;
         g_df_events = 0, g_df_started = 0, g_df_event_tick = 0;
         InterlockedExchange(&g_df_kills, 0), InterlockedExchange(&g_df_special_kills, 0);
         char *gm0 = *(char **)(g_base + 0x3c13258);
@@ -948,6 +1068,8 @@ static void day_flow_frame(int in_world) {
         if (g_pair >= 0) notice_with(131186 + g_pair, NULL);  // "Map: <name>"; the base map shows none
         g_df_told_met = 0, g_df_told_tier = 0;
         g_df_warp_until = 0, g_df_load_until = 0, g_df_ended = 0, g_df_move_at = 0;
+        g_df_chal_seen = -1, g_df_wf_last[0] = 0;  // a joiner takes the host's challenge state and world flags again
+        if (g_join != 4 && g_lobby) lobby_set(LOBBY_CHAL_KEY, "0,0");  // a lobby kept from before: no challenge yet
         if (g_df_fade_in_at) g_df_fade_in_at = 0, df_fade(0.0f, 0.1f, 0);
     }
     if (!day2_seen && bf_flag(7505)) {  // day 2: the game's own day-2 level, our count starts again
@@ -1009,7 +1131,19 @@ static void day_flow_frame(int in_world) {
     }
     g_df_tier = df_target_tier();
     if (g_df_tier != last_tier) last_tier = g_df_tier, df_repass("bosses"), repass_tick = GetTickCount();
-    else if (GetTickCount() - repass_tick > 15000) repass_tick = GetTickCount(), df_repass(NULL);  // characters loaded since
+    else if (GetTickCount() - repass_tick > 15000) {  // characters loaded since; the day-2 SpEffect's window
+        static int windows, last_host = -2;
+        repass_tick = GetTickCount(), df_repass(NULL);
+        if (g_join != 4) g_df_d2_host = g_df_d2_with ? g_df_d2_on * 2 > g_df_d2_with : -1;
+        char *pgd = *(char **)(g_base + 0x3c078d0);
+        if (windows++ % 4 == 0 || g_df_d2_host != last_host)
+            logf("day flow: strength (%s): play phase +0xde %d, day %d, tier %d%%; characters with a day-2 SpEffect %d, carrying it %d, %s %d; "
+                 "the host's day-2 SpEffect %s", g_join == 4 ? "joiner" : "host", pgd ? (unsigned char)pgd[0xde] : -1, g_df_day, g_df_tier,
+                 g_df_d2_with, g_df_d2_on, g_join == 4 ? "matched to the host" : "changed by us", g_df_d2_fixed,
+                 g_df_d2_host < 0 ? "not known" : g_df_d2_host ? "on" : "off");
+        if (windows % 4 == 1) g_df_samples = 3;  // a minute apart: 3 characters of the next pass, logged
+        last_host = g_df_d2_host, g_df_d2_with = g_df_d2_on = g_df_d2_fixed = 0;
+    }
     char *me = local_player();
     int marker = me && speffect_on(me, DF_MARKER);
     if (marker && !marker_was) df_item_used();
@@ -1035,6 +1169,7 @@ static void day_flow_frame(int in_world) {
     df_lobby_watch();
     df_bases_check();
     df_state_sync();
+    df_world_flags_sync();
     df_move_frame();
     df_track_frame();
     if (g_join != 4) df_events_frame();

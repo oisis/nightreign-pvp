@@ -39,7 +39,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 42
+#define BUILD_FORMAT 43
 #define BOSS_DEATHS_MIN 100  // the game (1.3.3) has 158 such flags; fewer = its event scripts changed
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
@@ -72,6 +72,15 @@ static const struct { u32 id; const char *english, *polish; } OUR_TEXT[] = {
     {131167, "Waiting for the squad's host...", "Oczekiwanie na hosta dru\xc5\xbcyny..."},
     {131168, "The invader has left", "Naje\xc5\xba" "d\xc5\xba" "ca odszed\xc5\x82"},
     {131169, "You have invaded another squad's expedition!", "Wkroczy\xc5\x82" "e\xc5\x9b do wyprawy innej dru\xc5\xbcyny!"},
+    // "Play as a summon" (Target list row 102): name, description, searching / cancelled notices, start button labels
+    {131175, "Play as a summon", "Graj jako summon"},
+    {131176, "Join another squad's expedition as its host's summon.\nWith a password: only that squad.",
+             "Do\xc5\x82\xc4\x85" "cz do wyprawy innej dru\xc5\xbcyny jako summon jej hosta.\nZ has\xc5\x82" "em: tylko do tej dru\xc5\xbcyny."},
+    {131177, "Searching for a host to join...", "Szukanie hosta do do\xc5\x82\xc4\x85" "czenia..."},
+    {131178, "Summon search cancelled", "Anulowano szukanie hosta"},
+    {131194, "You are offline: no host can be found", "Jeste\xc5\x9b offline: nie mo\xc5\xbcna znale\xc5\xba\xc4\x87 hosta"},
+    {131179, "Cancel search", "Anuluj szukanie"},
+    {131185, "Begin search", "Rozpocznij szukanie"},
     // day flow (boss-flow 4): the challenge's state. 131180: %s = "M/M", a special boss still needed; 131181: %s = "N/M",
     // M the day's target (owner, 2026-11-19 / 2026-11-21: 6 on day 1, on day 2 min(6, ordinary bosses alive at its
     // start)); 131183 / 131191 / 131192: %s = M (131192: the base map, no special region); 131193: the enemy tier went
@@ -858,12 +867,15 @@ static const u8 REGULATION_KEY[32] = {
     0x21, 0x07, 0xeb, 0xcf, 0x43, 0xd5, 0xac, 0xb0, 0x55, 0x4f, 0x94, 0x16, 0x01, 0xb5, 0x79, 0x18};
 
 // The Target list is NightBossMenuParam. Row 100 is the game's own non-boss entry ("The Deep of
-// Night"); our row 101 is a copy of it with these fields changed. Keep in sync with
-// mod/build_regulation.py, which explains the fields.
+// Night"); our rows 101 (Invasion) and 102 (Play as a summon: the same with its own texts, sorted after 101) are
+// copies of it with these fields changed. Keep in sync with mod/build_regulation.py, which explains the fields.
 #define TARGET_PARAM "\\NightBossMenuParam.param"
 #define TEMPLATE_ROW 100
 #define INVASION_ROW 101
-static const int ROW_CHANGES[][2] = {{131150, 131160}, {131151, 131161}, {41812, 41813}, {300, 5}, {130, 0}};
+#define SUMMON_ROW 102
+#define ROW_CHANGE_COUNT 5
+static const int ROW_CHANGES[ROW_CHANGE_COUNT][2] = {{131150, 131160}, {131151, 131161}, {41812, 41813}, {300, 5}, {130, 0}};
+static const int SUMMON_ROW_CHANGES[ROW_CHANGE_COUNT][2] = {{131150, 131175}, {131151, 131176}, {41812, 41813}, {300, 6}, {130, 0}};
 #define FIRST_LARGE_ICON 41820  // row 0's largeBossIconId, to find the field
 #define LARGE_ICON 41814
 
@@ -879,8 +891,9 @@ static int find_value(const u8 *row, u32 size, int value, int step) {
 }
 
 // Param layout: 0x40 header, 24-byte row descriptors (id, pad, data offset, name offset), row data,
-// strings. Returns the param with our row appended, or an empty buf if it does not look as expected.
-static buf param_add_row(buf p) {
+// strings. Returns the param with a copy of TEMPLATE_ROW appended as new_id (above every id already there) with
+// these changes, or an empty buf if it does not look as expected.
+static buf param_add_row(buf p, int new_id, const int changes[ROW_CHANGE_COUNT][2]) {
     buf out = {0};
     if (p.n < 0x40 + 48) return out;
     u32 strings_off = rd32(p.p), count = rd16(p.p + 0x0A);
@@ -890,7 +903,7 @@ static buf param_add_row(buf p) {
     const u8 *tmpl = NULL;
     for (u32 i = 0; i < count; i++) {
         const u8 *d = p.p + 0x40 + i * 24;
-        if ((int)rd32(d) >= INVASION_ROW) return out;
+        if ((int)rd32(d) >= new_id) return out;
         if (rd32(d) == TEMPLATE_ROW) tmpl = d;
     }
     if (!tmpl) return out;
@@ -909,7 +922,7 @@ static buf param_add_row(buf p) {
         wr64(d + 8, rd64(src + 8) + 24);
         wr64(d + 16, rd64(src + 16) + shift);
     }
-    wr32(d, INVASION_ROW);
+    wr32(d, (u32)new_id);
     wr64(d + 8, data_start + 24 + count * size);
     wr64(d + 16, rd64(tmpl + 16) + shift);
     d += 24;
@@ -920,10 +933,10 @@ static buf param_add_row(buf p) {
     out.n = p.n + shift;
 
     int ok = 1;
-    for (size_t i = 0; i < sizeof ROW_CHANGES / sizeof *ROW_CHANGES; i++) {
-        int at = find_value(row, (u32)size, ROW_CHANGES[i][0], 1);
+    for (size_t i = 0; i < ROW_CHANGE_COUNT; i++) {
+        int at = find_value(row, (u32)size, changes[i][0], 1);
         if (at < 0) ok = 0;
-        else wr32(row + at, (u32)ROW_CHANGES[i][1]);
+        else wr32(row + at, (u32)changes[i][1]);
     }
     int large = find_value(p.p + data_start, (u32)size, FIRST_LARGE_ICON, 4);
     if (large < 0 || (int)rd32(row + large) != -1) ok = 0;
@@ -2107,13 +2120,14 @@ static int build_regulation(const char *game_dir) {
     if (memcmp(dcx, "DCX", 3) || memcmp(dcx + 0x28, "ZSTD", 4) || csize > enc.n - 16 - 0x4C)
         return free(enc.p), logf_("regulation.bin is not in the expected format"), 0;
     buf bundle = {xalloc((size_t)usize + (1 << 17)), usize};
-    buf patched = {0}, body = {0}, param = {0}, speffect = {0}, speffect2 = {0}, step = {0}, maps[4] = {{0}}, cur = {0}, goods = {0}, shop = {0};
+    buf patched = {0}, body = {0}, param = {0}, param1 = {0}, speffect = {0}, speffect2 = {0}, step = {0}, maps[4] = {{0}}, cur = {0}, goods = {0}, shop = {0};
     int ok = 0, index, sp_index, npc_index, area_index, goods_index = -1, shop_index = -1, map_index[4] = {-1, -1, -1, -1}, var_index = -1;
     buf variation = {0};
     u8 *team_row = NULL, *ally_row = NULL;
     if (nr_zstd_decompress(dcx + 0x4C, csize, bundle.p, (size_t)usize + (1 << 17)) != usize) {
         logf_("regulation.bin could not be unpacked");
-    } else if ((index = bnd4_find(bundle, TARGET_PARAM)) < 0 || !(param = param_add_row(bnd4_file(bundle, index))).p) {
+    } else if ((index = bnd4_find(bundle, TARGET_PARAM)) < 0 || !(param1 = param_add_row(bnd4_file(bundle, index), INVASION_ROW, ROW_CHANGES)).p ||
+               !(param = param_add_row(param1, SUMMON_ROW, SUMMON_ROW_CHANGES)).p) {
         logf_("The game's Target list looks different than expected. The game may have been updated; the mod needs an update too.");
     } else if ((sp_index = bnd4_find(bundle, SPEFFECT_PARAM)) < 0 ||
                !(speffect = param_insert_sorted(bnd4_file(bundle, sp_index), SPEFFECT_TEMPLATE, SPEFFECT_TEAM_ROW,
@@ -2180,7 +2194,7 @@ static int build_regulation(const char *game_dir) {
         ok = write_file(path, out.p, out.n);
         free(out.p);
     }
-    free(enc.p); free(bundle.p); free(param.p); free(speffect.p); free(speffect2.p); free(step.p); free(patched.p); free(body.p);
+    free(enc.p); free(bundle.p); free(param1.p); free(param.p); free(speffect.p); free(speffect2.p); free(step.p); free(patched.p); free(body.p);
     free(goods.p); free(shop.p); free(variation.p);
     for (int t = 0; t < 4; t++) free(maps[t].p);
     return ok;
@@ -3435,7 +3449,7 @@ int core_build(const char *game_dir) {
     if (!ok) return 0;
     logf_("Menu icons added");
     if (!build_regulation(game_dir)) return 0;
-    logf_("Target list entry added");
+    logf_("Target list entries added (Invasion, Play as a summon)");
 
     snprintf(from, sizeof from, "%s" SEP "data" SEP "invasion.dll", g_app);
     snprintf(to, sizeof to, "%s" SEP "work" SEP "native" SEP "invasion.dll", g_app);

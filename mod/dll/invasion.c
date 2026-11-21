@@ -51,6 +51,7 @@ static int g_cap_remote = 2;  // remote player slots in effect (4 once the capac
 #define RVA_BOSS_ITEM_PUSH        0x9e77c0  // void (dialog + 0x19a0, item*)
 #define RVA_BOSS_ITEM_DTOR        0x8dad70  // void (buf*)
 #define INVASION_ROW              101       // our row in NightBossMenuParam
+#define SUMMON_ROW                102       // "Play as a summon": the party guest path only, never hosting (summon_request)
 
 static char log_path[MAX_PATH];
 static char *g_base;
@@ -1201,6 +1202,7 @@ static int g_as_ally;                       // joiner: this join is as an ally
 // gathered over our Steam lobby instead of FromSoftware's matchmaking. Phases below (party code).
 enum { PARTY_OFF, PARTY_PENDING, PARTY_GUEST_WAIT, PARTY_HOST_CREATE, PARTY_HOST_STARTED, PARTY_GUEST };
 static int g_party, g_party_host, g_party_guest;
+static int g_summon_only;  // the party was started from "Play as a summon" (row 102): guest only, never hosts, searches on
 static int g_party_waited;  // guest: it waited in the hub for the host's go (an early summon, it starts with the host)
 static char g_party_code[16];  // the pool key: "p" + hash of base, game version, protocol, password, test salt
 static unsigned long long g_party_old_lobby;  // our own last lobby: never taken for another host's
@@ -3575,10 +3577,13 @@ static void preselect_invasion(char *grid) {
     char a[120], b[120];
     rows_text(settings + 0x68, a, sizeof a);
     rows_text(request + 0x50, b, sizeof b);
-    int want = g_searching && !g_party;
-    logf("target list: chosen rows: settings [%s], request [%s]%s", a, b, want ? "; choosing Invasion" : "");
+    // a running search keeps its entry chosen: Invasion, or "Play as a summon" while its party search runs
+    unsigned want = g_searching && !g_party ? INVASION_ROW : g_party && g_summon_only ? SUMMON_ROW : 0;
+    logf("target list: chosen rows: settings [%s], request [%s]%s", a, b,
+         want == INVASION_ROW ? "; choosing Invasion" : want ? "; choosing Play as a summon" : "");
     if (!want || IsBadReadPtr(settings + 0x68, 32) || IsBadReadPtr(request + 0x50, 32)) return;
-    static unsigned ours[1] = {INVASION_ROW};
+    static unsigned ours[1];
+    ours[0] = want;
     void *source[4] = {NULL, ours, ours + 1, ours + 1};
     ((void *(*)(void *, void *))(g_base + RVA_VECTOR_ASSIGN))(settings + 0x68, source);
     ((void *(*)(void *, void *))(g_base + RVA_VECTOR_ASSIGN))(request + 0x50, source);
@@ -3608,30 +3613,38 @@ static void show_boss_list_hook(void *grid, char *list, void *a3, void *a4) {
         g_list_builder = "?";
     }
     preselect_invasion(grid);
-    {  // the second builder (_CreateBossList_Debug, 0x9e9b60) may already list our row
+    // Our entries: Invasion (101), then Play as a summon (102). The second builder (_CreateBossList_Debug, 0x9e9b60)
+    // may already list them; a missing one is appended.
+    static const int OURS[2] = {INVASION_ROW, SUMMON_ROW};
+    for (int k = 0; k < 2; k++) {
         char *b0 = *(char **)(list + 0x10), *e0 = *(char **)(list + 0x18);
-        for (char *it = b0; b0 && it + 0x28 <= e0; it += 0x28)
-            if (*(int *)(it + 0x10) == INVASION_ROW) {
-                logf("target list: Invasion already in the list (%u items)", (unsigned)((e0 - b0) / 0x28));
-                ((void (*)(void *, void *, void *, void *))(g_base + RVA_SHOW_BOSS_LIST))(grid, list, a3, a4);
-                return;
-            }
+        int has = 0;
+        for (char *it = b0; b0 && it + 0x28 <= e0; it += 0x28) has |= *(int *)(it + 0x10) == OURS[k];
+        if (has) {
+            logf("target list: row %d already in the list (%u items)", OURS[k], (unsigned)((e0 - b0) / 0x28));
+            continue;
+        }
+        _Alignas(16) char item[0x40];  // a MatchingNightBossViewItem is 0x28 bytes
+        ((void *(*)(void *, int, unsigned char, unsigned char))(g_base + RVA_BOSS_ITEM_CTOR))(item, OURS[k], 0, 0);
+        ((void (*)(void *, void *))(g_base + RVA_BOSS_ITEM_PUSH))(list, item);
+        ((void (*)(void *))(g_base + RVA_BOSS_ITEM_DTOR))(item);
+        logf("target list: row %d (%s) added", OURS[k], k ? "Play as a summon" : "Invasion");
     }
-    _Alignas(16) char item[0x40];  // a MatchingNightBossViewItem is 0x28 bytes
-    ((void *(*)(void *, int, unsigned char, unsigned char))(g_base + RVA_BOSS_ITEM_CTOR))(item, INVASION_ROW, 0, 0);
-    ((void (*)(void *, void *))(g_base + RVA_BOSS_ITEM_PUSH))(list, item);
-    ((void (*)(void *))(g_base + RVA_BOSS_ITEM_DTOR))(item);
     char *begin = *(char **)(list + 0x10), *end = *(char **)(list + 0x18);
     unsigned count = begin && end >= begin ? (unsigned)((end - begin) / 0x28) : 0;
-    // Our entry goes first (user's choice): it was appended last, so rotate it to the front.
-    // Items are plain data (vtable, id, flags, param row), safe to move as bytes.
-    if (count >= 2 && *(int *)(end - 0x28 + 0x10) == INVASION_ROW) {
-        char ours[0x28];
-        memcpy(ours, end - 0x28, 0x28);
-        memmove(begin + 0x28, begin, (size_t)(count - 1) * 0x28);
-        memcpy(begin, ours, 0x28);
-    }
-    logf("target list: Invasion entry added, %u items", count);
+    // Our entries go first (user's choice), Invasion then Play as a summon: each is rotated to the front, the
+    // summon first. Items are plain data (vtable, id, flags, param row), safe to move as bytes.
+    for (int k = 1; k >= 0; k--)
+        for (unsigned i = 1; i < count; i++)
+            if (*(int *)(begin + i * 0x28 + 0x10) == OURS[k]) {
+                char ours[0x28];
+                memcpy(ours, begin + i * 0x28, 0x28);
+                memmove(begin + 0x28, begin, (size_t)i * 0x28);
+                memcpy(begin, ours, 0x28);
+                break;
+            }
+    logf("target list: our entries placed first, %u items (first %d, second %d)", count, count ? *(int *)(begin + 0x10) : -1,
+         count > 1 ? *(int *)(begin + 0x28 + 0x10) : -1);
     ((void (*)(void *, void *, void *, void *))(g_base + RVA_SHOW_BOSS_LIST))(grid, list, a3, a4);
 }
 
@@ -3904,18 +3917,24 @@ static void log_start(char *ctrl, int step) {
 #define TEXT_PARTY_WAIT     131167    // "Waiting for the squad's host..."
 #define TEXT_INVADER_LEFT   131168    // "The invader has left"
 #define TEXT_YOU_INVADED    131169    // "You have invaded another squad's expedition!"
+#define TEXT_SUMMON_SEARCHING 131177  // "Play as a summon": "Searching for a host to join..."
+#define TEXT_SUMMON_CANCELLED 131178  // "Summon search cancelled"
+#define TEXT_OFFLINE        131194    // "You are offline: no host can be found"
 static char *summon_queue(void) {
     char *menu = *(char **)(g_base + RVA_MENU_MAN_PTR);
     return menu ? menu + MENU_MAN_SUMMON_QUEUE : NULL;
 }
 // 0 searching, 1 cancelled, 2 party: waiting for the host / joining it, 3 an invader arrived (the game's own line
 // 338280 "Another Condemned has invaded!"), 4 the invader died (the game's 336101 "INVADER VANQUISHED"), 5 the
-// invader left (ours), 6 the invader's own arrival (ours). The game's lines come in every language it has.
+// invader left (ours), 6 the invader's own arrival (ours), 7 / 8 "Play as a summon": searching / cancelled (ours),
+// 9 offline (ours).
+// The game's lines come in every language it has.
 static void notice(int which) {
-    static _Alignas(16) char text[7][0x100];  // built once and kept: the game never frees them for us
-    static void *ready[7];
-    static const int ID[7] = {TEXT_SEARCHING, TEXT_SEARCH_CANCELLED, TEXT_PARTY_WAIT, 338280, 336101, TEXT_INVADER_LEFT, TEXT_YOU_INVADED};
-    if (which < 0 || which > 6) return;
+    static _Alignas(16) char text[10][0x100];  // built once and kept: the game never frees them for us
+    static void *ready[10];
+    static const int ID[10] = {TEXT_SEARCHING, TEXT_SEARCH_CANCELLED, TEXT_PARTY_WAIT, 338280, 336101, TEXT_INVADER_LEFT, TEXT_YOU_INVADED,
+                              TEXT_SUMMON_SEARCHING, TEXT_SUMMON_CANCELLED, TEXT_OFFLINE};
+    if (which < 0 || which > 9) return;
     if (!ready[which]) ready[which] = ((void *(*)(void *, int))(g_base + RVA_MENU_TEXT_CTOR))(text[which], ID[which]);
     ((unsigned char (*)(void *))(g_base + RVA_SUMMON_MESSAGE))(ready[which]);
 }
@@ -6568,7 +6587,12 @@ static void party_ctx_log(char *ctrl, const char *why) {
          (unsigned char)c[0x181], *(unsigned *)(c + 0x188), *(unsigned *)(c + 0x18c));
 }
 static void party_end(const char *why) {
-    logf("party: over (%s)", why);
+    logf("party: over (%s)%s", why, g_summon_only ? "; the Play as a summon search ends" : "");
+    if (g_summon_only) {
+        g_summon_only = 0;
+        clear_notices();
+        notice(8);
+    }
     if (g_party_host && !g_in_expedition) {
         if (g_lobby) g_party_old_lobby = g_lobby;
         if (host_test_leave()) g_stop_pending = GetTickCount();
@@ -6615,6 +6639,7 @@ static void party_request(char *self, char *request) {
     }
     char *ctx = *(char **)(self + 8);
     snprintf(g_party_code, sizeof g_party_code, "%s", code);
+    g_summon_only = 0;  // summon_request sets it after this call
     g_party = PARTY_PENDING, g_party_tick = GetTickCount(), g_party_marked_for = -1, g_party_confirm = 0;
     g_ver_notice_armed = 1;
     g_as_ally = 1;
@@ -6623,6 +6648,33 @@ static void party_request(char *self, char *request) {
          ctx && *(char **)ctx == g_base + RVA_QM_CONTEXT_VTABLE ? *(unsigned *)(ctx + QM_CTX_PLAYERS) : 0,
          pw ? "the menu's password" : "the common pool (no password)", g_settings[S_PARTY] > 0 ? " + test salt" : "",
          g_network_on ? "up" : "NOT up");
+}
+// "Play as a summon" (Target list row 102, owner's rules: BRIEF "One way to play together", analysis/13 Etap 2): the
+// party guest path of the menu's Team choice, as a guest only. The pool is party_request's key (the typed password,
+// else the common pool); lobby_search_frame picks among hosts with a free ally place (Solo + invaders publishes 0,
+// Solo has no lobby) the lowest host level, then the oldest lobby, never one in a night boss fight or after day 2's
+// boss; party_frame waits in the hub for a host not yet in the field (notice 131167) and joins one in the field as a
+// late summon (summon_at_host). With no host it does not host (party_frame) and searches until cancelled: choosing
+// the entry again calls it off (fill_context_hook; g_summon_stop sets the start back to None).
+static int g_summon_stop;  // the start request that called the summon search off: set its start back to None
+static void summon_request(char *self, char *request) {
+    if (g_party && g_summon_only) {
+        logf("summon: Play as a summon chosen again while searching (phase %d, joining %d): called off", g_party, g_searching);
+        if (g_searching) toggle_search("summon search called off");
+        party_end("Play as a summon called off");
+        g_summon_stop = 1;
+        return;
+    }
+    if (g_party) {  // a Team party under way (guest or a host still in the hub) gives way to the summon search
+        if (g_searching) toggle_search("party: Play as a summon chosen");
+        party_end("Play as a summon chosen");
+    } else if (g_searching) toggle_search("Play as a summon chosen");  // an invasion search ends
+    if (g_stop_pending) finish_pending_stop(1);
+    party_request(self, request);
+    g_summon_only = g_party != 0;
+    logf("summon: Play as a summon: %s", g_summon_only ? "looking for a host as a guest only (never hosting)" : "party not started");
+    clear_notices();
+    if (g_summon_only) notice(7);
 }
 static int party_lobby_go(u64 lobby) {
     const char *go = lobby ? g_steam.get_data(g_steam.mm, lobby, LOBBY_GO_KEY) : NULL;
@@ -6636,11 +6688,19 @@ static void party_frame(char *ctrl) {
         void **impl = sm ? session_impl(sm) : NULL;
         if (!g_network_on || !((unsigned char (*)(void))(g_base + RVA_NET_READY))() || !impl || !*(unsigned *)((char *)impl + 0x10) ||
             (state != 0 && state != 2 && state != 5)) {  // also: our own last session still leaving
+            // owner, 2026-11-21: no waiting when the player is offline (Steam not logged on): say so at once
+            if (g_party == PARTY_PENDING && g_diag.user && g_diag.logged_on && !g_diag.logged_on(g_diag.user)) {
+                g_summon_only = 0;  // our own notice below, not "cancelled"
+                party_end("offline (Steam not logged on)");
+                notice(9);
+                return;
+            }
             if (g_party == PARTY_PENDING && GetTickCount() - g_party_tick > 30000) party_end("network not ready within 30 s");
             return;
         }
         if (g_party == PARTY_GUEST_WAIT && notices_idle()) notice(2);
-        if (!lobby_search_frame("party search")) return;
+        if (g_summon_only && g_party == PARTY_PENDING && notices_idle()) notice(7);
+        if (!lobby_search_frame(g_summon_only ? "summon search" : "party search")) return;
         u64 c = g_candidate == g_party_old_lobby ? 0 : g_candidate;
         if (c && party_lobby_go(c)) {  // the host is in its expedition's field map: join it as an ally
             join_test_start();
@@ -6652,6 +6712,11 @@ static void party_frame(char *ctrl) {
             if (g_party != PARTY_GUEST_WAIT) logf("party: host found (lobby %llu), still on its way into the expedition: waiting", c);
             g_party = PARTY_GUEST_WAIT;
             if (notices_idle()) notice(2);
+        } else if (g_summon_only) {  // Play as a summon never hosts: it searches on until the player cancels
+            static DWORD told;
+            if (g_party == PARTY_GUEST_WAIT) logf("summon: the host's lobby is gone (or has no ally place / is in a boss fight now): searching on");
+            else if (GetTickCount() - told > 30000) told = GetTickCount(), logf("summon: no host with a free ally place in the pool (yet): searching on");
+            g_party = PARTY_PENDING;
         } else if (g_party == PARTY_GUEST_WAIT) {
             party_end("the host's lobby is gone");
         } else {
@@ -7344,6 +7409,13 @@ static void step_hook(void *ctrl, void *time, int step) {
     night_hide_frame(g_in_exped);
     df_sb_registry_frame(g_in_exped);
     day_flow_frame(g_in_exped);
+    {  // a joiner's clock as the host's (owner, 2026-11-22): the same hold at 18:00 and jump to 23:00, from the host's day
+       // and challenge as the joiner has taken them (df_state_sync, df_lobby_watch); the host's runs in host_expedition
+        static int joined_was;
+        int joined = g_join == 4 && g_join_in_world();
+        if (joined) boss_flow_frame(!joined_was);
+        joined_was = joined;
+    }
     if (step == QM_STEP_INGAME || g_join_in_world()) invader_notice_frame();
     summon_kill_reward();
     summon_at_host_frame();
@@ -7374,6 +7446,12 @@ static void step_hook(void *ctrl, void *time, int step) {
             g_request_tick = GetTickCount();
         }
         last_seen_start = step;
+        if (g_summon_stop) {
+            g_summon_stop = 0;
+            ((void (*)(void *, int))(*(void ***)ctrl)[QM_CTRL_VT_SET_STEP])(ctrl, QM_STEP_NONE);
+            logf("summon: the start that called the search off (%s) set back to None", STEP_NAMES[step]);
+            return;
+        }
         if (g_invasion_pending) {
             void **vt = *(void ***)ctrl;
             ((void (*)(void *, int))vt[QM_CTRL_VT_SET_STEP])(ctrl, QM_STEP_NONE);
@@ -7390,6 +7468,7 @@ static void step_hook(void *ctrl, void *time, int step) {
     } else {  // the idle step runs every frame in the Roundtable Hold
         if (g_party == PARTY_PENDING || g_party == PARTY_GUEST_WAIT || g_party == PARTY_HOST_CREATE) party_frame(ctrl);
         if (g_invasion_pending && GetTickCount() - g_request_tick > 300) toggle_search("machine stayed idle");
+        if (g_summon_stop && GetTickCount() - g_request_tick > 300) g_summon_stop = 0, logf("summon: the machine stayed idle after the call-off");
         if (g_searching && notices_idle()) notice(g_party ? 2 : 0);
         // No lobby list requests while a join is under way: nothing to choose then, and one less
         // thing talking to Steam during the join.
@@ -7413,6 +7492,7 @@ static void step_hook(void *ctrl, void *time, int step) {
 #define PLAYERS_CHOICE_FOUR    3         // the old fourth option's value; the offline compare below still admits it (harmless)
 static char *g_dialog;                       // defined with the start button code below
 static int cursor_on_invasion(char *dialog);
+static int cursor_row(char *dialog);
 // The game's own use of the choice (0x140b67cc0, read 2026-11-21): +0x49 is read once, at the top: 0 -> 3 players,
 // 1 -> 2, 2 -> 1 (ctx vt+0x28); mode (ctx vt+0x48) = choice != 2 ? 2 (squad: matching steps 1-11) : 1 (solo); ctx+8 =
 // 4 for two players (5 with the special row), else 0 / 1 (password). So "two players" would start FromSoftware's
@@ -7423,25 +7503,30 @@ static unsigned long long fill_context_hook(char *self, char *request) {
     size_t count = begin && end >= begin ? (size_t)(end - begin) : 0;
     // Same rule as the button's label: the entry under the cursor. If the dialog cannot be read,
     // fall back on the chosen rows, where the game itself looks at the last one for its special row.
-    int invasion = cursor_on_invasion(g_dialog);
-    if (invasion < 0) invasion = count && count <= 64 && begin[count - 1] == INVASION_ROW;
+    int row = cursor_row(g_dialog);
+    if (row < 0) row = count && count <= 64 ? (int)begin[count - 1] : -1;
+    int invasion = row == INVASION_ROW, summon = row == SUMMON_ROW, ours = invasion || summon;
     unsigned char choice = (unsigned char)request[REQ_PLAYERS_CHOICE];
     if (choice == 1) request[REQ_PLAYERS_CHOICE] = 2;  // Solo + invaders: the game's solo start
     unsigned long long result = ((unsigned long long (*)(char *, char *))(g_base + RVA_FILL_CONTEXT))(self, request);
     request[REQ_PLAYERS_CHOICE] = (char)choice;
     g_invasion_pending = invasion;
+    g_summon_stop = 0;
     g_request_tick = GetTickCount();
-    if (g_party && !g_party_host && (invasion || choice != 0)) {  // something else chosen: the party wait ends
-        if (g_searching) toggle_search(invasion ? "party: Invasion chosen" : "party: a solo expedition chosen");
-        party_end(invasion ? "Invasion chosen" : "a solo expedition chosen");
+    // something else chosen: the party wait ends (a summon search also for Team: a new party of its own)
+    if (g_party && !g_party_host && !summon && (invasion || choice != 0 || g_summon_only)) {
+        const char *why = invasion ? "Invasion chosen" : choice != 0 ? "a solo expedition chosen" : "Team chosen";
+        if (g_searching) toggle_search(why);
+        party_end(why);
     }
     // a party host still gathering in the hub (its session is the party's) gives it up for a solo start: no squad
     // mate can follow it into Solo or Solo + invaders
-    if (g_party && g_party_host && !g_in_expedition && !invasion && choice != 0) party_end("a solo expedition chosen (host)");
-    if (!invasion && choice < 3) g_players_choice = choice;
-    if (!invasion && choice == 0) party_request(self, request);
-    logf("start request: players choice %u (%s), %u target rows, invasion %d", choice, choice < 3 ? PLAYERS_MODE[choice] : "?",
-         (unsigned)count, invasion);
+    if (g_party && g_party_host && !g_in_expedition && !ours && choice != 0) party_end("a solo expedition chosen (host)");
+    if (!ours && choice < 3) g_players_choice = choice;
+    if (!ours && choice == 0) party_request(self, request);
+    if (summon) summon_request(self, request);
+    logf("start request: players choice %u (%s), %u target rows, row under the cursor %d, invasion %d, play as a summon %d", choice,
+         choice < 3 ? PLAYERS_MODE[choice] : "?", (unsigned)count, row, invasion, summon);
     return result;
 }
 
@@ -7460,7 +7545,7 @@ static unsigned char online_check_hook(char *request) {
     unsigned *begin = *(unsigned **)(request + REQ_ROWS_BEGIN), *end = *(unsigned **)(request + REQ_ROWS_BEGIN + 8);
     size_t count = begin && end >= begin ? (size_t)(end - begin) : 0;
     for (size_t i = 0; i < count && i < 64; i++)
-        if (begin[i] == INVASION_ROW) return 1;
+        if (begin[i] == INVASION_ROW || begin[i] == SUMMON_ROW) return 1;
     if (request[REQ_PLAYERS_CHOICE] <= 1) return 1;  // Team / Solo + invaders: our own session over Steam, never the server
     return ((unsigned char (*)(void))(g_base + RVA_IS_ONLINE))();
 }
@@ -7496,6 +7581,8 @@ static void hook_offline_check(void) {
 // "Cancel invasion" while a search is running (pressing the button then calls the search off).
 #define TEXT_BEGIN_INVASION  131166
 #define TEXT_CANCEL_INVASION 131164
+#define TEXT_BEGIN_SUMMON    131185  // "Play as a summon": "Begin search"
+#define TEXT_CANCEL_SUMMON   131179  // "Cancel search", while its party search runs
 // Which target a press of the start button would use, as the player sees it: the entry the list
 // cursor is on (F chooses that entry and moves to the button). The dialog holds the grid at +0xff0
 // and the item list at +0x19a0 (virtual slot 5: item by index; the row id is at item+0x10).
@@ -7503,7 +7590,7 @@ static void hook_offline_check(void) {
 #define DIALOG_ITEM_LIST   0x19a0
 #define RVA_GRID_CURSOR    0x781a50  // int (GridControl*): index of the entry under the cursor
 static char *g_dialog;  // the dialog the label was last built for
-static int cursor_on_invasion(char *dialog) {
+static int cursor_row(char *dialog) {  // the row id under the cursor, -1 if it cannot be read
     if (!dialog || IsBadReadPtr(dialog + DIALOG_ITEM_LIST, 8)) return -1;
     char *list = dialog + DIALOG_ITEM_LIST;
     void **vt = *(void ***)list;
@@ -7512,11 +7599,17 @@ static int cursor_on_invasion(char *dialog) {
     char *begin = *(char **)(list + 0x10), *end = *(char **)(list + 0x18);
     if (index < 0 || !begin || end < begin || index >= (end - begin) / 0x28) return -1;
     char *item = ((char *(*)(void *, int))vt[5])(list, index);
-    return item && !IsBadReadPtr(item + 0x10, 4) ? *(int *)(item + 0x10) == INVASION_ROW : -1;
+    return item && !IsBadReadPtr(item + 0x10, 4) && *(int *)(item + 0x10) >= 0 ? *(int *)(item + 0x10) : -1;
+}
+static int cursor_on_invasion(char *dialog) {
+    int row = cursor_row(dialog);
+    return row < 0 ? -1 : row == INVASION_ROW;
 }
 static void *button_text_hook(void *out, int id, char *dialog) {
     g_dialog = dialog;
-    if (cursor_on_invasion(dialog) == 1) id = g_searching ? TEXT_CANCEL_INVASION : TEXT_BEGIN_INVASION;
+    int row = cursor_row(dialog);
+    if (row == INVASION_ROW) id = g_searching ? TEXT_CANCEL_INVASION : TEXT_BEGIN_INVASION;
+    else if (row == SUMMON_ROW) id = g_party && g_summon_only ? TEXT_CANCEL_SUMMON : TEXT_BEGIN_SUMMON;
     return ((void *(*)(void *, int))(g_base + RVA_MENU_TEXT_CTOR))(out, id);
 }
 static void hook_button_text(void) {
