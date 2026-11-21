@@ -2825,6 +2825,32 @@ static unsigned char tile_flag_space_hook(unsigned *id, int a) {
     if (!r && g_two_active && m >> 24 == 60 && two_on_tile(&TWO_ADDED, x, y) && (int)(m >> 4 & 0xf) == TWO_ADDED.variant) r = 1;
     return r;
 }
+// The end-of-expedition crash (DL_PANIC "WorldGridAreaInfo::m_smallBaseBlocks leak!!", 0x14214e298 from the
+// destructor 0x1406420bf; deck-run3/4, deck-now3). Tile keys (block info +0x34): area << 24 | X << 16 | Z << 8 |
+// variant << 4 | lod. The small-base insert 0x1406427b0 (from 0x140628ab2) files each small base under its tile's
+// key lifted param_5 levels (X, Z halved, lod + 1, the VARIANT KEPT); the only erase, 0x140645db0 (only from
+// 0x140627da0 at 0x140627dba: a tile's unload and the WorldBlockResBase destructor), takes the unloading tile's own
+// key. Entries seen are all lod 2, so the lod-2 tile of the cell erases them. Our variant hook makes the added
+// region's tiles variant 3 but leaves the cell's lod-2 tile (m60_11_09) at the base variant 2: deck-now3 had keys
+// 3c0b0922 and 3c0b0932 in that cell; at the final arena (20:09:07) the 3c0b0922 ones went, the 7 3c0b0932 ones
+// stayed until the leak check. So the erase of a lod >= 1 key of a cell holding added-region tiles also erases the
+// same key with the added variant: what the lod-2 tile would erase if the game had given it that variant.
+static unsigned g_sb_variant;  // the added region's variant on a two-regions map (0 none), set at the map request
+static void sb_erase_hook(char *ga, unsigned *key) {
+    void (*erase)(char *, unsigned *) = (void (*)(char *, unsigned *))(g_base + 0x645db0);
+    erase(ga, key);
+    unsigned k = key ? *key : 0, l = k & 0xf, x = k >> 16 & 0xff, z = k >> 8 & 0xff, v = g_sb_variant;
+    const two_region *r = &TWO_ADDED;
+    if (!v || k >> 24 != 60 || !l || l > 7 || (k >> 4 & 0xf) == v) return;
+    int cell = ((unsigned)r->x0 >> l <= x && x <= (unsigned)r->x1 >> l && (unsigned)r->z0 >> l <= z && z <= (unsigned)r->z1 >> l) ||
+               (r->xe >= 0 && (unsigned)r->xe >> l == x && (unsigned)r->ze >> l == z);
+    if (!cell) return;
+    unsigned k2 = (k & ~0xf0u) | v << 4;
+    long long before = *(long long *)(ga + 0xd8);
+    erase(ga, &k2);
+    long long gone = before - *(long long *)(ga + 0xd8);
+    if (gone) logf("small-base registry: tile key %08x unloaded; also erased %lld small base(s) under %08x (added region's variant)", k, gone, k2);
+}
 // Per-tile variant (pair >= 1, test): CS::GameMan::CalcGetReplaceMapIdByDisaster 0x6ab7a0(out, &map id, mode) gives a
 // tile or half the variant of the FIRST region flag in gm +0xbb8 whose variant file exists (mode 0; 0x6b4cb0 checks
 // the file table). For Mountaintop + Rotted Woods that already gives each tile its region (the Mountaintop has
@@ -3058,6 +3084,7 @@ static unsigned *map_request_hook(unsigned *out, unsigned *request) {
     // 0xa000000: the hub (the pattern stays in +0xb4c there; nothing of ours belongs in the hub)
     int one = g_settings[S_ONE_REGION] >= 1 && g_settings[S_ONE_REGION] <= 5;
     g_two_active = !one && gm && req != 0xa000000 && two_pattern(*(unsigned *)(gm + 0xb4c));
+    if (req != 0xa000000) g_sb_variant = g_two_active ? TWO_ADDED.variant : 0;  // kept over the hub request (it may come before the old world's teardown)
     if (one && gm && req != 0xa000000) {
         logf("one-region (test): map request: pattern %u, map type +b46 %d, region list left as the game's", *(unsigned *)(gm + 0xb4c), (int)(unsigned char)gm[0xb46]);
         return r;
@@ -3286,6 +3313,7 @@ static void hook_acceptance(void) {
     }
     hook_call(0xc27a41, 0x6b06f0, (void *)map_request_hook, "two-regions: map request");
     hook_call(0x5e7ff6, 0x6ab300, (void *)tile_flag_space_hook, "two-regions: tile flag space");
+    hook_call(0x627dba, 0x645db0, (void *)sb_erase_hook, "two-regions: small-base erase");
     if (setting(S_PACK_TEST)) pack_test_install();
     if (PAIR_NOW >= 1 || setting(S_VARIANT_TEST))
         for (unsigned i = 0; i < sizeof VARIANT_SITES / sizeof *VARIANT_SITES; i++)
@@ -7114,11 +7142,16 @@ static void step_hook(void *ctrl, void *time, int step) {
         // delayed write was the only DLL flag write; the hawk problem of runs 33..35 was start group 708).
         // Watched, never written here (logged when they change): 7601, the powers 9193 / 9192, and the
         // Rotted Woods' pattern flag 1046300590 (cleared by the game every frame in run 35).
-        static const int WATCH[5] = {7601, 7603, 9193, 9192, 1046300590};
-        static int seen[5] = {-1, -1, -1, -1, -1}, changes;
-        for (int k = 0; k < 5; k++) {
+        // + the Rotted Woods' map and tree (owner's report 2026-11-21): the tower's map 1056304580 / 81, the tree sites
+        // 1046300590 / 1047300590 / 1057300590 and their bosses' deaths 1046300800 / 1047300800 / 1057300800
+        static const int WATCH[] = {7601, 7603, 9193, 9192, 1046300590, 1047300590, 1057300590, 1056304580, 1056304581,
+                                    1046300800, 1047300800, 1057300800};
+        enum { NW = sizeof WATCH / sizeof *WATCH };
+        static int seen[NW], changes, init;
+        if (!init) init = 1, memset(seen, 0xff, sizeof seen);
+        for (int k = 0; k < NW; k++) {
             int v = two_flag(WATCH[k], 0, 0);
-            if (v != seen[k] && changes < 40) changes++, logf("two-regions: event flag %d is %s", WATCH[k], v ? "on" : "off"), seen[k] = v;
+            if (v != seen[k] && changes < 120) changes++, logf("two-regions: event flag %d is %s", WATCH[k], v < 0 ? "no block" : v ? "on" : "off"), seen[k] = v;
         }
     }
     no_sprint_frame();

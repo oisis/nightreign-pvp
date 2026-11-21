@@ -39,7 +39,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 40
+#define BUILD_FORMAT 41
 #define BOSS_DEATHS_MIN 100  // the game (1.3.3) has 158 such flags; fewer = its event scripts changed
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
@@ -110,28 +110,21 @@ static const char *const PAIR_SPECIAL[4][2] = {
     {"the Magma Wyrm or the Captain", "Magmowego Wyrma lub Kapitana"},
     {"the Magma Wyrm or the Naturalborn of the Void", "Magmowego Wyrma lub Naturalborn of the Void"},
 };
-static const char *const PAIR_SPECIAL_BOTH[4][2] = {  // day 2 needs both (owner, 2026-11-21)
-    {"the dragon and the Captain", "smoka i Kapitana"},
-    {"the dragon and the Naturalborn of the Void", "smoka i Naturalborn of the Void"},
-    {"the Magma Wyrm and the Captain", "Magmowego Wyrma i Kapitana"},
-    {"the Magma Wyrm and the Naturalborn of the Void", "Magmowego Wyrma i Naturalborn of the Void"},
-};
 static int g_pair_given;  // test-settings.toml names the map (map = 1..4); otherwise it is drawn
 static int pair_now(void);
 // Texts that depend on the pair: 131183 (the special boss); 131180 / 131181 (kill notices, here with them), 131185 (the map's name, at the expedition start),
-// 131186 + k (a team with our password plays pair k), 131191 (131183 on day 2), the item's caption. (id, text) for the
+// 131186 + k (a team with our password plays pair k), 131191 (131183 on day 2; both short, no names: owner 2026-11-21), the item's caption. (id, text) for the
 // language, n of them.
 static int pair_texts(int polish, u32 *ids, char text[][400]) {  // up to 10
     int p = pair_now(), l = polish != 0, n = 0;
-    const char *sp = PAIR_SPECIAL[p][l];
     // 131180: %s = "M/M", a special boss still needed; 131181: %s = "N/M", M the day's target (owner, 2026-11-19 /
     // 2026-11-21: 6 on day 1, on day 2 min(6, ordinary bosses alive at its start)); 131183 / 131191: %s = M
     ids[n] = 131180, snprintf(text[n++], 400, l ? "Pokonano boss\xc3\xb3w: %%s. Zabij bossa regionu specjalnego" : "Bosses defeated: %%s. Defeat the special region boss");
     ids[n] = 131181, snprintf(text[n++], 400, l ? "Pokonano boss\xc3\xb3w: %%s" : "Bosses defeated: %%s");
-    ids[n] = 131183, snprintf(text[n++], 400, l ? "Wyzwanie nie jest jeszcze dost\xc4\x99pne: pokonaj %%s boss\xc3\xb3w i bossa specjalnego (%s)"
-                                                  : "The challenge is not available yet: defeat %%s bosses and the special boss (%s)", sp);
-    ids[n] = 131191, snprintf(text[n++], 400, l ? "Wyzwanie nie jest jeszcze dost\xc4\x99pne: pokonaj %%s boss\xc3\xb3w i obu boss\xc3\xb3w specjalnych (%s)"
-                                                  : "The challenge is not available yet: defeat %%s bosses and both special bosses (%s)", PAIR_SPECIAL_BOTH[p][l]);
+    ids[n] = 131183, snprintf(text[n++], 400, l ? "Wyzwanie niedost\xc4\x99pne: zabij %%s boss\xc3\xb3w i bossa regionu specjalnego"
+                                                  : "Challenge not available: defeat %%s bosses and a special region boss");
+    ids[n] = 131191, snprintf(text[n++], 400, l ? "Wyzwanie niedost\xc4\x99pne: zabij %%s boss\xc3\xb3w i obu boss\xc3\xb3w regionu specjalnego"
+                                                  : "Challenge not available: defeat %%s bosses and both special region bosses");
     ids[n] = 131185, snprintf(text[n++], 400, l ? "Mapa: %s" : "Map: %s", PAIR_NAME[p][l]);
     for (int k = 0; k < 4; k++)
         ids[n] = 131186 + (u32)k, snprintf(text[n++], 400, l ? "Twoja dru\xc5\xbcyna (to samo has\xc5\x82o) gra na mapie %s. Ustaw map = %d w test-settings.toml albo uruchom launcher ponownie, aby wylosowa\xc4\x87 map\xc4\x99."

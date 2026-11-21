@@ -453,6 +453,17 @@ static void df_sb_registry_frame(int in_world) {
 // and then places the character. The same queue here, without the death and its level setter (0x140729200, the revive's
 // first call): the final circle's tile block as laid out (flag manager's tile list +0x118, the variant included); once
 // the load is done and the site's point is known, the warp below puts the player on it.
+// The queued position is not the default origin but DF_LOAD_Y above it. 0x140638d50 applies it at once with the setter
+// 0x1403daa70, in the arena tile's frame (every run: "before 0.0 -4.4..-11.4 0.0" right after, and the site then read
+// at about (0, ground, 0)), and the player waits there until the point is known. At y 0 he is under the ground; from an
+// m60 tile he only falls, but from the cave m30_30 (block 1e1e0111, deck 0.2.8 day 2) he had HP 0 before the landing
+// took effect, most likely a death collision (hit kind 0xf: 0x140461650 -> 0x140441ee0, the instant fall death that
+// zeroes HP; unproven which part). Above every site seen (ground y 64.8..191.3) he touches nothing in that time.
+#define DF_LOAD_Y 400.0f
+static int df_hp(char *me) {  // -1: not readable
+    char **pd = me && !IsBadReadPtr(me + 0x1b8, 8) ? *(char ***)(me + 0x1b8) : NULL;
+    return pd && !IsBadReadPtr(pd, 8) && *pd && !IsBadReadPtr(*pd, 0x148) ? *(int *)(*pd + 0x140) : -1;
+}
 static int df_arena_block(unsigned *block) {
     char *pa = *(char **)(g_base + RVA_PLAY_AREA_PTR), *man = *(char **)(g_base + 0x3c115a8);
     if (!pa || !man) return 0;
@@ -471,10 +482,13 @@ static int df_arena_load(void) {
     unsigned b = block;
     if (((char (*)(char *, unsigned *))(g_base + 0x639150))(mgr, &b)) return logf("day flow: arena block %08x already loaded", block), 1;
     b = block;
-    ((void (*)(char *, unsigned *, void *, void *))(g_base + 0x639760))(mgr, &b, (void *)(g_base + 0x3ab9b10), (void *)(g_base + 0x46a9490));
+    _Alignas(16) float pos[4] = {0.0f, DF_LOAD_Y, 0.0f, 1.0f};
+    ((void (*)(char *, unsigned *, void *, void *))(g_base + 0x639760))(mgr, &b, pos, (void *)(g_base + 0x46a9490));
+    char *me = local_player();
+    if (me) ((void (*)(void *, int, unsigned char))(g_base + RVA_ADD_SPEFFECT))(me, 90071613, 0);  // no fall damage (15 s), as after the warp
     char *rp = *(char **)(g_base + 0x3c17c88);
-    logf("day flow: arena block %08x not loaded: load queued as the death restart does (respawn manager's block %08x)", block,
-         rp ? *(unsigned *)(rp + 0x18) : 0);
+    logf("day flow: arena block %08x not loaded: load queued as the death restart does, at 0 %.0f 0 of the block (respawn manager's block %08x; "
+         "player block %08x, HP %d)", block, DF_LOAD_Y, rp ? *(unsigned *)(rp + 0x18) : 0, me ? *(unsigned *)(me + CHR_BLOCK_ID) : 0, df_hp(me));
     return 1;
 }
 static int df_load_pending(void) {
@@ -483,9 +497,9 @@ static int df_load_pending(void) {
 }
 // After the warp (deck test of 9330160: the player fell through the ground 8 s after a successful warp, at the
 // arena block's origin height). Three things:
-// 1. the load we queued (world manager +0xf0 block, +0x100 position = 0x143ab9b10 = (0, 0, 0, 1), the block's origin)
+// 1. the load we queued (world manager +0xf0 block, +0x100 position = (0, DF_LOAD_Y, 0, 1), above the block's origin)
 //    is cleared if still pending: 0x140638d50 applies a pending entry by setting the local player's position to it
-//    (0x1403daa70 ...), which would put him at the origin of the arena tile;
+//    (0x1403daa70 ...), which would put him above the centre of the arena tile;
 // 2. our no-fall-damage SpEffect 90071613 (15 s, fallDamageRate +0xdc = 0, launcher);
 // 3. the owner's landing: the site's own position (the point's vfunc +0x18, its rotation +0x20, as 0x14060b540 takes
 //    them) with y + DF_DROP_M, set with the same setter 0x1403daa70, so the player falls onto the arena.
@@ -545,13 +559,19 @@ static void df_after_warp(char *me, int dest) {
 }
 static void df_track_frame(void) {
     if (!g_df_track_until) return;
-    if ((int)(GetTickCount() - g_df_track_until) >= 0) { g_df_track_until = 0; return; }
+    char *me = local_player(), *mgr = *(char **)(g_base + 0x3c123f8);
+    int hp = df_hp(me);
+    if ((int)(GetTickCount() - g_df_track_until) >= 0) {  // the verdict, 10 s after the landing
+        unsigned arena = 0, at = me ? *(unsigned *)(me + CHR_BLOCK_ID) : 0;
+        df_arena_block(&arena);
+        g_df_track_until = 0;
+        logf("day flow: warp check: block %08x, arena block %08x: %s; HP %d: %s", at, arena, at == arena ? "in the arena" : "NOT in the arena", hp,
+             hp > 0 ? "alive" : "DEAD");
+        return;
+    }
     if ((int)(GetTickCount() - g_df_track_next) < 0) return;
     g_df_track_next = GetTickCount() + 500;
-    char *me = local_player(), *mgr = *(char **)(g_base + 0x3c123f8);
     float p[3];
-    char **pd = me && !IsBadReadPtr(me + 0x1b8, 8) ? *(char ***)(me + 0x1b8) : NULL;
-    int hp = pd && !IsBadReadPtr(pd, 8) && *pd && !IsBadReadPtr(*pd, 0x148) ? *(int *)(*pd + 0x140) : -1;
     if (me && df_chr_pos(me, p))
         logf("day flow: after the warp: block %08x position %.1f %.1f %.1f, HP %d, downed %u, queued load %s", *(unsigned *)(me + CHR_BLOCK_ID), p[0],
              p[1], p[2], hp, (unsigned char)me[0x710], mgr && *(int *)(mgr + 0xf0) != -1 ? "pending" : "none");
@@ -574,9 +594,9 @@ static int df_warp(void) {
     float before[3] = {0, 0, 0};
     int had = df_chr_pos(me, before);
     unsigned char got = known ? (unsigned char)((unsigned long long (*)(int *, int *, char))(g_base + 0x5f1a00))(&who, &dest, 1) : 0;
-    logf("day flow: warp to the night boss's site (circle row %d, attach point %d, entity %d): point %s, %s; before: %s%.1f %.1f %.1f", row_id,
-         *(int *)(row + 0x24), dest, known ? "known" : "not in the point manager", got ? "done" : "not done", had ? "" : "(none) ", before[0],
-         before[1], before[2]);
+    logf("day flow: warp to the night boss's site (circle row %d, attach point %d, entity %d): point %s, %s; before: %s%.1f %.1f %.1f, block %08x, HP %d",
+         row_id, *(int *)(row + 0x24), dest, known ? "known" : "not in the point manager", got ? "done" : "not done", had ? "" : "(none) ", before[0],
+         before[1], before[2], *(unsigned *)(me + CHR_BLOCK_ID), df_hp(me));
     if (got) df_after_warp(me, dest);
     return got;
 }
