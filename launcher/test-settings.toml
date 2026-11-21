@@ -10,4 +10,3 @@ revive-hits = false       # test, invasions: a downed player is finished by the 
 ult-pvp = 100             # test, invasions: ultimate damage against players of the other side in percent (100 = unchanged, 0..999)
 party = 0                 # test only: a number mixed into the squad matchmaking key, to keep test runs apart (0 = off)
 slot-test = false         # test: new session members take the highest free player slot first (3 machines reach slots 3 and 2)
-# map = 1            # test: fix the map (1 Frozen Thicket, 2 City Beneath the Peak, 3 Ash and Rot, 4 Fire over the City); without it (or 0) the launcher draws one at every start

@@ -336,10 +336,14 @@ static void exit_line(int process_exit) {
 // Test settings: test-settings.toml next to the DLL (the launcher writes it at every start from the
 // file next to the launcher; the dev build copies $W/test-settings.toml). Read once, at load.
 #include "settings.h"
-// The map's region pair 0..3; -1 when the launcher's build did not finish (built-map.txt missing): no lobby pairs up.
-#define PAIR_NOW (g_pair_unbuilt ? -1 : g_settings[S_MAP] >= 1 && g_settings[S_MAP] <= 4 ? g_settings[S_MAP] - 1 : 0)
+// The five maps (launcher, owner 2026-11-21): the game's generator draws the pattern, the pattern is the map. Per night
+// boss group of 40: 0..19 the base map (no special region), 20+5p..24+5p pair p.
+static int pattern_pair(unsigned pat) { return pat < 320 && pat % 40 >= 20 ? (int)(pat % 40 - 20) / 5 : -1; }
+static const char *const PAIR_NAME[4] = {"Frozen Thicket", "City Beneath the Peak", "Ash and Rot", "Fire over the City"};
+static int g_pair = -1;  // this map's pair, from gm +0xb4c at each map request (host and joiner alike); -1 the base map
+static const char *map_name(int pair) { return pair >= 0 && pair < 4 ? PAIR_NAME[pair] : "the base map"; }
 static short g_settings[SETTINGS_COUNT];
-static int g_pair_unbuilt;
+static int g_pair_unbuilt;  // the launcher's build did not finish (no built-map.txt): no lobby is offered or joined
 static int setting(int i) { return g_settings[i] > 0; }
 static void next_to_dll(char *path, size_t cap, const char *name) {
     snprintf(path, cap, "%s", log_path);
@@ -371,26 +375,16 @@ static void settings_load(void) {
             if (GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES) snprintf(old + strlen(old), sizeof old - strlen(old), " %s", name);
         }
     if (old[0]) logf("settings: old marker files ignored (test-settings.toml replaces them):%s", old);
-    {  // The map: what the launcher built (built-map.txt, written once a build has finished, removed when one starts),
-       // not test-settings.toml, which the launcher writes before it builds (run of 2026-11-21: map = 3 here on files
-       // of another map). The dev build (mod/build.sh) has no built-map.txt and no launcher header: its map line counts.
-        char bp[MAX_PATH], bt[32] = "";
+    {  // built-map.txt: written by the launcher once a build has finished, removed when one starts. A launcher-written
+       // test-settings.toml without it: a start on unfinished files. The dev build (mod/build.sh) has neither.
+        char bp[MAX_PATH];
         next_to_dll(bp, sizeof bp, "built-map.txt");
-        FILE *b = fopen(bp, "rb");
-        size_t bn = b ? fread(bt, 1, sizeof bt - 1, b) : 0;
-        if (b) fclose(b);
-        bt[bn] = 0;
-        int m = 0, launcher = n >= 25 && !memcmp(text, "# Written by the launcher", 25);
-        if (sscanf(bt, "map = %d", &m) == 1 && m >= 1 && m <= 4) {
-            if (m != g_settings[S_MAP])
-                logf("settings: test-settings.toml says map = %d, but the launcher built map %d: map %d is used", g_settings[S_MAP], m, m);
-            g_settings[S_MAP] = (short)m;
-            logf("settings: map = %d (built-map.txt: the map the launcher built)", m);
-        } else if (launcher) {
+        int launcher = n >= 25 && !memcmp(text, "# Written by the launcher", 25);
+        if (launcher && GetFileAttributesA(bp) == INVALID_FILE_ATTRIBUTES) {
             g_pair_unbuilt = 1;
-            logf("settings: no usable built-map.txt next to the DLL ('%s'), but the launcher wrote test-settings.toml: its build did not "
-                 "finish, the map files may be another map's; no lobby is offered or joined (start the game with the launcher's Play)", bt);
-        } else logf("settings: no built-map.txt (dev build): map = %d from test-settings.toml", g_settings[S_MAP]);
+            logf("settings: no built-map.txt next to the DLL, but the launcher wrote test-settings.toml: its build did not finish; no "
+                 "lobby is offered or joined (start the game with the launcher's Play)");
+        }
     }
     g_debug_log = setting(S_DEBUG_LOG);
     logf("settings: log %s", g_debug_log ? "full (debug-log)" : "short (key lines only; debug-log gives everything)");
@@ -953,27 +947,36 @@ static void hook_call(unsigned rva_site, unsigned rva_target, void *hook, const 
     if (patch_rel32(site + 1, site + 5, stub)) logf("%s: hooked (%x)", what, rva_site);
     else logf("%s: cannot patch %x", what, rva_site);
 }
-// pack-test (measurement for four pairs side by side): the map screen's tile pack is loaded by 0x140ec2cc0(obj, u8 map
-// type) as "menu:/71_MapTile_M%02d.tpf" (format at 0x142cb4c48), kept while obj+0xdc8 equals the type; no direct
-// call reaches it (protected callers), so its entry is patched: mov dl, 6, then its first three instructions
-// (mov [rsp+8],rbx / [rsp+0x10],rbp / [rsp+0x18],rsi, 15 bytes) and back. The launcher put the game's plain pack M00
-// there as M06, so the map screen shows the map without its region if the pack loads.
-static void pack_test_install(void) {
+// The map screen's tile pack: 0x140ec2cc0(obj, u8 map type) loads "menu:/71_MapTile_M%02d.tpf" (format at 0x142cb4c48; the
+// type in edi is the format's only argument and the cache key obj+0xdc8: 0x140ec2cda / 0x140ec2d61 / 0x140ec2dbe), and
+// no direct call reaches it (protected callers), so its entry is patched: g_pack_type, when not 0xff, replaces dl, then
+// its first three instructions (mov [rsp+8],rbx / [rsp+0x10],rbp / [rsp+0x18],rsi, 15 bytes) and back. On a pair's map
+// it is 6 + pair: the launcher's pack of that pair (both regions; packs 01 / 02 belong to two pairs each).
+static volatile unsigned char g_pack_type = 0xff;
+static void map_pack_install(void) {
     static const unsigned char head[15] = {0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18};
-    unsigned char *f = (unsigned char *)g_base + 0xec2cc0, *stub = near_alloc(32);
-    if (memcmp(f, head, sizeof head) || !stub) return (void)logf("pack test: 0xec2cc0 does not look as expected, not hooked");
-    stub[0] = 0xb2, stub[1] = 0x06;  // mov dl, 6
-    memcpy(stub + 2, head, sizeof head);
-    stub[17] = 0xe9;
-    int back = (int)((f + 15) - (stub + 22));
-    memcpy(stub + 18, &back, 4);
+    unsigned char *f = (unsigned char *)g_base + 0xec2cc0, *stub = near_alloc(48);
+    if (memcmp(f, head, sizeof head) || !stub) return (void)logf("map screen: 0xec2cc0 does not look as expected, pack choice not hooked");
+    unsigned char *at = stub;
+    volatile unsigned char *type = &g_pack_type;
+    *at++ = 0x50;                                       // push rax
+    *at++ = 0x48, *at++ = 0xb8, memcpy(at, &type, 8), at += 8;  // mov rax, &g_pack_type
+    *at++ = 0x8a, *at++ = 0x00;                         // mov al, [rax]
+    *at++ = 0x3c, *at++ = 0xff;                         // cmp al, 0xff
+    *at++ = 0x74, *at++ = 0x02;                         // je +2
+    *at++ = 0x88, *at++ = 0xc2;                         // mov dl, al
+    *at++ = 0x58;                                       // pop rax
+    memcpy(at, head, sizeof head), at += sizeof head;
+    *at++ = 0xe9;
+    int back = (int)((f + 15) - (at + 4));
+    memcpy(at, &back, 4);
     DWORD old;
-    if (!VirtualProtect(f, 15, PAGE_EXECUTE_READWRITE, &old)) return (void)logf("pack test: cannot patch 0xec2cc0");
+    if (!VirtualProtect(f, 15, PAGE_EXECUTE_READWRITE, &old)) return (void)logf("map screen: cannot patch 0xec2cc0");
     int to = (int)(stub - (f + 5));
     f[0] = 0xe9, memcpy(f + 1, &to, 4), memset(f + 5, 0x90, 10);
     VirtualProtect(f, 15, old, &old);
     FlushInstructionCache(GetCurrentProcess(), f, 15);
-    logf("pack test: map screen pack choice hooked (0xec2cc0): every map type loads menu:/71_MapTile_M06.tpf");
+    logf("map screen: pack choice hooked (0xec2cc0): a pair's map loads menu:/71_MapTile_M(6 + pair).tpf");
 }
 static void hooks_retry(void) {  // every second for 2 minutes after the start, while some site is still pending
     static DWORD start, next;
@@ -1127,28 +1130,33 @@ static void generate_hook(unsigned long long a1, unsigned long long a2, unsigned
     char *pa = *(char **)(g_base + 0x3c13158);
     if (gm) memcpy(gm_before, gm + 0xa00, sizeof gm_before);
     if (pa) memcpy(pa_before, pa, sizeof pa_before);
-    // map-test-control / two-regions: the generator draws the pattern itself (a forced gm +0xb48 left items
-    // unpickable, runs 30..36). Its region argument v3 (rare map layer, u8: the region the player chose)
-    // becomes the Mountaintop (1); the launcher left a weight only on the Mountaintop sets, so one of the
-    // Mountaintop patterns is drawn (two-regions: with the Rotted Woods added by the launcher).
-    // map-region (test): the region digit asked for (1..5); 9 (plain sets) leaves the argument alone, plain
-    // sets are always candidates. The launcher left weights only on that region's sets.
+    // The generator draws the pattern itself (a forced gm +0xb48 left items unpickable, runs 30..36); the launcher's
+    // weights make the five maps 20 % each. Its region argument v3 (u8 vector, the game's "rare map layer"): the
+    // generator takes a set of a digit in its region-choice vector alone, and keeps only the digits whose bit every byte
+    // of its unlock vector has (0x1406b383d.., 0x1406b3938..), so v3 is emptied: a vector with no byte forces nothing and
+    // filters nothing, whichever of the two it is (runs with [1] / [2] here drew plain and region slots alike).
     // one-region (measurement only): that region's digit; the launcher left weights only on its sets.
-    int want = g_settings[S_ONE_REGION] >= 1 && g_settings[S_ONE_REGION] <= 5 ? g_settings[S_ONE_REGION]
-               : PAIR_NOW == 2 || PAIR_NOW == 3 ? 2 : 1;  // decision 35: Mountaintop / plain sets; pairs 2 / 3: the Crater
-    if (want && g_join != 4 && v3 && !IsBadReadPtr(v3, 32)) {
+    int want = g_settings[S_ONE_REGION] >= 1 && g_settings[S_ONE_REGION] <= 5 ? g_settings[S_ONE_REGION] : 0;
+    if (g_join != 4 && v3 && !IsBadReadPtr(v3, 32)) {
         unsigned char *b = v3[1], *e = v3[2], *cap = v3[3];
-        if (b && e > b) {
+        if (!want) {
+            v3[2] = b;
+            logf("generate: region argument emptied (was [%s]): every map's set is drawn by its weight", t3);
+        } else if (b && e > b) {
             for (unsigned char *q = b; q < e; q++) *q = (unsigned char)want;
-            logf("map test: generator region argument set to %d", want);
+            logf("one-region (test): generator region argument set to %d", want);
         } else if (b && e == b && cap > e) {
             *e = (unsigned char)want, v3[2] = e + 1;
-            logf("map test: generator region argument was empty; %d added", want);
+            logf("one-region (test): generator region argument was empty; %d added", want);
         } else
-            logf("map test: generator region argument not usable; the draw stays the game's own");
+            logf("one-region (test): generator region argument not usable; the draw stays the game's own");
     }
     ((void (*)(unsigned long long, unsigned long long, unsigned long long, unsigned long long, void *, void *, void *,
                void *, unsigned long long))(g_base + RVA_GENERATE))(a1, a2, a3, a4, v1, v2, v3, v4, a9);
+    if (gm) {
+        unsigned pat = *(unsigned *)(gm + 0xb48);
+        logf("generate: drew pattern %u (group %u, slot %u): %s", pat, pat / 40, pat % 40, pat < 320 ? map_name(pattern_pair(pat)) : "not one of our maps");
+    }
     logf("generate (%s): done; start block after %08x", g_generate_where, gm ? *(unsigned *)(gm + 0xa74) : 0);
     if (gm) diff_log("game manager +0xa00..+0xe00", gm_before, (unsigned *)(gm + 0xa00), 0x100, 0xa00);
     if (pa) diff_log("play area +0..+0x700", pa_before, (unsigned *)pa, 0x1c0, 0);
@@ -2224,17 +2232,12 @@ static void reward_hook(unsigned long long a1, unsigned a2) {
 // into the current expedition and puts one region flag (7601..7606, the pattern's map type) into gm +0xbb8
 // (int[4], count int64 at +0xbd0). Map tiles take their variant from those flags, per tile
 // (CalcGetReplaceMapIdByDisaster, 0x6ab7a0: the first flag whose variant the tile has), and so do the
-// tile scripts (run 35: the Rotted Woods' rot works with the Mountaintop as the map type). The patterns
-// are the game's Mountaintop ones (40g+20..24) with the Rotted Woods added by the launcher; the map type
-// stays the Mountaintop's (what its cold and ice dragon need, runs 33..35). Here, once per map request:
-// 7603 (the Rotted Woods, tile variant 3) appended to the list (the game puts only the record's last region
-// flag, 7601, there: 0x6b06f0). The event flags come from the record (the launcher puts a 7603 row before
-// 7601; OnMapEnter sets both). Host and invader alike. Event flag calls: 0x5e7260 get (man, &id, tag), 0x5e79f0 set
+// tile scripts (run 35: the Rotted Woods' rot works with the Mountaintop as the map type). A pair's patterns
+// are compositions of its base region's (map type: what e.g. the Mountaintop's cold and ice dragon need, runs 33..35)
+// with its added region's (launcher). Here, once per map request: the added region's flag appended to the list (the
+// game puts only the record's last region flag, the base region's, there: 0x6b06f0). The event flags come from the
+// record (the launcher puts the added region's row before the base one's; OnMapEnter sets both). Host and invader alike. Event flag calls: 0x5e7260 get (man, &id, tag), 0x5e79f0 set
 // (man, &id, on, tag, notify 0, 0), the manager at 0x3c115a8.
-static int pair_base_off(void) { int p = PAIR_NOW; return p == 2 || p == 3 ? 25 : 20; }  // Crater base for pairs 2 / 3
-static int two_pattern(unsigned pat) {  // the plain and base-region slots (decision 35; pairs 2 / 3: Crater 25..29)
-    return pat < 320 && (pat % 40 < 20 || (pat % 40 >= (unsigned)pair_base_off() && pat % 40 < (unsigned)pair_base_off() + 5));
-}
 static int two_flag(int id, int set, int on) {  // set: 0 read, 1 write
     char *man = *(char **)(g_base + 0x3c115a8);
     if (!man) return -1;
@@ -2821,18 +2824,17 @@ static void flag_log_frame(void) {  // InGame, every frame
         logf("flags: 20 s after the map load, %d tile flags on (read from storage):%s", on, line);
     }
 }
-// The two regions of the two-region map, as data (decision 35's pair; other pairs need their own rows, and
-// their tile sets from 0x6ab3c0: 1 Mountaintop 42-43 x 38-39, 2 Crater 43-44 x 38-39, 3 Rotted Woods 44-45 x
-// 36-37, 4 every field tile, 5 Noklateo 42-43 x 36-37 and 44_37): region flag (7601..7606), variant digit, tiles.
+// The regions of the four pairs, as data (tile sets from 0x6ab3c0: 1 Mountaintop 42-43 x 38-39, 2 Crater 43-44 x 38-39,
+// 3 Rotted Woods 44-45 x 36-37, 4 every field tile, 5 Noklateo 42-43 x 36-37 and 44_37): region flag (7601..7606),
+// variant digit, tiles. Noklateo has 44_37, which the game's table gives it and whose variant-5 file it loads once 7605
+// is in the region list (its tile scripts m60_44_37_50 need that tile's own flag space; small bases there stay the base
+// region's, launcher).
 typedef struct { int flag, variant, x0, x1, z0, z1, xe, ze; const char *name; } two_region;  // xe/ze: one extra tile (-1 none)
 static const two_region TWO_BASE_REGIONS[2] = {{7601, 1, 42, 43, 38, 39, -1, -1, "Mountaintop"}, {7602, 2, 43, 44, 38, 39, -1, -1, "Crater"}};
-#define TWO_BASE (TWO_BASE_REGIONS[PAIR_NOW == 2 || PAIR_NOW == 3])  // the pattern's own region (map type)
-// The region laid over its tiles: pair = 0 the Rotted Woods; pair = 1 (test) Noklateo, with 44_37, which the game's
-// table gives to Noklateo and whose variant-5 file it loads once 7605 is in the region list (its tile scripts
-// m60_44_37_50 need that tile's own flag space; small bases there stay the Mountaintop's, launcher).
 static const two_region TWO_ADDED_PAIRS[2] = {{7603, 3, 44, 45, 36, 37, -1, -1, "Rotted Woods"},
                                               {7605, 5, 42, 43, 36, 37, 44, 37, "Noklateo"}};
-#define TWO_ADDED (TWO_ADDED_PAIRS[PAIR_NOW == 1 || PAIR_NOW == 3])  // pairs 1 / 3 Noklateo, 0 / 2 the Rotted Woods
+#define TWO_BASE (TWO_BASE_REGIONS[g_pair == 2 || g_pair == 3])  // the pattern's own region (map type): pairs 2 / 3 the Crater
+#define TWO_ADDED (TWO_ADDED_PAIRS[g_pair == 1 || g_pair == 3])  // pairs 1 / 3 Noklateo, 0 / 2 the Rotted Woods
 static int two_on_tile(const two_region *r, unsigned x, unsigned z) {
     return ((int)x >= r->x0 && (int)x <= r->x1 && (int)z >= r->z0 && (int)z <= r->z1) || ((int)x == r->xe && (int)z == r->ze);
 }
@@ -2857,63 +2859,59 @@ static unsigned char tile_flag_space_hook(unsigned *id, int a) {
 // key. Entries seen are all lod 2, so the lod-2 tile of the cell erases them. Our variant hook makes the added
 // region's tiles variant 3 but leaves the cell's lod-2 tile (m60_11_09) at the base variant 2: deck-now3 had keys
 // 3c0b0922 and 3c0b0932 in that cell; at the final arena (20:09:07) the 3c0b0922 ones went, the 7 3c0b0932 ones
-// stayed until the leak check. So the erase of a lod >= 1 key of a cell holding added-region tiles also erases the
-// same key with the added variant: what the lod-2 tile would erase if the game had given it that variant.
-static unsigned g_sb_variant;  // the added region's variant on a two-regions map (0 none), set at the map request
+// stayed until the leak check. In the game's own maps a cell's tiles have its lod-2 tile's variant; on a pair's maps
+// they have the base region's, the added region's or none (0), and a composed half has a variant of its own (6 + pair:
+// variant_hook). So the erase of a lod >= 1 key of the field (42..45 x 36..39 at that lod) also erases the same key
+// with each of those variants: what the lod-2 tile would erase if all its tiles had its variant.
+static int g_sb_pair = -1;  // the pair of the last two-regions map request (-1 none), kept over the hub request
 static void sb_erase_hook(char *ga, unsigned *key) {
     void (*erase)(char *, unsigned *) = (void (*)(char *, unsigned *))(g_base + 0x645db0);
     erase(ga, key);
-    unsigned k = key ? *key : 0, l = k & 0xf, x = k >> 16 & 0xff, z = k >> 8 & 0xff, v = g_sb_variant;
-    const two_region *r = &TWO_ADDED;
-    if (!v || k >> 24 != 60 || !l || l > 7 || (k >> 4 & 0xf) == v) return;
-    int cell = ((unsigned)r->x0 >> l <= x && x <= (unsigned)r->x1 >> l && (unsigned)r->z0 >> l <= z && z <= (unsigned)r->z1 >> l) ||
-               (r->xe >= 0 && (unsigned)r->xe >> l == x && (unsigned)r->ze >> l == z);
-    if (!cell) return;
-    unsigned k2 = (k & ~0xf0u) | v << 4;
-    long long before = *(long long *)(ga + 0xd8);
-    erase(ga, &k2);
-    long long gone = before - *(long long *)(ga + 0xd8);
-    if (gone) logf("small-base registry: tile key %08x unloaded; also erased %lld small base(s) under %08x (added region's variant)", k, gone, k2);
+    unsigned k = key ? *key : 0, l = k & 0xf, x = k >> 16 & 0xff, z = k >> 8 & 0xff;
+    if (g_sb_pair < 0 || k >> 24 != 60 || !l || l > 7 || x < 42u >> l || x > 45u >> l || z < 36u >> l || z > 39u >> l) return;
+    int p = g_sb_pair;
+    const unsigned V[3] = {0, (unsigned)TWO_BASE_REGIONS[p == 2 || p == 3].variant, (unsigned)TWO_ADDED_PAIRS[p == 1 || p == 3].variant};
+    for (int i = 0; i < 3; i++) {
+        if ((k >> 4 & 0xf) == V[i]) continue;
+        unsigned k2 = (k & ~0xf0u) | V[i] << 4;
+        long long before = *(long long *)(ga + 0xd8);
+        erase(ga, &k2);
+        long long gone = before - *(long long *)(ga + 0xd8);
+        if (gone) logf("small-base registry: tile key %08x unloaded; also erased %lld small base(s) under %08x (variant %u)", k, gone, k2, V[i]);
+    }
 }
-// Per-tile variant (pair >= 1, test): CS::GameMan::CalcGetReplaceMapIdByDisaster 0x6ab7a0(out, &map id, mode) gives a
-// tile or half the variant of the FIRST region flag in gm +0xbb8 whose variant file exists (mode 0; 0x6b4cb0 checks
-// the file table). For Mountaintop + Rotted Woods that already gives each tile its region (the Mountaintop has
-// variant files only on X 42-43, the Rotted Woods only on X 44-45), but the Crater and Noklateo have variant files
-// on all 16 tiles and the Mountaintop on every west tile, so for the other pairs the second region's tiles would
-// load the first region's variant. Here (27 call sites, all calls): a field tile (area 60, low nibble 0) of the
-// second region's set gets that region's variant; everything else stays the game's choice.
+// Per-tile variant: CS::GameMan::CalcGetReplaceMapIdByDisaster 0x6ab7a0(out, &map id, mode) gives a tile or half the
+// variant of the FIRST region flag in gm +0xbb8 whose variant file exists (mode 0; 0x6b4cb0 checks the file table). For
+// Mountaintop + Rotted Woods that already gives each tile its region (the Mountaintop has variant files only on X 42-43,
+// the Rotted Woods only on X 44-45), but the Crater and Noklateo have variant files on all 16 tiles and the Mountaintop
+// on every west tile, so for the other pairs the second region's tiles would load the first region's variant. Here
+// (27 call sites, all calls), on a pair's map: a field tile (area 60, low nibble 0) of the added region's set gets that
+// region's variant, its lod1 quadrant too, and a half the launcher composed for this pair (lod 2, low nibble 2: west
+// m60_10_09 on pairs 1 / 3, east m60_11_09 on pairs 2 / 3) gets the pair's own variant 6 + pair, under which the
+// launcher wrote it (m60_10_09_72 ...: the pairs' sources share names). Everything else stays the game's choice.
 static const unsigned VARIANT_SITES[] = {0x6362a7, 0x6363e6, 0x6363fb, 0x6396ae, 0x6396c3, 0x639ac2, 0x646ce1, 0x646d2f, 0x64a112,
                                          0x64aa02, 0x64b5c0, 0x64cafc, 0x64cb71, 0x64cc25, 0x64d9b7, 0x64db8c, 0x64dc47, 0x64dcf6,
                                          0x64dd98, 0x69ceb3, 0x69cfa2, 0x6ab5c6, 0x6ab63d, 0x6ab723, 0x6b0dcb, 0xbedc9f, 0xe7b48c};
+static const unsigned char PAIR_HALVES[4] = {0, 1, 2, 3};  // bit 0 west, bit 1 east (launcher TWO_PAIRS)
 static int g_variant_forced;
+static void variant_set(unsigned *out, unsigned want, const char *what, unsigned x, unsigned z) {
+    if (*out != want && g_variant_forced++ < 40)
+        logf("pair: %s m60_%02u_%02u: variant %u -> %u (%s)", what, x, z, *out >> 4 & 0xf, want >> 4 & 0xf, map_name(g_pair));
+    *out = want;
+}
 static unsigned *variant_hook(unsigned *out, unsigned *id, unsigned long long mode) {
     ((unsigned *(*)(unsigned *, unsigned *, unsigned long long))(g_base + 0x6ab7a0))(out, id, mode);
-    if ((mode & 0xff) || !g_two_active || !id) return out;
-    unsigned m = *id, x = m >> 16 & 0xff, z = m >> 8 & 0xff;
-    if (m >> 24 == 60 && (m & 0xf) == 0 && two_on_tile(&TWO_ADDED, x, z)) {
-        unsigned want = (m & 0xffffff00u) | ((unsigned)TWO_ADDED.variant << 4);
-        if (*out != want && g_variant_forced++ < 40)
-            logf("pair: tile m60_%02u_%02u: variant %u -> %d (%s)", x, z, *out >> 4 & 0xf, TWO_ADDED.variant, TWO_ADDED.name);
-        *out = want;
-    }
-    // variant-test (measurement for four pairs side by side): the west half (lod2 m60_10_09, low nibble 2) gets variant
-    // 6, a digit no region has; the launcher wrote the composed half there (m60_10_09_62). Shows whether the loaders
-    // take a variant without a region flag.
-    if (setting(S_VARIANT_TEST) && m >> 24 == 60 && x == 10 && z == 9 && (m & 0xf) == 2) {
-        unsigned want = (m & 0xffffff00u) | 0x62;
-        if (*out != want && g_variant_forced++ < 40) logf("variant test: half m60_10_09: variant %u -> 6", *out >> 4 & 0xf);
-        *out = want;
-    }
-    // The lod1 quadrant of the added region (2x2 tiles, low nibble 1: m60_21_18 = 42-43 x 36-37, Noklateo's; m60_22_18 =
-    // 44-45 x 36-37, the Rotted Woods'; analysis 09 §15): it took the base region's variant too, so the second
-    // region's buildings were drawn only by their own near tiles (pair 3, dev.63: Noklateo's walls cut open seen from
-    // the city's edge). It gets the added region's variant; the other quadrants stay the game's choice.
-    if (m >> 24 == 60 && (m & 0xf) == 1 && x == (TWO_ADDED.variant == 5 ? 21u : 22u) && z == 18) {
-        unsigned want = (m & 0xffffff00u) | ((unsigned)TWO_ADDED.variant << 4) | 1;
-        if (*out != want && g_variant_forced++ < 40)
-            logf("pair: quadrant m60_%02u_%02u (lod1): variant %u -> %d (%s)", x, z, *out >> 4 & 0xf, TWO_ADDED.variant, TWO_ADDED.name);
-        *out = want;
-    }
+    if ((mode & 0xff) || !g_two_active || g_pair < 0 || !id) return out;
+    unsigned m = *id, x = m >> 16 & 0xff, z = m >> 8 & 0xff, lod = m & 0xf, top = m & 0xffffff00u;
+    if (m >> 24 != 60) return out;
+    if (lod == 0 && two_on_tile(&TWO_ADDED, x, z)) variant_set(out, top | (unsigned)TWO_ADDED.variant << 4, "tile", x, z);
+    // The lod1 quadrant of the added region (2x2 tiles: m60_21_18 = 42-43 x 36-37, Noklateo's; m60_22_18 = 44-45 x
+    // 36-37, the Rotted Woods'; analysis 09 §15): it took the base region's variant too, so the second region's
+    // buildings were drawn only by their own near tiles (pair 3, dev.63: Noklateo's walls cut open seen from the city's
+    // edge).
+    if (lod == 1 && x == (TWO_ADDED.variant == 5 ? 21u : 22u) && z == 18) variant_set(out, top | (unsigned)TWO_ADDED.variant << 4 | 1, "quadrant (lod1)", x, z);
+    if (lod == 2 && z == 9 && (x == 10 || x == 11) && (PAIR_HALVES[g_pair] >> (x - 10) & 1))
+        variant_set(out, top | (unsigned)(6 + g_pair) << 4 | 2, "composed half (lod2)", x, z);
     return out;
 }
 // No rain (fixed, every player): the raindrops outside the circle and the circle's wall are one effect, the
@@ -3081,8 +3079,8 @@ static void hud_circle_notice_hook(void *hud, unsigned long long phase) {
 #define RVA_PIN_ROW_SHOWN 0x6af290
 static unsigned long long pin_row_shown_hook(unsigned long long type, unsigned *id) {
     unsigned v = *id, area = v >> 24, x = (v >> 16) & 0xff, z = (v >> 8) & 0xff;
-    if (g_settings[S_ONE_REGION] < 1 && area >= 0x3c && area <= 0x58 && (v & 0xf) == 0 && two_on_tile(&TWO_ADDED, x, z)) {
-        norain_first(12, "map pins: a woods-tile row decided by the Rotted Woods rule");
+    if (g_two_active && area >= 0x3c && area <= 0x58 && (v & 0xf) == 0 && two_on_tile(&TWO_ADDED, x, z)) {
+        norain_first(12, "map pins: an added-region tile's row decided by that region's rule");
         return (int)((v >> 4) & 0xf) == TWO_ADDED.variant;
     }
     return ((unsigned long long (*)(unsigned long long, unsigned *))(g_base + RVA_PIN_ROW_SHOWN))(type, id);
@@ -3107,14 +3105,18 @@ static unsigned *map_request_hook(unsigned *out, unsigned *request) {
     char *gm = *(char **)(g_base + 0x3c13258);
     // 0xa000000: the hub (the pattern stays in +0xb4c there; nothing of ours belongs in the hub)
     int one = g_settings[S_ONE_REGION] >= 1 && g_settings[S_ONE_REGION] <= 5;
-    g_two_active = !one && gm && req != 0xa000000 && two_pattern(*(unsigned *)(gm + 0xb4c));
-    if (req != 0xa000000) g_sb_variant = g_two_active ? TWO_ADDED.variant : 0;  // kept over the hub request (it may come before the old world's teardown)
+    // the map: the pattern's pair (host and joiner alike: a joiner's generator copies the host's pattern, nrpvp_gen)
+    if (req != 0xa000000) g_pair = !one && gm ? pattern_pair(*(unsigned *)(gm + 0xb4c)) : -1;
+    g_two_active = gm && req != 0xa000000 && g_pair >= 0;
+    if (req != 0xa000000) g_sb_pair = g_pair;  // kept over the hub request (it may come before the old world's teardown)
+    g_pack_type = g_two_active ? (unsigned char)(6 + g_pair) : 0xff;
+    if (gm && req != 0xa000000) logf("map request: pattern %u: %s", *(unsigned *)(gm + 0xb4c), map_name(g_pair));
     if (one && gm && req != 0xa000000) {
         logf("one-region (test): map request: pattern %u, map type +b46 %d, region list left as the game's", *(unsigned *)(gm + 0xb4c), (int)(unsigned char)gm[0xb46]);
         return r;
     }
     if (!g_two_active) {
-        if (gm && req != 0xa000000) logf("two-regions: map request: pattern %u is not a Mountaintop pattern; nothing added", *(unsigned *)(gm + 0xb4c));
+        if (gm && req != 0xa000000) logf("two-regions: map request: pattern %u is the base map's; nothing added", *(unsigned *)(gm + 0xb4c));
         return r;
     }
     g_two_requests++;
@@ -3129,7 +3131,7 @@ static unsigned *map_request_hook(unsigned *out, unsigned *request) {
     logf("two-regions: map request: pattern %u, map type +b46 %d, +b50 %d, region flags (%lld) %d %d %d %d",
          *(unsigned *)(gm + 0xb4c), (int)(unsigned char)gm[0xb46], *(int *)(gm + 0xb50), *count,
          *count > 0 ? flags[0] : -1, *count > 1 ? flags[1] : -1, *count > 2 ? flags[2] : -1, *count > 3 ? flags[3] : -1);
-    logf("two-regions: event flags come from the pattern record (7603 row before 7601, OnMapEnter); none set here");
+    logf("two-regions: event flags come from the pattern record (%d row before %d, OnMapEnter); none set here", TWO_ADDED.flag, TWO_BASE.flag);
     return r;
 }
 // Decision 26: on a two-regions map the player starts with more HP flask charges, so that with every
@@ -3338,10 +3340,9 @@ static void hook_acceptance(void) {
     hook_call(0xc27a41, 0x6b06f0, (void *)map_request_hook, "two-regions: map request");
     hook_call(0x5e7ff6, 0x6ab300, (void *)tile_flag_space_hook, "two-regions: tile flag space");
     hook_call(0x627dba, 0x645db0, (void *)sb_erase_hook, "two-regions: small-base erase");
-    if (setting(S_PACK_TEST)) pack_test_install();
-    if (PAIR_NOW >= 1 || setting(S_VARIANT_TEST))
-        for (unsigned i = 0; i < sizeof VARIANT_SITES / sizeof *VARIANT_SITES; i++)
-            hook_call(VARIANT_SITES[i], 0x6ab7a0, (void *)variant_hook, "pair: per-tile variant");
+    map_pack_install();
+    for (unsigned i = 0; i < sizeof VARIANT_SITES / sizeof *VARIANT_SITES; i++)
+        hook_call(VARIANT_SITES[i], 0x6ab7a0, (void *)variant_hook, "pair: per-tile variant");
     // the held radius makes the game answer the rain around the player, the health bar's circle state, the weather side
     // and "outside the circle" by itself (rain-hooks-legacy, retired: its 8 hooks went)
     hook_call(0x68e1d2, 0x696170, (void *)norain_circle_hook, "no rain: circle radius held, play-area effect off after the circle update");
@@ -3974,7 +3975,6 @@ static DWORD g_request_tick;  // when the last start request arrived
 #define LOBBY_VER_KEY    "nrpvp_ver"     // the mod version (MOD_VERSION); only the same version pairs up
 #define LOBBY_LEVEL_KEY  "nrpvp_lvl"     // host's level (player data +0x68)
 #define LOBBY_PHASE_KEY  "nrpvp_phase"   // host's expedition phase: "hub", "field", "boss" (a night boss fight), "late" (day-2 boss beaten)
-#define LOBBY_PAIR_KEY   "nrpvp_pair"    // the host's region pair this launcher start (0..3); only the same pair pairs up
 #define LOBBY_BORN_KEY   "nrpvp_born"    // when the lobby was marked: seconds since 2026-01-01 UTC (its age for the pick order)
 #define SQUAD_MAX        3               // the game's squad
 #define LOBBY_EQUAL      0               // ELobbyComparison
@@ -4725,14 +4725,9 @@ static void lobby_mark(void) {
         log_pending_state("host");
         lobby_set(LOBBY_MARK_KEY, "1");
         lobby_set(LOBBY_OVER_KEY, "0");
-        lobby_set(LOBBY_PROTO_KEY, LOBBY_PROTO);
+        lobby_set(LOBBY_PROTO_KEY, g_pair_unbuilt ? "unbuilt" : LOBBY_PROTO);  // unfinished launcher build: nobody pairs up
         lobby_set(LOBBY_GAME_KEY, LOBBY_GAME);
         lobby_set(LOBBY_VER_KEY, MOD_VERSION);
-        {
-            char pt[8];
-            snprintf(pt, sizeof pt, "%d", PAIR_NOW);
-            lobby_set(LOBBY_PAIR_KEY, pt);
-        }
         {  // the expedition's start block: what a solo start put in the pending block (SingleStart ->
            // context vt+8 0xb44630 -> 0xb47470), kept by the game manager for the whole expedition
             char *gm = *(char **)(g_base + 0x3c13258), text[16];
@@ -4829,7 +4824,6 @@ static void lobby_mark(void) {
 // is set to our formatted copy, like the ping after a name. Once per hub visit and once per search start.
 static int g_ver_notice_armed = 1;
 static char g_ver_newest[24], g_ver_team[24];
-static int g_pair_team = -1;  // a lobby with our password and version, on another region pair (its pair), this search
 static int version_parse(const char *v, int out[3]) {  // a release is "a.b.c", digits only
     if (!v) return 0;
     int n = 0, k = 0;
@@ -4877,11 +4871,7 @@ static void notice_with(int id, const char *arg) {
          q ? *(short *)(q + SMQ_CURRENT_PRIORITY) : -2, q ? *(int *)(q + SMQ_WAITING_COUNT) : -1);
 }
 static void version_result(int found_same) {
-    if (g_ver_notice_armed && g_party && !found_same && g_pair_team >= 0 && !*g_ver_team) {
-        g_ver_notice_armed = 0;
-        logf("pair: the team with our password plays region pair %d (ours %d): notice shown", g_pair_team, PAIR_NOW);
-        notice_with(131186 + g_pair_team, NULL);
-    } else if (g_ver_notice_armed && *g_ver_newest) {
+    if (g_ver_notice_armed && *g_ver_newest) {
         g_ver_notice_armed = 0;
         logf("version: a newer mod version %s is in use (ours %s): notice shown", g_ver_newest, MOD_VERSION);
         notice_with(131170, g_ver_newest);
@@ -4891,7 +4881,6 @@ static void version_result(int found_same) {
         notice_with(131171, g_ver_team);
     }
     g_ver_newest[0] = g_ver_team[0] = 0;
-    g_pair_team = -1;
 }
 static int counts_in_hub(void);
 static void counts_from_list(unsigned n);
@@ -4946,13 +4935,9 @@ static int lobby_search_frame(const char *who) {
         const char *afree = g_steam.get_data(g_steam.mm, id, LOBBY_ALLY_FREE_KEY);
         int own = id == g_lobby && g_lobby, slots = g_as_ally ? (afree ? atoi(afree) : 0) : free ? atoi(free) : 0;
         const char *ver = g_steam.get_data(g_steam.mm, id, LOBBY_VER_KEY);
-        const char *pr = g_steam.get_data(g_steam.mm, id, LOBBY_PAIR_KEY);
         int same = proto && !strcmp(proto, LOBBY_PROTO) && ver && !strcmp(ver, MOD_VERSION);
-        int pair_ok = PAIR_NOW >= 0 && pr && *pr && atoi(pr) == PAIR_NOW;
         version_seen(ver, g_party != 0);
-        if (same && !own && !pair_ok && g_party && pr && *pr && g_pair_team < 0) g_pair_team = atoi(pr) & 3;
-        if (same && !own && !pair_ok) logf("%s:   lobby %llu: map (region pair) '%s', ours %d: not for us", who, id, pr ? pr : "?", PAIR_NOW);
-        same = same && pair_ok;
+        same = same && !g_pair_unbuilt;  // an unfinished launcher build joins nobody
         int fits = same && !own && slots > 0 && game && !strcmp(game, LOBBY_GAME);
         // GetLobbyData gives "" for a key that is not set.
         logf("%s:   lobby %llu: proto '%s' game '%s' squad '%s' free '%s', members %d of %d -> %s", who, id, proto ? proto : "?",
@@ -7325,14 +7310,12 @@ static void step_hook(void *ctrl, void *time, int step) {
     }
     // Both roles live in every player (no switches since 14c271a): its own expeditions host; while it is
     // an invader in another player's world (g_join 4) it opens and advertises nothing of its own.
-    // map-test-control / two-regions: the generator draws the pattern (generate_hook); here only a check.
+    // the generator draws the pattern (generate_hook); here only the draw's map
     if (g_join != 4 && step == 21) {
         char *gm = *(char **)(g_base + 0x3c13258);
         static unsigned told = 0xffffffff;
         unsigned pat = gm ? *(unsigned *)(gm + 0xb48) : 0xffffffff;
-        if (gm && pat != told)
-            told = pat, logf("map test: generator pattern %u (%s)", pat,
-                             two_pattern(pat) ? "a two-region slot, as wanted" : "NOT a two-region slot");
+        if (gm && pat != told) told = pat, logf("map draw: pattern %u: %s", pat, pat < 320 ? map_name(pattern_pair(pat)) : "NOT one of our maps");
     }
     if (step == QM_STEP_INGAME && g_two_active) {
         two_regions_flasks();

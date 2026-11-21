@@ -81,7 +81,7 @@ static void set_texts(void) {
     SetWindowTextW(GetDlgItem(g_window, ID_SETTINGS), wide(T[T_SETTINGS]));
 }
 
-// Settings: the debug log; saved with OK. (The map is drawn at every start; test-settings.toml can fix it: map = 1..4.) A small window of its own,
+// Settings: the debug log; saved with OK. A small window of its own,
 // the main window disabled while it is open.
 static HWND g_set_win;
 static HWND set_child(const wchar_t *cls, const char *text, DWORD style, int id, int x, int y, int w, int h) {

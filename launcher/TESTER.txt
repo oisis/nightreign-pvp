@@ -3,8 +3,8 @@ Nightreign Invasions - tester build (not for release)
 
 Both players must use the same package (the same invasion.dll); mixed versions are not supported.
 
-No settings are needed: every map is a two-region map, one of four drawn at every launcher start (map = 1..4
-in test-settings.toml fixes one; everyone in a session needs the same map); every player
+No settings are needed: every expedition draws one of five maps (the base map or one of four two-region
+maps, each as often; whoever joins gets the host's map); every player
 hosts its own expeditions (other mod players can invade
 them) and "Invasion" in the Roundtable Hold joins another player's expedition. The launcher's
 Settings dialog has the "Debug log" box, which makes the mod log everything (for bug reports); off, the log is short.
@@ -29,8 +29,8 @@ into the expedition at once; the others start the same choice and wait in the Ro
 for the squad's host...") until the host is in the field, then join it automatically. A summon looks
 like a gold phantom.
 
-Every expedition map has two Shifting Earth regions (one of the four maps above; the map screen
-shows both regions).
+A two-region map has two Shifting Earth regions (one of the four maps above; the map screen
+shows both regions); the base map has none, and its challenge needs the six bosses only.
 
 The closing circle has no rain: no falling rain, no rain damage, no rain sound, no notice when it
 starts to move and no border, near or far; your character and the health bar keep their colours

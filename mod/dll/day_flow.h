@@ -15,12 +15,14 @@
 // The special bosses, one per region (owner, 2026-11-19; death flags, 2003[69] after death through common_func 90015002 /
 // 90015407; see 08-flagi-gry): the Mountaintop's ice dragon (m60_42_38_10, 42_39_10, 43_39_10), the Rotted Woods'
 // Captain (m60_45_36_30), the Crater's Magma Wyrm (m60_44_38_20), Noklateo's Naturalborn of the Void (m60_42_36_50).
-// Only the two regions of this start's pair (setting pair, written by the launcher) count.
+// Only the two regions of this map's pair (g_pair, from the pattern) count; the base map has none (owner, 2026-11-21:
+// its challenge needs the 6 bosses only).
 static const unsigned DF_SPECIAL_MT[] = {1028100800, 1029100800, 1039100800, 1039100801}, DF_SPECIAL_RW[] = {1056300800},
                       DF_SPECIAL_CR[] = {1048202800}, DF_SPECIAL_NK[] = {1026500800};
 static const char *const DF_REGION_NAME[4] = {"Mountaintop", "Crater", "Rotted Woods", "Noklateo"};
 static int df_region(int which, const unsigned **flags) {  // which 0: the base region (MT / CR), 1: the added (RW / NK); its flag count
-    int p = PAIR_NOW, crater = p == 2 || p == 3, nk = p == 1 || p == 3;
+    int p = g_pair, crater = p == 2 || p == 3, nk = p == 1 || p == 3;
+    if (p < 0) return *flags = NULL, 0;  // the base map
     if (which == 0) return *flags = crater ? DF_SPECIAL_CR : DF_SPECIAL_MT, crater ? 1 : 4;
     return *flags = nk ? DF_SPECIAL_NK : DF_SPECIAL_RW, 1;
 }
@@ -43,7 +45,6 @@ static int df_specials_dead(void) {
     }
     return dead;
 }
-static const char *const DF_PAIR_NAME[4] = {"Frozen Thicket", "City Beneath the Peak", "Ash and Rot", "Fire over the City"};
 static volatile LONG g_df_kills, g_df_special_kills;
 static int g_df_bosses, g_df_special, g_df_met, g_df_met_at, g_df_after, g_df_day = 1, g_df_go, g_df_used;
 // the ordinary bosses killed on day 1 (g_df_killed1: before and after the condition; every boss-death flag the day
@@ -55,7 +56,7 @@ static int g_df_tier;  // percent: 0, 5, 10 ...
 // many are dead, from their flags).
 static int g_df_need = DF_BOSSES;
 static int df_need(void) { return g_df_day == 2 ? g_df_need : DF_BOSSES; }
-static int df_special_ok(void) { return g_df_special >= (g_df_day == 2 ? 2 : 1); }
+static int df_special_ok(void) { return g_pair < 0 || g_df_special >= (g_df_day == 2 ? 2 : 1); }  // the base map: none needed
 static DWORD g_df_notice_due;  // the progress notice, 6 s after a kill
 static void df_kill(unsigned id) {  // flag_note, any thread: a boss death flag turned on
     if (df_special(id)) { InterlockedIncrement(&g_df_special_kills); return; }
@@ -67,15 +68,20 @@ static int df_target_tier(void) {
     if (g_df_day == 2) t += 15 * (g_df_killed2 > g_df_need ? g_df_killed2 - g_df_need : 0);
     return t > DF_TIER_COUNT * 5 ? DF_TIER_COUNT * 5 : t;
 }
-// After a kill (owner, 2026-11-21): the condition met -> 131182 (challenge available); M/M without the special boss(es)
-// -> 131180 ("M/M. Defeat the special region boss"); otherwise -> 131181 ("N/M"); M the day's target (df_need).
-// The game keeps a summon message up about 5.9 s by itself (run of dev.60: 5924 ms).
+// After a kill (owner, 2026-11-21): the condition newly met -> 131182 (challenge available); else the enemy tier went
+// up -> 131193 ("+N% (total T%)", N the rise since the last notice); else the condition met before -> 131182 again;
+// M/M without the special boss(es) -> 131180 ("M/M. Defeat the special region boss"); otherwise -> 131181 ("N/M"); M the
+// day's target (df_need). The game keeps a summon message up about 5.9 s by itself (run of dev.60: 5924 ms).
+static int g_df_told_met, g_df_told_tier;  // the condition / the tier as the last notice told them
 static void df_progress_notice(void) {
     char arg[24];
-    int m = df_need();
+    int m = df_need(), tier = df_target_tier();
     snprintf(arg, sizeof arg, "%d/%d", g_df_bosses < m ? g_df_bosses : m, m);
-    if (g_df_met) notice_with(131182, NULL);
+    if (g_df_met && !g_df_told_met) notice_with(131182, NULL);
+    else if (tier > g_df_told_tier) snprintf(arg, sizeof arg, "%d%%|%d%%", tier - g_df_told_tier, tier), notice_with(131193, arg);
+    else if (g_df_met) notice_with(131182, NULL);
     else notice_with(g_df_bosses >= m && !df_special_ok() ? 131180 : 131181, arg);
+    g_df_told_met = g_df_met, g_df_told_tier = tier;
 }
 static void df_check_met(const char *when) {
     if (g_df_met || g_df_bosses < df_need() || !df_special_ok()) return;
@@ -95,14 +101,16 @@ static void df_day2_count(void) {
     if (f) fclose(f);
     int alive = total - g_df_killed1 > 0 ? total - g_df_killed1 : 0;
     g_df_need = total < 0 ? DF_BOSSES : alive < DF_BOSSES ? alive : DF_BOSSES;
-    int dead = df_specials_dead(), p = PAIR_NOW >= 0 && PAIR_NOW <= 3 ? PAIR_NOW : 0;
+    int dead = df_specials_dead(), p = g_pair;
     g_df_special = (dead & 1) + (dead >> 1 & 1);
     if (total < 0)
         logf("day flow: day 2: pattern %u not in pattern-bosses.txt (%s): needed %d (fallback); %d ordinary bosses killed on day 1", pat,
              have_file ? "no line" : "file missing", g_df_need, g_df_killed1);
-    logf("day flow: day 2: pattern %u, ordinary bosses on the map %d, alive %d (%d killed on day 1), needed %d; specials: %s %s, %s %s", pat,
-         total, total < 0 ? -1 : alive, g_df_killed1, g_df_need, DF_REGION_NAME[p == 2 || p == 3], dead & 1 ? "dead" : "alive",
-         DF_REGION_NAME[2 + (p == 1 || p == 3)], dead & 2 ? "dead" : "alive");
+    if (p < 0) logf("day flow: day 2: pattern %u (the base map), ordinary bosses on the map %d, alive %d (%d killed on day 1), needed %d; no special boss",
+                    pat, total, total < 0 ? -1 : alive, g_df_killed1, g_df_need);
+    else logf("day flow: day 2: pattern %u, ordinary bosses on the map %d, alive %d (%d killed on day 1), needed %d; specials: %s %s, %s %s", pat,
+              total, total < 0 ? -1 : alive, g_df_killed1, g_df_need, DF_REGION_NAME[p == 2 || p == 3], dead & 1 ? "dead" : "alive",
+              DF_REGION_NAME[2 + (p == 1 || p == 3)], dead & 2 ? "dead" : "alive");
 }
 // --- enemy tiers: through the game's own re-apply of the player-count correction (ChrFinder -> 0x1405186a0, which
 // calls 0x1403c7e50(chr) for each character at 0x1405186ac; the pass runs when WCM+0x17558 differs from the count,
@@ -668,7 +676,7 @@ static void df_item_used(void) {
         char arg[16];
         snprintf(arg, sizeof arg, "%d", df_need());
         if (g_df_used) notice_with(131184, NULL);
-        else notice_with(g_df_day == 2 ? 131191 : 131183, arg);
+        else notice_with(g_pair < 0 ? 131192 : g_df_day == 2 ? 131191 : 131183, arg);
         logf("day flow: item used %s: kept, not consumed", g_df_used ? "after this day's challenge" : "before the condition");
         return;
     }
@@ -915,6 +923,7 @@ static void df_state_sync(void) {
     g_df_kills_day = d[6], g_df_second = d[7], g_df_need = d[8], g_df_killed1 = d[9], g_df_killed2 = d[10];
     logf("day flow: the host's state %s: day %d, %d bosses, special %d, condition %d, after it %d, this day %d, second invaders %d, "
          "needed on day 2 %d, ordinary bosses day 1 %d / day 2 %d", g_df_host_state ? "changed" : "taken", d[0], d[1], d[2], d[3], d[5], d[6], d[7], d[8], d[9], d[10]);
+    if (!g_df_host_state) g_df_told_met = g_df_met, g_df_told_tier = df_target_tier();  // arrival: nothing new to tell yet
     g_df_host_state = 1;
     if (more) g_df_notice_due = GetTickCount() + 6000 | 1;
     df_repass("the host's state");
@@ -933,10 +942,11 @@ static void day_flow_frame(int in_world) {
         g_df_events = 0, g_df_started = 0, g_df_event_tick = 0;
         InterlockedExchange(&g_df_kills, 0), InterlockedExchange(&g_df_special_kills, 0);
         char *gm0 = *(char **)(g_base + 0x3c13258);
-        int pr = PAIR_NOW >= 0 && PAIR_NOW <= 3 ? PAIR_NOW : 0;
-        logf("day flow: expedition start (pattern %u / %u): map %s (region pair %d); challenge after %d bosses and the special boss",
-             gm0 ? *(unsigned *)(gm0 + 0xb48) : 0, gm0 ? *(unsigned *)(gm0 + 0xb4c) : 0, DF_PAIR_NAME[pr], pr, DF_BOSSES);
-        notice_with(131185, NULL);  // "Map: <name>" (launcher: the pair's name)
+        logf("day flow: expedition start (pattern %u / %u): %s (pair %d); challenge after %d bosses%s",
+             gm0 ? *(unsigned *)(gm0 + 0xb48) : 0, gm0 ? *(unsigned *)(gm0 + 0xb4c) : 0, map_name(g_pair), g_pair, DF_BOSSES,
+             g_pair < 0 ? " (no special region)" : " and the special boss");
+        if (g_pair >= 0) notice_with(131186 + g_pair, NULL);  // "Map: <name>"; the base map shows none
+        g_df_told_met = 0, g_df_told_tier = 0;
         g_df_warp_until = 0, g_df_load_until = 0, g_df_ended = 0, g_df_move_at = 0;
         if (g_df_fade_in_at) g_df_fade_in_at = 0, df_fade(0.0f, 0.1f, 0);
     }
@@ -945,6 +955,7 @@ static void day_flow_frame(int in_world) {
         int host_day2 = g_join == 4 && g_df_host_state && g_df_day == 2;
         day2_seen = 1, g_df_day = 2;
         if (!host_day2) g_df_bosses = g_df_special = g_df_met = g_df_met_at = g_df_after = 0, g_df_kills_day = 0, g_df_killed2 = 0;
+        g_df_told_met = 0;  // day 2's condition is told again (the tier is kept, and so is what was told of it)
         g_df_go = g_df_used = 0;
         InterlockedExchange(&g_df_kills, 0), InterlockedExchange(&g_df_special_kills, 0);
         logf("day flow: day 2 (7505): the count starts again, the tier from day 1 is kept (%d%%; events: each family ran at most once, none again)", df_target_tier());

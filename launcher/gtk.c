@@ -84,8 +84,7 @@ static void set_texts(void) {
     gtk_button_set_label(GTK_BUTTON(g_settings), T[T_SETTINGS]);
 }
 
-// Settings: the debug log; saved when the dialog is closed with OK. (The map is drawn at every start; test-settings.toml
-// can fix it: map = 1..4.)
+// Settings: the debug log; saved when the dialog is closed with OK.
 static void on_settings(GtkButton *b, gpointer u) {
     (void)b; (void)u;
     GtkWidget *d = gtk_dialog_new_with_buttons(T[T_SETTINGS], GTK_WINDOW(g_window), GTK_DIALOG_MODAL, "_OK", GTK_RESPONSE_OK,
