@@ -336,8 +336,10 @@ static void exit_line(int process_exit) {
 // Test settings: test-settings.toml next to the DLL (the launcher writes it at every start from the
 // file next to the launcher; the dev build copies $W/test-settings.toml). Read once, at load.
 #include "settings.h"
-#define PAIR_NOW (g_settings[S_MAP] >= 1 && g_settings[S_MAP] <= 4 ? g_settings[S_MAP] - 1 : 0)  // the map's region pair 0..3
+// The map's region pair 0..3; -1 when the launcher's build did not finish (built-map.txt missing): no lobby pairs up.
+#define PAIR_NOW (g_pair_unbuilt ? -1 : g_settings[S_MAP] >= 1 && g_settings[S_MAP] <= 4 ? g_settings[S_MAP] - 1 : 0)
 static short g_settings[SETTINGS_COUNT];
+static int g_pair_unbuilt;
 static int setting(int i) { return g_settings[i] > 0; }
 static void next_to_dll(char *path, size_t cap, const char *name) {
     snprintf(path, cap, "%s", log_path);
@@ -369,6 +371,27 @@ static void settings_load(void) {
             if (GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES) snprintf(old + strlen(old), sizeof old - strlen(old), " %s", name);
         }
     if (old[0]) logf("settings: old marker files ignored (test-settings.toml replaces them):%s", old);
+    {  // The map: what the launcher built (built-map.txt, written once a build has finished, removed when one starts),
+       // not test-settings.toml, which the launcher writes before it builds (run of 2026-11-21: map = 3 here on files
+       // of another map). The dev build (mod/build.sh) has no built-map.txt and no launcher header: its map line counts.
+        char bp[MAX_PATH], bt[32] = "";
+        next_to_dll(bp, sizeof bp, "built-map.txt");
+        FILE *b = fopen(bp, "rb");
+        size_t bn = b ? fread(bt, 1, sizeof bt - 1, b) : 0;
+        if (b) fclose(b);
+        bt[bn] = 0;
+        int m = 0, launcher = n >= 25 && !memcmp(text, "# Written by the launcher", 25);
+        if (sscanf(bt, "map = %d", &m) == 1 && m >= 1 && m <= 4) {
+            if (m != g_settings[S_MAP])
+                logf("settings: test-settings.toml says map = %d, but the launcher built map %d: map %d is used", g_settings[S_MAP], m, m);
+            g_settings[S_MAP] = (short)m;
+            logf("settings: map = %d (built-map.txt: the map the launcher built)", m);
+        } else if (launcher) {
+            g_pair_unbuilt = 1;
+            logf("settings: no usable built-map.txt next to the DLL ('%s'), but the launcher wrote test-settings.toml: its build did not "
+                 "finish, the map files may be another map's; no lobby is offered or joined (start the game with the launcher's Play)", bt);
+        } else logf("settings: no built-map.txt (dev build): map = %d from test-settings.toml", g_settings[S_MAP]);
+    }
     g_debug_log = setting(S_DEBUG_LOG);
     logf("settings: log %s", g_debug_log ? "full (debug-log)" : "short (key lines only; debug-log gives everything)");
 }
@@ -3939,7 +3962,9 @@ static DWORD g_request_tick;  // when the last start request arrived
 #define LOBBY_SQUAD_KEY  "nrpvp_squad"
 #define LOBBY_FREE_KEY   "nrpvp_free"
 #define LOBBY_BLOCK_KEY  "nrpvp_block"   // host's map block id, 8 hex digits (ChrIns+0x38)
-#define LOBBY_POS_KEY    "nrpvp_pos"     // host's position "x,y,z" from the game's getter 0x3d0fd0
+#define LOBBY_POS_KEY    "nrpvp_pos"     // host's position "x,y,z" from the game's getter 0x3d0fd0 (the host's own world frame)
+#define LOBBY_FIELD_KEY  "nrpvp_field"   // host's field (m60) tile block: the one it is in, else the last one (small maps)
+#define LOBBY_FPOS_KEY   "nrpvp_fpos"    // host's position local to that tile "x,y,z" (0x140631740): the same on every machine
 #define LOBBY_GEN_KEY    "nrpvp_gen"     // host's generator results gm +0xb48,+0xb54,+0xb5c (hex)
 #define LOBBY_START_KEY  "nrpvp_start"   // host's expedition start block (game manager +0xa74), 8 hex digits
 #define LOBBY_ALLY_FREE_KEY "nrpvp_ally_free"  // free places in the host's squad for allies (squad of three)
@@ -4915,7 +4940,7 @@ static int lobby_search_frame(const char *who) {
         const char *ver = g_steam.get_data(g_steam.mm, id, LOBBY_VER_KEY);
         const char *pr = g_steam.get_data(g_steam.mm, id, LOBBY_PAIR_KEY);
         int same = proto && !strcmp(proto, LOBBY_PROTO) && ver && !strcmp(ver, MOD_VERSION);
-        int pair_ok = pr && *pr && atoi(pr) == PAIR_NOW;
+        int pair_ok = PAIR_NOW >= 0 && pr && *pr && atoi(pr) == PAIR_NOW;
         version_seen(ver, g_party != 0);
         if (same && !own && !pair_ok && g_party && pr && *pr && g_pair_team < 0) g_pair_team = atoi(pr) & 3;
         if (same && !own && !pair_ok) logf("%s:   lobby %llu: map (region pair) '%s', ours %d: not for us", who, id, pr ? pr : "?", PAIR_NOW);
@@ -5140,6 +5165,49 @@ static int g_drop_done;
 static DWORD g_drop_tick;
 static const char *g_drop_held;
 static int df_on(void);
+// The drop's block: the character handle's high half (chr+0xc), else the area's (*(0x143c123f8)+0x2c).
+static unsigned drop_block(char *me) {
+    char *fm = *(char **)(g_base + 0x3c123f8);
+    unsigned block = *(unsigned *)(me + 0xc);
+    if (!block) block = ~0u;
+    if (block == ~0u && fm) block = *(unsigned *)(fm + 0x2c);
+    return block;
+}
+// Last ground position, for a death far below it (run of 2026-11-21: an ally fell through the world, died at y -1022.6
+// and its 13 items went down there). Every frame of a join (g_join 4) while alive, the height (0x1403d0e60) is
+// compared with the last frame's; GROUND_FRAMES frames in a row within GROUND_DY_M count as standing or walking (a fall
+// changes it every frame), and then, at most every GROUND_EVERY_MS, the position is kept block-local (0x140631740 with
+// drop_block, as the drop itself takes it), so a later shift of the world frame does not move it.
+#define GROUND_DY_M     0.05f
+#define GROUND_FRAMES   20
+#define GROUND_EVERY_MS 500
+#define DROP_FALL_M     50.0f  // ponytail: a died-this-far-below-the-last-ground rule; a floor test would need the collision
+static unsigned g_ground_block;
+static float g_ground[3];
+static DWORD g_ground_tick;
+static void ground_frame(void) {
+    static float last_y;
+    static int steady;
+    static DWORD next;
+    char *me = local_player();
+    if (g_join != 4 || !me || IsBadReadPtr(me, 0x200) || chr_hp(me) <= 0) {
+        steady = 0;
+        if (g_join != 4) g_ground_tick = 0;
+        return;
+    }
+    _Alignas(16) float w[4];
+    ((void *(*)(char *, float *))(g_base + 0x3d0e60))(me, w);
+    float dy = w[1] - last_y;
+    last_y = w[1];
+    steady = dy < GROUND_DY_M && dy > -GROUND_DY_M ? steady + 1 : 0;
+    DWORD now = GetTickCount();
+    if (steady < GROUND_FRAMES || now < next) return;
+    next = now + GROUND_EVERY_MS;
+    unsigned block = drop_block(me);
+    float l[3];
+    if (((unsigned char (*)(float *, float *, unsigned *))(g_base + 0x631740))(l, w, &block))
+        g_ground_block = block, memcpy(g_ground, l, sizeof l), g_ground_tick = now | 1;
+}
 static void death_drop(const char *why) {
     if (g_drop_done || g_join != 4 || (g_as_ally && !(df_on() && g_in_exped))) return;
     char *me = local_player(), *ps = *(char **)(g_base + 0x3c078d0), *pd = ps ? *(char **)(ps + 8) : NULL;
@@ -5203,13 +5271,23 @@ static void death_drop(const char *why) {
     }
     _Alignas(16) float wpos[4];
     ((void *(*)(char *, float *))(g_base + 0x3d0e60))(me, wpos);
-    unsigned block = *(unsigned *)(me + 0xc);
-    if (!block) block = ~0u;
-    if (block == ~0u && fm) block = *(unsigned *)(fm + 0x2c);
+    unsigned block = drop_block(me);
     float pos[3] = {0, 0, 0};
     unsigned char ok = ((unsigned char (*)(float *, float *, unsigned *))(g_base + 0x631740))(pos, wpos, &block);
     logf("death drop: world %.2f %.2f %.2f, block %08x (chr+0x38 %08x, area +0x2c %08x) -> local %.2f %.2f %.2f (conversion %u)",
          wpos[0], wpos[1], wpos[2], block, *(unsigned *)(me + 0x38), fm ? *(unsigned *)(fm + 0x2c) : 0, pos[0], pos[1], pos[2], ok);
+    if (g_ground_tick) {  // the death's height against the last ground, both local to the ground's block
+        unsigned gb = g_ground_block;
+        float d[3];
+        int dk = ((unsigned char (*)(float *, float *, unsigned *))(g_base + 0x631740))(d, wpos, &gb);
+        float below = dk ? g_ground[1] - d[1] : 0;
+        logf("death drop: last ground %lu ms ago: block %08x local %.2f %.2f %.2f; the death is %.1f m below it%s", GetTickCount() - g_ground_tick,
+             g_ground_block, g_ground[0], g_ground[1], g_ground[2], below, !dk ? " (not comparable: conversion failed)" : "");
+        if (dk && below > DROP_FALL_M) {
+            block = g_ground_block, memcpy(pos, g_ground, sizeof pos), ok = 1;
+            logf("death drop: more than %.0f m below the last ground (a fall through the world): dropped at the last ground instead", DROP_FALL_M);
+        }
+    } else logf("death drop: no ground position seen in this join: dropped where the player died");
     if (!ok) {
         logf("death drop: no block-local position, %d items not dropped", n);
         return;
@@ -6397,18 +6475,26 @@ static void boss_flow_frame(int first) {
 #define LOBBY_POS_MIN_GAP_MS 30000
 #define LOBBY_POS_REFRESH_MS 60000
 #define LOBBY_POS_MIN_MOVE   5.0f
+// With them the field tile and the position local to it: the world frame of 0x3d0fd0 follows the player (the host's
+// nrpvp_pos stays within about 40 m of 0 on every tile it crosses; a death at world x -8.3 was tile-local -48.3), so a
+// joiner cannot use the host's world position as it is. 0x140631740 (world -> block-local) and 0x140631530 (back) are
+// a translation by the tile's origin for a field block (area 0x3c..0x58, 0x140677740), so the host converts into its
+// field tile and the joiner converts back in its own frame. Small maps (areas 0x14..0x35, 0x59: 0x140677760) sit on
+// the overworld (a church 220a0101 at y 98..118 next to field y 113); there the last field tile is used, which the
+// translation still covers.
 static void lobby_position(void) {
     static DWORD next, last_write;
-    static unsigned last_block;
+    static unsigned last_block, field;
     static float last[3];
     static u64 for_lobby;
     DWORD now = GetTickCount();
-    if (for_lobby != g_lobby) for_lobby = g_lobby, next = 0, last_write = 0, last_block = 0;
+    if (for_lobby != g_lobby) for_lobby = g_lobby, next = 0, last_write = 0, last_block = 0, field = 0;
     if (!g_lobby || !steam_ready() || now < next || g_someone_joining) return;
     next = now + LOBBY_POS_PERIOD_MS;
     float p[3];
     unsigned block;
     if (!player_position(p, &block)) return;
+    if (block >> 24 >= 0x3c && block >> 24 <= 0x58) field = block;
     float dx = p[0] - last[0], dy = p[1] - last[1], dz = p[2] - last[2];
     if (block == last_block && last_write &&
         (now - last_write < LOBBY_POS_MIN_GAP_MS ||
@@ -6419,6 +6505,15 @@ static void lobby_position(void) {
     lobby_set(LOBBY_BLOCK_KEY, text);
     snprintf(text, sizeof text, "%.1f,%.1f,%.1f", p[0], p[1], p[2]);
     lobby_set(LOBBY_POS_KEY, text);
+    float w[4] = {p[0], p[1], p[2], 0}, l[4];
+    unsigned fb = field;
+    if (field && ((unsigned char (*)(float *, float *, unsigned *))(g_base + 0x631740))(l, w, &fb)) {
+        snprintf(text, sizeof text, "%08x", field);
+        lobby_set(LOBBY_FIELD_KEY, text);
+        snprintf(text, sizeof text, "%.1f,%.1f,%.1f", l[0], l[1], l[2]);
+        lobby_set(LOBBY_FPOS_KEY, text);
+        if (field != block) logf("host: in block %08x (not a field tile): published as local to the last field tile %08x", block, field);
+    } else logf("host: in block %08x: %s, no field position published", block, field ? "0x140631740 failed for the field tile" : "no field tile seen yet");
     last_block = block, last[0] = p[0], last[1] = p[1], last[2] = p[2], last_write = now;
 }
 
@@ -6819,31 +6914,48 @@ static void toggle_search(const char *where) {
 //  - the game's "next to a teammate" placement 0x140c3fc80 refuses any block but the four final-boss maps (its first
 //    test), so it is not used; the host's own position is written into the respawn manager instead. Frame: 0x140c3fc80
 //    feeds the getter 0x1403d0e60 (0x14039bd50, the same as 0x1403d0fd0 behind nrpvp_pos) straight into 0x140639760,
-//    while block-local points go through 0x140631530 first: so nrpvp_pos is in the frame the warp takes.
-// Here: only for a late summon (an ally that did not wait in the hub for the host's go), with the host's block and
-// position in its lobby. The three call sites above are taken over only while this entry runs (g_sah >= 2); they
+//    and 0x140638d50 hands that position to the character's setter (0x1403daa70) as it is: the warp takes our own world
+//    frame. That frame follows the player (lobby_position), so the host's tile-local position (nrpvp_field / nrpvp_fpos)
+//    is turned into ours with 0x140631530 when the respawn point is written, our map being loaded by then.
+//  - no area rule is needed: the step start 0x140c3ee60 treats only the four final-boss blocks apart (+0xac), and
+//    HorseWait's own check (0x140c34e87 region) lets field (0x3c..0x58) and small-map (0x14..0x35, 0x59) blocks alike.
+//    The block we give is the field tile (the warp's block goes to the map manager +0x8880 and 0x14069ac70).
+// Here: only for a late summon (an ally that did not wait in the hub for the host's go), with the host's field tile
+// and tile-local position in its lobby. The three call sites above are taken over only while this entry runs (g_sah >= 2); they
 // belong to RejoinMapEnterStep alone (the death restart 0x1405c38f0 calls 0x140729200 / 0x140ba2b80 at its own sites).
-// Anything missing: the expedition's start on the hawk, as before.
+// Anything missing (a 0.2.9 host, or one that has not touched a field tile yet): the expedition's start on the hawk.
 #define SAH_SIDE_M 2.0f  // beside the host, along x
 #define SAH_UP_M   1.0f  // above his feet, with the no-fall-damage SpEffect 90071613 (launcher row, 15 s)
 static int g_sah;        // 0 off, 1 rejoin mode set, 2 rejoin entry started, 3 respawn point written
-static unsigned g_sah_block;
-static float g_sah_host[3];
+static unsigned g_sah_block;  // the host's field tile
+static float g_sah_local[3], g_sah_host[3];  // the host's position local to it; in our world frame (once converted)
+static int sah_host_field(unsigned *block, float local[3]) {  // from the host's lobby
+    const char *b = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_FIELD_KEY), *p = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_FPOS_KEY);
+    char *end = NULL;
+    *block = b && *b ? (unsigned)strtoul(b, &end, 16) : 0;
+    return end && !*end && *block >> 24 >= 0x3c && *block >> 24 <= 0x58 && p && sscanf(p, "%f,%f,%f", &local[0], &local[1], &local[2]) == 3;
+}
+static int sah_host_world(unsigned block, const float local[3], float out[3]) {  // tile-local -> our world frame
+    float l[4] = {local[0], local[1], local[2], 0}, w[4];
+    if (!((unsigned char (*)(float *, float *, unsigned *))(g_base + 0x631530))(w, l, &block)) return 0;
+    memcpy(out, w, 3 * sizeof *out);
+    return 1;
+}
 static int summon_at_host_decide(void) {
     if (!g_as_ally) return 0;  // an invader: the start on the hawk (decision 15)
     if (g_party_waited) return logf("summon at host: early summon (waited in the hub for the host's go): the start on the hawk"), 0;
-    const char *b = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_BLOCK_KEY), *p = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_POS_KEY);
-    char *end = NULL;
-    unsigned block = b && *b ? (unsigned)strtoul(b, &end, 16) : 0;
+    const char *hb = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_BLOCK_KEY);
+    unsigned block;
     float v[3];
-    if (!end || *end || block == 0 || block == 0xffffffff || block >> 24 != 0x3c || !p || sscanf(p, "%f,%f,%f", &v[0], &v[1], &v[2]) != 3) {
-        logf("summon at host: late summon, but the host's lobby has no usable field block / position ('%s' / '%s'): the start on the hawk",
-             b ? b : "", p ? p : "");
+    if (!sah_host_field(&block, v)) {
+        const char *b = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_FIELD_KEY), *p = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_FPOS_KEY);
+        logf("summon at host: late summon, but the host's lobby has no field tile / tile-local position ('%s' / '%s'; host block '%s'): "
+             "the start on the hawk", b ? b : "", p ? p : "", hb ? hb : "");
         return 0;
     }
-    g_sah_block = block, memcpy(g_sah_host, v, sizeof v);
-    logf("summon at host: late summon: the host is in block %08x at %.1f %.1f %.1f (its lobby): entering through the game's rejoin",
-         block, v[0], v[1], v[2]);
+    g_sah_block = block, memcpy(g_sah_local, v, sizeof v);
+    logf("summon at host: late summon: the host is in block %s, field tile %08x, tile-local %.1f %.1f %.1f (its lobby): entering through "
+         "the game's rejoin", hb ? hb : "?", block, v[0], v[1], v[2]);
     return 1;
 }
 static void summon_at_host_arm(void) {
@@ -6883,15 +6995,15 @@ static void sah_respawn_point(char *rp) {
     if (g_sah != 2 || !rp) return;
     logf("summon at host: the game's respawn point: valid %u block %08x pos %.1f %.1f %.1f", (unsigned char)rp[0x40], *(unsigned *)(rp + 0x18),
          *(float *)(rp + 0x20), *(float *)(rp + 0x24), *(float *)(rp + 0x28));
-    {  // the host's latest block / position (its lobby is rewritten every few seconds while it moves)
-        const char *b = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_BLOCK_KEY), *p = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_POS_KEY);
-        char *end = NULL;
-        unsigned block = b && *b ? (unsigned)strtoul(b, &end, 16) : 0;
+    {  // the host's latest field tile / position (its lobby is rewritten every few seconds while it moves)
+        unsigned block;
         float v[3];
-        if (end && !*end && block >> 24 == 0x3c && p && sscanf(p, "%f,%f,%f", &v[0], &v[1], &v[2]) == 3)
-            g_sah_block = block, memcpy(g_sah_host, v, sizeof v);
-        logf("summon at host: host now in block %08x at %.1f %.1f %.1f (its lobby '%s' / '%s')", g_sah_block, g_sah_host[0], g_sah_host[1],
-             g_sah_host[2], b ? b : "", p ? p : "");
+        if (sah_host_field(&block, v)) g_sah_block = block, memcpy(g_sah_local, v, sizeof v);
+    }
+    if (!sah_host_world(g_sah_block, g_sah_local, g_sah_host)) {
+        logf("summon at host: field tile %08x not known here (0x140631530 failed for tile-local %.1f %.1f %.1f): the game's own respawn point kept",
+             g_sah_block, g_sah_local[0], g_sah_local[1], g_sah_local[2]);
+        return;
     }
     float pos[4] = {g_sah_host[0] + SAH_SIDE_M, g_sah_host[1] + SAH_UP_M, g_sah_host[2], 1.0f};
     *(unsigned *)(rp + 0x18) = g_sah_block;
@@ -6901,8 +7013,13 @@ static void sah_respawn_point(char *rp) {
     char *me = local_player();
     if (me) ((void (*)(void *, int, unsigned char))(g_base + RVA_ADD_SPEFFECT))(me, 90071613, 0);
     g_sah = 3;
-    logf("summon at host: respawn point written: block %08x pos %.1f %.1f %.1f (host + %.0f m x, + %.0f m up), no-fall-damage %s",
-         g_sah_block, pos[0], pos[1], pos[2], SAH_SIDE_M, SAH_UP_M, me ? "on" : "(no player)");
+    float mp[3];
+    unsigned mb = 0;
+    int have = player_position(mp, &mb);
+    logf("summon at host: respawn point written: tile %08x, host tile-local %.1f %.1f %.1f = our world %.1f %.1f %.1f; point %.1f %.1f %.1f "
+         "(host + %.0f m x, + %.0f m up), no-fall-damage %s; we are now in block %08x at %.1f %.1f %.1f",
+         g_sah_block, g_sah_local[0], g_sah_local[1], g_sah_local[2], g_sah_host[0], g_sah_host[1], g_sah_host[2], pos[0], pos[1], pos[2],
+         SAH_SIDE_M, SAH_UP_M, me ? "on" : "(no player)", mb, have ? mp[0] : 0, have ? mp[1] : 0, have ? mp[2] : 0);
 }
 // 0x140c3f2da / 0x140c3f4e0: the death penalty in RespawnEnter / StablizeWarp
 static void sah_penalty(char *gdm, char arg) {
@@ -6925,10 +7042,9 @@ static void summon_at_host_frame(void) {
         g_sah = 0;
     }
     if (g_sah < 2 || !gm || gm[0xc5e]) return;
-    float p[3], h[3];
-    unsigned block;
-    const char *hp = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_POS_KEY);
-    if (!hp || sscanf(hp, "%f,%f,%f", &h[0], &h[1], &h[2]) != 3) memcpy(h, g_sah_host, sizeof h);
+    float p[3], h[3], l[3];
+    unsigned block, hb;
+    if (!sah_host_field(&hb, l) || !sah_host_world(hb, l, h)) memcpy(h, g_sah_host, sizeof h);  // the host now, in our frame
     if (player_position(p, &block)) {
         float dx = p[0] - h[0], dy = p[1] - h[1], dz = p[2] - h[2];
         logf("summon at host: entry done (stage %d): we are in block %08x at %.1f %.1f %.1f; host %.1f %.1f %.1f: %.1f m apart%s", g_sah,
@@ -6990,7 +7106,8 @@ static int move_force(char *ctrl) {
     // places the player at the expedition's start; the host's current block only if that key is absent.
     const char *text = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_START_KEY);
     int at_host = summon_at_host_decide();
-    if (at_host) text = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_BLOCK_KEY);  // the map the host is in now
+    static char field_text[12];
+    if (at_host) snprintf(field_text, sizeof field_text, "%08x", g_sah_block), text = field_text;  // the host's field tile
     if (!text || !*text) {
         logf("move test: the host's lobby has no %s, using %s", LOBBY_START_KEY, LOBBY_BLOCK_KEY);
         text = g_steam.get_data(g_steam.mm, g_candidate, LOBBY_BLOCK_KEY);
@@ -7040,7 +7157,7 @@ static int move_force(char *ctrl) {
     // context's vt+8 (0xb44630: reason -14 = 0xfffffff2 at +0x1c, type 14 at +0x20, +0x18 = 1 when the
     // context is not a rejoin) and applies them with 0x740110, which passes the reason to 0x6b0520.
     ((void (*)(int))(g_base + RVA_SET_PENDING_REASON))(-14);
-    pending_log(at_host ? "after (the host's current block, late summon)" : "after (start block from the host's lobby)");
+    pending_log(at_host ? "after (the host's field tile, late summon)" : "after (start block from the host's lobby)");
     if (at_host) summon_at_host_arm();
     char *ctx = *(char **)(ctrl + 0xa8);
     if (!ctx || *(char **)ctx != g_base + RVA_QM_CTX_VTABLE) {
@@ -7155,6 +7272,7 @@ static void step_hook(void *ctrl, void *time, int step) {
         }
     }
     no_sprint_frame();
+    ground_frame();
     g_in_exped = step == QM_STEP_INGAME || g_join_in_world();
     if (!g_in_exped) g_df_inv_dead = NULL;
     night_hide_frame(g_in_exped);

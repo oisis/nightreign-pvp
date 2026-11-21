@@ -3385,6 +3385,16 @@ static void build_fire_ring(const char *game_dir, buf bhd, const char *bdt) {
     free(bnd.p);
 }
 
+// work/native/built-map.txt: the map the files in work/build are for, written only once a build has finished (or found up
+// to date) and removed when a rebuild starts. The DLL takes its map from it, not from test-settings.toml (which
+// read_settings writes before the build), so a start on unfinished files never pairs with another map's players.
+static void built_map(int write) {
+    char path[1300], t[16];
+    snprintf(path, sizeof path, "%s" SEP "work" SEP "native" SEP "built-map.txt", g_app);
+    if (!write) { remove(path); return; }
+    int n = snprintf(t, sizeof t, "map = %d\n", pair_now() + 1);
+    if (!write_file(path, (const u8 *)t, (size_t)n)) logf_("cannot write %s", path);
+}
 int core_build(const char *game_dir) {
     char bhd_path[1100], bdt_path[1100], from[1300], to[1300];
     if (!core_check_game(game_dir)) return logf_("This is not the game's folder: %s", game_dir), 0;
@@ -3414,9 +3424,11 @@ int core_build(const char *game_dir) {
     if (same && exists(to)) {
         free(enc.p);
         logf_("Mod files are up to date");
+        built_map(1);
         return write_profile();
     }
     remove(stamp_path);
+    built_map(0);
     {  // the last start's pair files go: its composed map halves and map screen packs (another pair writes others)
         char dir[1300];
         snprintf(dir, sizeof dir, "%s" SEP "work" SEP "build" SEP "map", g_app);
@@ -3465,6 +3477,7 @@ int core_build(const char *game_dir) {
     if (!copy_file(from, to)) return logf_("missing %s", from), 0;
     if (!write_profile()) return 0;
     write_file(stamp_path, (const u8 *)stamp, 32);
+    built_map(1);
 #ifndef _WIN32
     snprintf(to, sizeof to, "%s/work/wineprefix", g_app);  // only needed for unpacking; it is large
     remove_tree(to);
