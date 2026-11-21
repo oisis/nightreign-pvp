@@ -39,7 +39,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 39
+#define BUILD_FORMAT 40
 #define BOSS_DEATHS_MIN 100  // the game (1.3.3) has 158 such flags; fewer = its event scripts changed
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
@@ -86,10 +86,12 @@ static const struct { const char *fmg, *english, *polish; } ITEM_TEXT[] = {
     {"\\GoodsInfo.fmg", "Takes the whole squad to the night boss", "Przenosi ca\xc5\x82\xc4\x85 dru\xc5\xbcyn\xc4\x99 do bossa nocy"},
     {"\\GoodsCaption.fmg",
      "Two crossed blades, a call to the Night.\n\nUsable once the squad has defeated six bosses and the special boss of a region "
-     "(the Mountaintop's dragon or the Rotted Woods' Captain). Takes the whole squad to the night boss's arena, and the night "
+     "(the Mountaintop's dragon or the Rotted Woods' Captain); on day 2, six bosses (or all those left, if fewer) and both special "
+     "bosses. Takes the whole squad to the night boss's arena, and the night "
      "falls.\n\nUsed too early, it stays in the pouch.",
      "Dwa skrzy\xc5\xbcowane ostrza, wezwanie Nocy.\n\nMo\xc5\xbcna u\xc5\xbcy\xc4\x87, gdy dru\xc5\xbcyna pokona sze\xc5\x9b" "ciu boss\xc3\xb3w "
-     "i bossa specjalnego regionu (smoka Szczytu albo Kapitana Zgni\xc5\x82" "ego Lasu). Przenosi ca\xc5\x82\xc4\x85 dru\xc5\xbcyn\xc4\x99 "
+     "i bossa specjalnego regionu (smoka Szczytu albo Kapitana Zgni\xc5\x82" "ego Lasu); drugiego dnia sze\xc5\x9b" "ciu boss\xc3\xb3w (albo wszystkich pozosta\xc5\x82ych, je\xc5\x9bli jest ich mniej) i obu "
+     "boss\xc3\xb3w specjalnych. Przenosi ca\xc5\x82\xc4\x85 dru\xc5\xbcyn\xc4\x99 "
      "na aren\xc4\x99 bossa nocy i zapada noc.\n\nU\xc5\xbcyte za wcze\xc5\x9bnie zostaje w sakwie."},
 };
 
@@ -108,19 +110,28 @@ static const char *const PAIR_SPECIAL[4][2] = {
     {"the Magma Wyrm or the Captain", "Magmowego Wyrma lub Kapitana"},
     {"the Magma Wyrm or the Naturalborn of the Void", "Magmowego Wyrma lub Naturalborn of the Void"},
 };
+static const char *const PAIR_SPECIAL_BOTH[4][2] = {  // day 2 needs both (owner, 2026-11-21)
+    {"the dragon and the Captain", "smoka i Kapitana"},
+    {"the dragon and the Naturalborn of the Void", "smoka i Naturalborn of the Void"},
+    {"the Magma Wyrm and the Captain", "Magmowego Wyrma i Kapitana"},
+    {"the Magma Wyrm and the Naturalborn of the Void", "Magmowego Wyrma i Naturalborn of the Void"},
+};
 static int g_pair_given;  // test-settings.toml names the map (map = 1..4); otherwise it is drawn
 static int pair_now(void);
 // Texts that depend on the pair: 131183 (the special boss); 131180 / 131181 (kill notices, here with them), 131185 (the map's name, at the expedition start),
-// 131186 + k (a team with our password plays pair k), the item's caption. (id, text) for the language, n of them.
-static int pair_texts(int polish, u32 *ids, char text[][400]) {  // up to 8
+// 131186 + k (a team with our password plays pair k), 131191 (131183 on day 2), the item's caption. (id, text) for the
+// language, n of them.
+static int pair_texts(int polish, u32 *ids, char text[][400]) {  // up to 10
     int p = pair_now(), l = polish != 0, n = 0;
     const char *sp = PAIR_SPECIAL[p][l];
-    // 131180: %s = "6/6", the special boss still alive; 131181: %s = "N/6" (always the release target, DF_BOSSES; owner,
-    // 2026-11-19 / 2026-11-21); 131183: %s = 6
+    // 131180: %s = "M/M", a special boss still needed; 131181: %s = "N/M", M the day's target (owner, 2026-11-19 /
+    // 2026-11-21: 6 on day 1, on day 2 min(6, ordinary bosses alive at its start)); 131183 / 131191: %s = M
     ids[n] = 131180, snprintf(text[n++], 400, l ? "Pokonano boss\xc3\xb3w: %%s. Zabij bossa regionu specjalnego" : "Bosses defeated: %%s. Defeat the special region boss");
     ids[n] = 131181, snprintf(text[n++], 400, l ? "Pokonano boss\xc3\xb3w: %%s" : "Bosses defeated: %%s");
     ids[n] = 131183, snprintf(text[n++], 400, l ? "Wyzwanie nie jest jeszcze dost\xc4\x99pne: pokonaj %%s boss\xc3\xb3w i bossa specjalnego (%s)"
                                                   : "The challenge is not available yet: defeat %%s bosses and the special boss (%s)", sp);
+    ids[n] = 131191, snprintf(text[n++], 400, l ? "Wyzwanie nie jest jeszcze dost\xc4\x99pne: pokonaj %%s boss\xc3\xb3w i obu boss\xc3\xb3w specjalnych (%s)"
+                                                  : "The challenge is not available yet: defeat %%s bosses and both special bosses (%s)", PAIR_SPECIAL_BOTH[p][l]);
     ids[n] = 131185, snprintf(text[n++], 400, l ? "Mapa: %s" : "Map: %s", PAIR_NAME[p][l]);
     for (int k = 0; k < 4; k++)
         ids[n] = 131186 + (u32)k, snprintf(text[n++], 400, l ? "Twoja dru\xc5\xbcyna (to samo has\xc5\x82o) gra na mapie %s. Ustaw map = %d w test-settings.toml albo uruchom launcher ponownie, aby wylosowa\xc4\x87 map\xc4\x99."
@@ -130,10 +141,11 @@ static int pair_texts(int polish, u32 *ids, char text[][400]) {  // up to 8
 static void pair_caption(int polish, char *out, size_t cap) {
     int l = polish != 0;
     snprintf(out, cap, l ? "Dwa skrzy\xc5\xbcowane ostrza, wezwanie Nocy.\n\nMo\xc5\xbcna u\xc5\xbcy\xc4\x87, gdy dru\xc5\xbcyna pokona sze\xc5\x9b" "ciu boss\xc3\xb3w "
-                           "i bossa specjalnego (%s). Przenosi ca\xc5\x82\xc4\x85 dru\xc5\xbcyn\xc4\x99 na aren\xc4\x99 bossa nocy i zapada noc.\n\n"
+                           "i bossa specjalnego (%s); drugiego dnia sze\xc5\x9b" "ciu boss\xc3\xb3w (albo wszystkich pozosta\xc5\x82ych, je\xc5\x9bli jest ich mniej) "
+                           "i obu boss\xc3\xb3w specjalnych. Przenosi ca\xc5\x82\xc4\x85 dru\xc5\xbcyn\xc4\x99 na aren\xc4\x99 bossa nocy i zapada noc.\n\n"
                            "U\xc5\xbcyte za wcze\xc5\x9bnie zostaje w sakwie."
-                         : "Two crossed blades, a call to the Night.\n\nUsable once the squad has defeated six bosses and the special boss (%s). "
-                           "Takes the whole squad to the night boss's arena, and the night falls.\n\nUsed too early, it stays in the pouch.",
+                         : "Two crossed blades, a call to the Night.\n\nUsable once the squad has defeated six bosses and the special boss (%s); on day 2, six "
+                           "bosses (or all those left, if fewer) and both special bosses. Takes the whole squad to the night boss's arena, and the night falls.\n\nUsed too early, it stays in the pouch.",
              PAIR_SPECIAL[pair_now()][l]);
 }
 
@@ -2081,6 +2093,7 @@ static int day_flow_maps(buf maps[4], buf points) {
     return 1;
 }
 
+static int write_pattern_bosses(buf bases);  // with the boss deaths below
 static int map_tables(buf bundle, int index[4], buf maps[4]) {
     static const char *const NAMES[4] = {"\\LotResultMapPatternFlag.param", "\\LotResultPlayAreaParam.param",
                                          "\\LotResultSmallBaseAndSpot.param", "\\MapPatternSet.param"};
@@ -2098,7 +2111,7 @@ static int map_tables(buf bundle, int index[4], buf maps[4]) {
         if (!pair_now()) chest_group_report(maps[0]);  // its table is the Rotted Woods' sites
         int d = bnd4_find(bundle, "\\SmallBaseAndSpotDefine.param");
         if (d < 0 || !write_churches(bnd4_file(bundle, d), maps[2], bnd4_file(bundle, ap))) return 0;
-        if (!day_flow_maps(maps, bnd4_file(bundle, ap))) return 0;
+        if (!day_flow_maps(maps, bnd4_file(bundle, ap)) || !write_pattern_bosses(maps[2])) return 0;
     }
     return 1;
 }
@@ -2304,6 +2317,8 @@ static void remove_two_region_map(void) {
         snprintf(path, sizeof path, "%s" SEP "work" SEP "build" SEP "menu" SEP "71_maptile_m%02d.tpf.dcx", g_app, k);
         remove(path);
     }
+    snprintf(path, sizeof path, "%s" SEP "work" SEP "native" SEP "pattern-bosses.txt", g_app);  // another map's patterns
+    remove(path);
 }
 
 static int place_icons(buf *bundle, buf tpf, const char *atlas_name, char quality) {
@@ -2615,9 +2630,9 @@ static int build_text(const char *game_dir, buf bhd, const char *bdt, const char
             static u8 wide[OUR_TEXT_COUNT][512];
             for (size_t i = 0; i < OUR_TEXT_COUNT; i++)
                 fmg_set(&dst, OUR_TEXT[i].id, wide[i], utf8_to_utf16(polish ? OUR_TEXT[i].polish : OUR_TEXT[i].english, wide[i]));
-            static u8 pwide[8][1024];
-            static char ptext[8][400];
-            u32 pids[8];
+            static u8 pwide[10][1024];
+            static char ptext[10][400];
+            u32 pids[10];
             int pn = pair_texts(polish, pids, ptext);
             for (int i = 0; i < pn; i++) fmg_set(&dst, pids[i], pwide[i], utf8_to_utf16(ptext[i], pwide[i]));
             buf table = fmg_write(&dst), patched = bnd4_replace(bundle, target, table), dcx = dcx_write(patched);
@@ -2997,6 +3012,22 @@ static int build_pair_half(const char *game_dir) {
 // count, one id per line); the game's ids are never shipped. Returns the number of flags, -1 on failure.
 // EMEVD: +0x10 event count, +0x18 events (0x30 each: id u64, instruction count u64, offset u64, ...), +0x28
 // instructions (0x20 each: bank u32, id u32, argument length u64, argument offset s64), +0x78 argument data.
+// Day 2's count (day flow, owner 2026-11-21: needed = min(6, ordinary bosses still alive)): the ordinary bosses of each
+// script, by source (g_day_src: small map AABB, or 100000 + tile X * 1000 + Z * 10 + variant; -1 not recorded). A boss
+// is a kill template's call that always runs: 90045002 (its shared flag), or 90015002 / 90015025 / 90015407 whose first
+// two arguments are 0 (the others wait for an event flag, e.g. 8076 in m45_52, or 8081 the interference: event bosses).
+// Not counted: the special bosses (DLL df_special). Flags that may be alternatives (Noklateo's Royal Revenants
+// 1026500820 / 860, the Tree Sentinels 42380800 / 805) count one each (owner, 2026-11-21: an error of 1-2 is fine).
+static const u32 DAY_NOT_COUNTED[] = {1028100800, 1029100800, 1039100800, 1039100801, 1056300800, 1048202800, 1026500800};
+#define DAY_BOSS_MAX 1024
+static struct { int src; u32 flag; } g_day_boss[DAY_BOSS_MAX];
+static int g_nday_boss, g_day_src = -1;
+static u8 g_tile_file[4][4][6];  // m60_X_Z_V0.emevd exists (X 42.., Z 36.., V): the tile's variant (as its msb: same set)
+static void day_boss_add(u32 flag) {
+    for (unsigned i = 0; i < sizeof DAY_NOT_COUNTED / sizeof *DAY_NOT_COUNTED; i++) if (DAY_NOT_COUNTED[i] == flag) return;
+    for (int i = 0; i < g_nday_boss; i++) if (g_day_boss[i].src == g_day_src && g_day_boss[i].flag == flag) return;
+    if (g_nday_boss < DAY_BOSS_MAX) g_day_boss[g_nday_boss].src = g_day_src, g_day_boss[g_nday_boss++].flag = flag;
+}
 static int emevd_boss_deaths(buf d, u32 *flags, int have, int cap, int night_arena) {
     if (d.n < 0x80 || memcmp(d.p, "EVD", 3)) return have;
     u64 ec = rd64(d.p + 0x10), eo = rd64(d.p + 0x18), io = rd64(d.p + 0x28), ao = rd64(d.p + 0x78);
@@ -3031,6 +3062,7 @@ static int emevd_boss_deaths(buf d, u32 *flags, int have, int cap, int night_are
             else if (kill >= 0 && !night_arena && alen >= 8 + KILL[kill].at + 4) flag = rd32(a + 8 + KILL[kill].at);
             else continue;
             if (flag < 10000000u) continue;
+            if (kill >= 0 && g_day_src >= 0 && (ev_id == 90045002 || (alen >= 16 && !rd32(a + 8) && !rd32(a + 12)))) day_boss_add(flag);
             int seen = 0;
             for (int i = 0; i < have && !seen; i++) seen = flags[i] == flag;
             if (!seen && have < cap) flags[have++] = flag;
@@ -3212,10 +3244,18 @@ static int build_boss_deaths(const char *game_dir, buf bhd, const char *bdt) {
     int have = 0, read = 0;
     int failed = -1;
     char kind[8] = "";
+    g_nday_boss = 0;
+    memset(g_tile_file, 0, sizeof g_tile_file);
     for (int i = 0; i < found; i++) {
+        int x, z, v, aa, bb;
+        g_day_src = -1;
+        if (sscanf(names[i], "/event/m60_%d_%d_%1d0.emevd", &x, &z, &v) == 3 && x >= 42 && x <= 45 && z >= 36 && z <= 39 && v <= 5)
+            g_tile_file[x - 42][z - 36][v] = 1, g_day_src = 100000 + x * 1000 + z * 10 + v;
+        else if (sscanf(names[i], "/event/m%d_%d_00_00.emevd", &aa, &bb) == 2) g_day_src = aa * 100 + bb;
         if (out[i].p) read++, have = emevd_boss_deaths(out[i], flags, have, 2048, night_arena_file(names[i]));
         else if (failed < 0) failed = i, snprintf(kind, sizeof kind, "%.4s", in[i].p && in[i].n >= 0x2C ? (const char *)in[i].p + 0x28 : "?");
     }
+    g_day_src = -1;
     if (failed >= 0) logf_("Boss deaths: %s not unpacked (compression %s)", names[failed], kind);
     qsort(flags, (size_t)have, sizeof *flags, cmp_u32);
     g_ntmpl = 0;
@@ -3240,6 +3280,48 @@ static int build_boss_deaths(const char *game_dir, buf bhd, const char *bdt) {
     logf_("Boss deaths for the day clock: %d flags (%d with their boss character, %d templates) from %d of %d event scripts", have, with,
           g_ntmpl, read, found);
     return ok ? have : -1;
+}
+
+// Day 2 (day flow): every merged pattern's number of ordinary bosses -> work/native/pattern-bosses.txt, "pattern count"
+// (the DLL: alive at 7505 = count - ordinary bosses killed on day 1). A pattern's bosses: one per small map placed for
+// good (LotResultSmallBaseAndSpot rows of modifier 0, +0x14; +0xc map) that has a boss, counted once (its several flags,
+// e.g. m32_10's 800 / 810 / 820, may be its variants' alternatives; owner 2026-11-21: an error of 1-2 is fine), and
+// every boss of its field tiles' scripts, each tile in the variant the map shows: the added region's on its tiles (the
+// DLL's variant_hook), elsewhere the first of (base, added) region that has a file for the tile (CalcGetReplaceMapIdByDisaster over gm
+// +0xbb8 = [base, added]), else the plain one. Also the counts' range in the build log (offline check).
+static int day_tile_variant(int x, int z) {
+    const u8 *has = g_tile_file[x - 42][z - 36];
+    if (site_added_tile(x, z)) return pair_b()->kind;
+    return has[pair_a()->kind] ? pair_a()->kind : has[pair_b()->kind] ? pair_b()->kind : 0;
+}
+static int write_pattern_bosses(buf bases) {
+    char path[1300];
+    snprintf(path, sizeof path, "%s" SEP "work" SEP "native" SEP "pattern-bosses.txt", g_app);
+    if (!g_nday_boss || param_row_size(bases) != 0x18) return logf_("Day flow: no boss list for day 2 (pattern-bosses.txt not written)"), remove(path), 1;
+    FILE *f = fopen(path, "w");
+    if (!f) return 0;
+    fprintf(f, "# Written by the launcher: pattern, the number of its ordinary bosses (day 2's count).\n");
+    int lo = 999, hi = 0, tiles = 0;
+    for (int x = 42; x <= 45; x++)
+        for (int z = 36; z <= 39; z++)
+            for (int i = 0; i < g_nday_boss; i++) tiles += g_day_boss[i].src == 100000 + x * 1000 + z * 10 + day_tile_variant(x, z);
+    for (int pat = 0; pat < TWO_PATTERNS; pat++) {
+        if (!merged_slot(pat)) continue;
+        int n = tiles;
+        for (u32 r = 0; r < rd16(bases.p + 0x0A); r++) {
+            const u8 *row = bases.p + rd64(bases.p + 0x40 + r * 24 + 8);
+            int m = (int)rd32(row + 0xc), boss = 0;
+            if ((int)rd32(row + 4) != pat || rd32(row + 0x14) || m <= 0 || m >= 10000) continue;
+            for (int i = 0; i < g_nday_boss && !boss; i++) boss = g_day_boss[i].src == m;
+            n += boss;
+        }
+        fprintf(f, "%d %d\n", pat, n);
+        if (n < lo) lo = n;
+        if (n > hi) hi = n;
+    }
+    fclose(f);
+    logf_("Day flow: ordinary bosses per pattern (day 2's count): %d..%d on the 200 merged patterns (%d of them on the field tiles)", lo, hi, tiles);
+    return 1;
 }
 
 // The fire ring: the circle that closes around the arena after the challenge (its border effect 807011, and 807800 on

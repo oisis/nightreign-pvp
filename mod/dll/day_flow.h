@@ -1,6 +1,7 @@
 // Day flow (boss-flow 4, the owner's design of 2026-11-18): the day is free play; the night comes when the squad
 // uses our item "Challenge the Night" (goods 1291, sold by the field merchant), which works once 6 bosses and the
-// region's special boss (the Mountaintop's dragon or the Rotted Woods' Captain) are dead. Each boss makes the
+// region's special boss (the Mountaintop's dragon or the Rotted Woods' Captain) are dead; on day 2 min(6, bosses still
+// alive at its start) and both regions' special bosses (owner, 2026-11-21; df_day2_count). Each boss makes the
 // enemies stronger: +5 % HP and damage per boss until the condition is met, then +50 % per boss. Rows (launcher,
 // day_flow_rows): SpEffect 90071612 = the item's use marker (1 s), 90071700 + k = an enemy tier of +5 % * k.
 // Every machine counts the bosses itself (death flags, synced; flag_note -> df_kill) and so has the same tier.
@@ -16,18 +17,41 @@
 // Only the two regions of this start's pair (setting pair, written by the launcher) count.
 static const unsigned DF_SPECIAL_MT[] = {1028100800, 1029100800, 1039100800, 1039100801}, DF_SPECIAL_RW[] = {1056300800},
                       DF_SPECIAL_CR[] = {1048202800}, DF_SPECIAL_NK[] = {1026500800};
-static int df_special(unsigned id) {
+static const char *const DF_REGION_NAME[4] = {"Mountaintop", "Crater", "Rotted Woods", "Noklateo"};
+static int df_region(int which, const unsigned **flags) {  // which 0: the base region (MT / CR), 1: the added (RW / NK); its flag count
     int p = PAIR_NOW, crater = p == 2 || p == 3, nk = p == 1 || p == 3;
-    const unsigned *a = crater ? DF_SPECIAL_CR : DF_SPECIAL_MT, *b = nk ? DF_SPECIAL_NK : DF_SPECIAL_RW;
-    unsigned na = crater ? 1 : 4, nb = 1;
-    for (unsigned i = 0; i < na; i++) if (id == a[i]) return 1;
-    for (unsigned i = 0; i < nb; i++) if (id == b[i]) return 1;
+    if (which == 0) return *flags = crater ? DF_SPECIAL_CR : DF_SPECIAL_MT, crater ? 1 : 4;
+    return *flags = nk ? DF_SPECIAL_NK : DF_SPECIAL_RW, 1;
+}
+static int df_special(unsigned id) {
+    for (int w = 0; w < 2; w++) {
+        const unsigned *f;
+        for (int i = 0, n = df_region(w, &f); i < n; i++) if (id == f[i]) return 1;
+    }
     return 0;
+}
+// Day 2 (owner, 2026-11-21): both regions' special bosses must be dead, on day 1 or day 2. Read from the death flags
+// themselves (bosses never respawn, their flags only go on): a region's is dead when any of its flags is on (the
+// Mountaintop's one dragon has four). Bit 0 the base region, bit 1 the added one.
+static int df_specials_dead(void) {
+    char *man = flag_man();
+    int dead = 0;
+    for (int w = 0; w < 2 && man; w++) {
+        const unsigned *f;
+        for (int i = 0, n = df_region(w, &f); i < n; i++) if (flag_state_in(man, f[i]) == 1) dead |= 1 << w;
+    }
+    return dead;
 }
 static const char *const DF_PAIR_NAME[4] = {"Frozen Thicket", "City Beneath the Peak", "Ash and Rot", "Fire over the City"};
 static volatile LONG g_df_kills, g_df_special_kills;
 static int g_df_bosses, g_df_special, g_df_met, g_df_met_at, g_df_after, g_df_day = 1, g_df_go, g_df_used;
 static int g_df_tier;  // percent: 0, 5, 10 ...
+// The day's target (owner, 2026-11-21): day 1 DF_BOSSES ordinary bosses and one special boss (g_df_special: killed this
+// day); day 2 g_df_need = min(DF_BOSSES, ordinary bosses alive at its start) and both special bosses (g_df_special: how
+// many are dead, from their flags).
+static int g_df_need = DF_BOSSES;
+static int df_need(void) { return g_df_day == 2 ? g_df_need : DF_BOSSES; }
+static int df_special_ok(void) { return g_df_special >= (g_df_day == 2 ? 2 : 1); }
 static DWORD g_df_notice_due;  // the progress notice, 6 s after a kill
 static void df_kill(unsigned id) {  // flag_note, any thread: a boss death flag turned on
     if (df_special(id)) { InterlockedIncrement(&g_df_special_kills); return; }
@@ -38,14 +62,44 @@ static int df_target_tier(void) {
     int t = g_df_met ? g_df_met_at * 5 + g_df_after * 50 : g_df_bosses * 5;
     return t > DF_TIER_COUNT * 5 ? DF_TIER_COUNT * 5 : t;
 }
-// After a kill (owner, 2026-11-21): the condition met -> 131182 (challenge available); 6/6 without the special boss ->
-// 131180 ("6/6. Defeat the special region boss"); otherwise (fewer than 6, special boss dead or not) -> 131181 ("N/6").
+// After a kill (owner, 2026-11-21): the condition met -> 131182 (challenge available); M/M without the special boss(es)
+// -> 131180 ("M/M. Defeat the special region boss"); otherwise -> 131181 ("N/M"); M the day's target (df_need).
 // The game keeps a summon message up about 5.9 s by itself (run of dev.60: 5924 ms).
 static void df_progress_notice(void) {
     char arg[24];
-    snprintf(arg, sizeof arg, "%d/%d", g_df_bosses < DF_BOSSES ? g_df_bosses : DF_BOSSES, DF_BOSSES);
+    int m = df_need();
+    snprintf(arg, sizeof arg, "%d/%d", g_df_bosses < m ? g_df_bosses : m, m);
     if (g_df_met) notice_with(131182, NULL);
-    else notice_with(g_df_bosses >= DF_BOSSES && !g_df_special ? 131180 : 131181, arg);
+    else notice_with(g_df_bosses >= m && !df_special_ok() ? 131180 : 131181, arg);
+}
+static void df_check_met(const char *when) {
+    if (g_df_met || g_df_bosses < df_need() || !df_special_ok()) return;
+    g_df_met = 1, g_df_met_at = g_df_bosses + 1;  // the special boss counts as one more for the tier
+    logf("day flow: condition met %s (day %d: %d of %d bosses, special bosses dead %d)", when, g_df_day, g_df_bosses, df_need(), g_df_special);
+}
+// Day 2's start (7505): alive = this pattern's ordinary bosses (launcher: pattern-bosses.txt, "pattern count") minus
+// the ordinary bosses killed on day 1 (g_df_killed1: before and after the condition; every boss-death flag the day
+// counted, so event bosses too: an error of 1-2 is accepted, owner 2026-11-21). No line for the pattern: 6.
+static int g_df_killed1;
+static void df_day2_count(void) {
+    char *gm = *(char **)(g_base + 0x3c13258), path[MAX_PATH], line[128];
+    unsigned pat = gm ? *(unsigned *)(gm + 0xb4c) : 0xffffffffu, p_;
+    next_to_dll(path, sizeof path, "pattern-bosses.txt");
+    FILE *f = fopen(path, "r");
+    int total = -1, n, have_file = f != NULL;
+    while (f && total < 0 && fgets(line, sizeof line, f))
+        if (sscanf(line, "%u %d", &p_, &n) == 2 && p_ == pat) total = n;
+    if (f) fclose(f);
+    int alive = total - g_df_killed1 > 0 ? total - g_df_killed1 : 0;
+    g_df_need = total < 0 ? DF_BOSSES : alive < DF_BOSSES ? alive : DF_BOSSES;
+    int dead = df_specials_dead(), p = PAIR_NOW >= 0 && PAIR_NOW <= 3 ? PAIR_NOW : 0;
+    g_df_special = (dead & 1) + (dead >> 1 & 1);
+    if (total < 0)
+        logf("day flow: day 2: pattern %u not in pattern-bosses.txt (%s): needed %d (fallback); %d ordinary bosses killed on day 1", pat,
+             have_file ? "no line" : "file missing", g_df_need, g_df_killed1);
+    logf("day flow: day 2: pattern %u, ordinary bosses on the map %d, alive %d (%d killed on day 1), needed %d; specials: %s %s, %s %s", pat,
+         total, total < 0 ? -1 : alive, g_df_killed1, g_df_need, DF_REGION_NAME[p == 2 || p == 3], dead & 1 ? "dead" : "alive",
+         DF_REGION_NAME[2 + (p == 1 || p == 3)], dead & 2 ? "dead" : "alive");
 }
 // --- enemy tiers: through the game's own re-apply of the player-count correction (ChrFinder -> 0x1405186a0, which
 // calls 0x1403c7e50(chr) for each character at 0x1405186ac; the pass runs when WCM+0x17558 differs from the count,
@@ -589,9 +643,9 @@ static void df_move_frame(void) {  // the warp once the screen is black; the fad
 static void df_item_used(void) {
     if (!g_df_met || g_df_used) {  // the item is not consumed (launcher: isConsume off), nothing to give back
         char arg[16];
-        snprintf(arg, sizeof arg, "%d", DF_BOSSES);
+        snprintf(arg, sizeof arg, "%d", df_need());
         if (g_df_used) notice_with(131184, NULL);
-        else notice_with(131183, arg);
+        else notice_with(g_df_day == 2 ? 131191 : 131183, arg);
         logf("day flow: item used %s: kept, not consumed", g_df_used ? "after this day's challenge" : "before the condition");
         return;
     }
@@ -808,7 +862,7 @@ static void df_death_restart_install(void) {
 }
 // --- every frame in the field (every machine)
 // The day flow's state is the host's (dev.60: a rejoined ally began its own count at its arrival): the host publishes
-// it in its lobby data (LOBBY_DF_KEY "day,bosses,special,met,met_at,after,kills_day,second", on change); a joiner
+// it in its lobby data (LOBBY_DF_KEY "day,bosses,special,met,met_at,after,kills_day,second,need", on change); a joiner
 // takes it at its arrival and on every change instead of counting itself (its boss count, the condition, the tier,
 // the camps' second invaders, the progress notice). The challenge itself goes as before (LOBBY_CHAL_KEY).
 #define LOBBY_DF_KEY "nrpvp_df"
@@ -822,21 +876,22 @@ static void df_state_sync(void) {
     if (g_join != 4) {
         g_df_host_state = 0;
         if (!g_lobby) return;
-        snprintf(text, sizeof text, "%d,%d,%d,%d,%d,%d,%d,%d", g_df_day, g_df_bosses, g_df_special, g_df_met, g_df_met_at, g_df_after,
-                 g_df_kills_day, g_df_second);
+        snprintf(text, sizeof text, "%d,%d,%d,%d,%d,%d,%d,%d,%d", g_df_day, g_df_bosses, g_df_special, g_df_met, g_df_met_at, g_df_after,
+                 g_df_kills_day, g_df_second, g_df_need);
         if (strcmp(text, last)) snprintf(last, sizeof last, "%s", text), lobby_set(LOBBY_DF_KEY, text);
         return;
     }
     const char *v = g_candidate ? g_steam.get_data(g_steam.mm, g_candidate, LOBBY_DF_KEY) : NULL;
-    int d[8];
-    if (!v || sscanf(v, "%d,%d,%d,%d,%d,%d,%d,%d", &d[0], &d[1], &d[2], &d[3], &d[4], &d[5], &d[6], &d[7]) != 8) return;
+    int d[9];
+    if (!v || sscanf(v, "%d,%d,%d,%d,%d,%d,%d,%d,%d", &d[0], &d[1], &d[2], &d[3], &d[4], &d[5], &d[6], &d[7], &d[8]) != 9) return;
     if (g_df_host_state && !strcmp(v, last)) return;
-    int more = g_df_host_state && (d[1] > g_df_bosses || d[2] > g_df_special || d[3] > g_df_met);
+    // a notice for a change of the host's (not at the arrival): more bosses, or the condition, also at once on day 2
+    int more = g_df_host_state && (d[1] > g_df_bosses || d[2] > g_df_special || d[3] > g_df_met || (d[0] > g_df_day && d[3]));
     snprintf(last, sizeof last, "%s", v);
     g_df_day = d[0], g_df_bosses = d[1], g_df_special = d[2], g_df_met = d[3], g_df_met_at = d[4], g_df_after = d[5];
-    g_df_kills_day = d[6], g_df_second = d[7];
-    logf("day flow: the host's state %s: day %d, %d bosses, special %d, condition %d, after it %d, this day %d, second invaders %d",
-         g_df_host_state ? "changed" : "taken", d[0], d[1], d[2], d[3], d[5], d[6], d[7]);
+    g_df_kills_day = d[6], g_df_second = d[7], g_df_need = d[8];
+    logf("day flow: the host's state %s: day %d, %d bosses, special %d, condition %d, after it %d, this day %d, second invaders %d, "
+         "needed on day 2 %d", g_df_host_state ? "changed" : "taken", d[0], d[1], d[2], d[3], d[5], d[6], d[7], d[8]);
     g_df_host_state = 1;
     if (more) g_df_notice_due = GetTickCount() + 6000 | 1;
     df_repass("the host's state");
@@ -851,7 +906,7 @@ static void day_flow_frame(int in_world) {
     if (first) {
         g_df_bosses = g_df_special = g_df_met = g_df_met_at = g_df_after = 0, g_df_day = 1, g_df_go = g_df_used = 0, g_df_seq = 0;
         g_df_tier = 0, day2_seen = 0, last_tier = -1, marker_was = 0, down_last = -1, g_df_kills_day = 0, g_df_camps = 0, g_df_ninv = 0, g_df_notice_due = 0;
-        g_df_second = 0, g_df_host_state = 0;
+        g_df_second = 0, g_df_host_state = 0, g_df_need = DF_BOSSES, g_df_killed1 = 0;
         g_df_events = 0, g_df_started = 0, g_df_event_tick = 0;
         InterlockedExchange(&g_df_kills, 0), InterlockedExchange(&g_df_special_kills, 0);
         char *gm0 = *(char **)(g_base + 0x3c13258);
@@ -863,10 +918,18 @@ static void day_flow_frame(int in_world) {
         if (g_df_fade_in_at) g_df_fade_in_at = 0, df_fade(0.0f, 0.1f, 0);
     }
     if (!day2_seen && bf_flag(7505)) {  // day 2: the game's own day-2 level, our count starts again
+        // a joiner that already took the host's day-2 state (it may come before 7505 here) keeps it
+        int host_day2 = g_join == 4 && g_df_host_state && g_df_day == 2;
         day2_seen = 1, g_df_day = 2;
-        g_df_bosses = g_df_special = g_df_met = g_df_met_at = g_df_after = 0, g_df_go = g_df_used = 0, g_df_kills_day = 0;
+        if (!host_day2) g_df_bosses = g_df_special = g_df_met = g_df_met_at = g_df_after = 0, g_df_kills_day = 0;
+        g_df_go = g_df_used = 0;
         InterlockedExchange(&g_df_kills, 0), InterlockedExchange(&g_df_special_kills, 0);
         logf("day flow: day 2 (7505): tier back to 0, count starts again (events: each family ran at most once, none again)");
+        if (g_join != 4) {  // the host (or solo); a joiner takes the host's (df_state_sync)
+            df_day2_count();
+            df_check_met("at the start of day 2");
+            if (g_df_met) g_df_notice_due = GetTickCount() + 6000 | 1;  // 131182 (the day-2 banner first)
+        }
         // The merchant sells the item again: its rows 3007 / 3507 keep the Small Pouch's stock flag 90470 (ShopLineupParam
         // eventFlag_forStock). The stock rows' flags are 10 apart (90430 .. 90470, 90690, 90700), so 90470..90479 are
         // taken as this row's sold count; every one that is on goes off (each machine its own merchant).
@@ -888,15 +951,22 @@ static void day_flow_frame(int in_world) {
     }
     g_df_kills_day += (int)(k + sk);
     if (k > 0 || sk > 0) df_repass("a boss: camps and tier");
+    if (g_df_day == 1) g_df_killed1 += (int)k;
     if (k > 0 || sk > 0) {
         if (g_df_met) g_df_after += (int)(k + sk);
-        else g_df_bosses += (int)k, g_df_special = g_df_special || sk > 0;
-        if (!g_df_met && g_df_bosses >= DF_BOSSES && g_df_special) {
-            g_df_met = 1, g_df_met_at = g_df_bosses + 1;  // the special boss counts as one more for the tier
-            logf("day flow: condition met (%d bosses and the special boss)", g_df_bosses);
-        }
-        logf("day flow: boss killed: %d bosses, special %s, after the condition %d", g_df_bosses, g_df_special ? "yes" : "no", g_df_after);
+        else g_df_bosses += (int)k, g_df_special = g_df_day == 2 ? g_df_special : g_df_special || sk > 0;  // day 2: below
+        df_check_met("after a kill");
+        logf("day flow: boss killed: %d of %d bosses, special bosses %d (of %d needed), after the condition %d", g_df_bosses, df_need(),
+             g_df_special, g_df_day == 2 ? 2 : 1, g_df_after);
         g_df_notice_due = GetTickCount() + 6000 | 1;  // after the game's own boss banner (deck test: a notice in the same frame was not seen)
+    }
+    if (g_df_day == 2 && !g_df_met && !(g_join == 4 && g_df_host_state)) {  // day 2: the special bosses from their flags
+        int dead = df_specials_dead(), n = (dead & 1) + (dead >> 1 & 1);
+        if (n != g_df_special) {
+            g_df_special = n;
+            logf("day flow: day 2: special bosses dead %d (flags: base region %s, added region %s)", n, dead & 1 ? "on" : "off", dead & 2 ? "on" : "off");
+            df_check_met("a special boss's flag");
+        }
     }
     if (g_df_notice_due && (int)(GetTickCount() - g_df_notice_due) >= 0) {
         g_df_notice_due = 0;
