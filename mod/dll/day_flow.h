@@ -1,8 +1,9 @@
 // Day flow (boss-flow 4, the owner's design of 2026-11-18): the day is free play; the night comes when the squad
 // uses our item "Challenge the Night" (goods 1291, sold by the field merchant), which works once 6 bosses and the
 // region's special boss (the Mountaintop's dragon or the Rotted Woods' Captain) are dead; on day 2 min(6, bosses still
-// alive at its start) and both regions' special bosses (owner, 2026-11-21; df_day2_count). Each boss makes the
-// enemies stronger: +5 % HP and damage per boss until the condition is met, then +50 % per boss. Rows (launcher,
+// alive at its start) and both regions' special bosses (owner, 2026-11-21; df_day2_count). Enemy tier (owner,
+// 2026-11-21, df_target_tier): day 1 every ordinary boss past the 6th +10 % HP and damage, day 2 every ordinary boss past
+// the day's need +15 %, added; special bosses never; it is kept to the end (night bosses, the final boss). Rows (launcher,
 // day_flow_rows): SpEffect 90071612 = the item's use marker (1 s), 90071700 + k = an enemy tier of +5 % * k.
 // Every machine counts the bosses itself (death flags, synced; flag_note -> df_kill) and so has the same tier.
 #define DF_GOODS        1291
@@ -45,6 +46,9 @@ static int df_specials_dead(void) {
 static const char *const DF_PAIR_NAME[4] = {"Frozen Thicket", "City Beneath the Peak", "Ash and Rot", "Fire over the City"};
 static volatile LONG g_df_kills, g_df_special_kills;
 static int g_df_bosses, g_df_special, g_df_met, g_df_met_at, g_df_after, g_df_day = 1, g_df_go, g_df_used;
+// the ordinary bosses killed on day 1 (g_df_killed1: before and after the condition; every boss-death flag the day
+// counted, so event bosses too: an error of 1-2 is accepted, owner 2026-11-21) and on day 2 (g_df_killed2)
+static int g_df_killed1, g_df_killed2;
 static int g_df_tier;  // percent: 0, 5, 10 ...
 // The day's target (owner, 2026-11-21): day 1 DF_BOSSES ordinary bosses and one special boss (g_df_special: killed this
 // day); day 2 g_df_need = min(DF_BOSSES, ordinary bosses alive at its start) and both special bosses (g_df_special: how
@@ -59,7 +63,8 @@ static void df_kill(unsigned id) {  // flag_note, any thread: a boss death flag 
 }
 static int df_on(void) { return g_settings[S_BOSS_FLOW] == 4; }
 static int df_target_tier(void) {
-    int t = g_df_met ? g_df_met_at * 5 + g_df_after * 50 : g_df_bosses * 5;
+    int t = 10 * (g_df_killed1 > DF_BOSSES ? g_df_killed1 - DF_BOSSES : 0);
+    if (g_df_day == 2) t += 15 * (g_df_killed2 > g_df_need ? g_df_killed2 - g_df_need : 0);
     return t > DF_TIER_COUNT * 5 ? DF_TIER_COUNT * 5 : t;
 }
 // After a kill (owner, 2026-11-21): the condition met -> 131182 (challenge available); M/M without the special boss(es)
@@ -78,9 +83,7 @@ static void df_check_met(const char *when) {
     logf("day flow: condition met %s (day %d: %d of %d bosses, special bosses dead %d)", when, g_df_day, g_df_bosses, df_need(), g_df_special);
 }
 // Day 2's start (7505): alive = this pattern's ordinary bosses (launcher: pattern-bosses.txt, "pattern count") minus
-// the ordinary bosses killed on day 1 (g_df_killed1: before and after the condition; every boss-death flag the day
-// counted, so event bosses too: an error of 1-2 is accepted, owner 2026-11-21). No line for the pattern: 6.
-static int g_df_killed1;
+// No line for the pattern: 6.
 static void df_day2_count(void) {
     char *gm = *(char **)(g_base + 0x3c13258), path[MAX_PATH], line[128];
     unsigned pat = gm ? *(unsigned *)(gm + 0xb4c) : 0xffffffffu, p_;
@@ -876,22 +879,22 @@ static void df_state_sync(void) {
     if (g_join != 4) {
         g_df_host_state = 0;
         if (!g_lobby) return;
-        snprintf(text, sizeof text, "%d,%d,%d,%d,%d,%d,%d,%d,%d", g_df_day, g_df_bosses, g_df_special, g_df_met, g_df_met_at, g_df_after,
-                 g_df_kills_day, g_df_second, g_df_need);
+        snprintf(text, sizeof text, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d", g_df_day, g_df_bosses, g_df_special, g_df_met, g_df_met_at, g_df_after,
+                 g_df_kills_day, g_df_second, g_df_need, g_df_killed1, g_df_killed2);
         if (strcmp(text, last)) snprintf(last, sizeof last, "%s", text), lobby_set(LOBBY_DF_KEY, text);
         return;
     }
     const char *v = g_candidate ? g_steam.get_data(g_steam.mm, g_candidate, LOBBY_DF_KEY) : NULL;
-    int d[9];
-    if (!v || sscanf(v, "%d,%d,%d,%d,%d,%d,%d,%d,%d", &d[0], &d[1], &d[2], &d[3], &d[4], &d[5], &d[6], &d[7], &d[8]) != 9) return;
+    int d[11];
+    if (!v || sscanf(v, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d", &d[0], &d[1], &d[2], &d[3], &d[4], &d[5], &d[6], &d[7], &d[8], &d[9], &d[10]) != 11) return;
     if (g_df_host_state && !strcmp(v, last)) return;
     // a notice for a change of the host's (not at the arrival): more bosses, or the condition, also at once on day 2
     int more = g_df_host_state && (d[1] > g_df_bosses || d[2] > g_df_special || d[3] > g_df_met || (d[0] > g_df_day && d[3]));
     snprintf(last, sizeof last, "%s", v);
     g_df_day = d[0], g_df_bosses = d[1], g_df_special = d[2], g_df_met = d[3], g_df_met_at = d[4], g_df_after = d[5];
-    g_df_kills_day = d[6], g_df_second = d[7], g_df_need = d[8];
+    g_df_kills_day = d[6], g_df_second = d[7], g_df_need = d[8], g_df_killed1 = d[9], g_df_killed2 = d[10];
     logf("day flow: the host's state %s: day %d, %d bosses, special %d, condition %d, after it %d, this day %d, second invaders %d, "
-         "needed on day 2 %d", g_df_host_state ? "changed" : "taken", d[0], d[1], d[2], d[3], d[5], d[6], d[7], d[8]);
+         "needed on day 2 %d, ordinary bosses day 1 %d / day 2 %d", g_df_host_state ? "changed" : "taken", d[0], d[1], d[2], d[3], d[5], d[6], d[7], d[8], d[9], d[10]);
     g_df_host_state = 1;
     if (more) g_df_notice_due = GetTickCount() + 6000 | 1;
     df_repass("the host's state");
@@ -906,7 +909,7 @@ static void day_flow_frame(int in_world) {
     if (first) {
         g_df_bosses = g_df_special = g_df_met = g_df_met_at = g_df_after = 0, g_df_day = 1, g_df_go = g_df_used = 0, g_df_seq = 0;
         g_df_tier = 0, day2_seen = 0, last_tier = -1, marker_was = 0, down_last = -1, g_df_kills_day = 0, g_df_camps = 0, g_df_ninv = 0, g_df_notice_due = 0;
-        g_df_second = 0, g_df_host_state = 0, g_df_need = DF_BOSSES, g_df_killed1 = 0;
+        g_df_second = 0, g_df_host_state = 0, g_df_need = DF_BOSSES, g_df_killed1 = 0, g_df_killed2 = 0;
         g_df_events = 0, g_df_started = 0, g_df_event_tick = 0;
         InterlockedExchange(&g_df_kills, 0), InterlockedExchange(&g_df_special_kills, 0);
         char *gm0 = *(char **)(g_base + 0x3c13258);
@@ -921,10 +924,10 @@ static void day_flow_frame(int in_world) {
         // a joiner that already took the host's day-2 state (it may come before 7505 here) keeps it
         int host_day2 = g_join == 4 && g_df_host_state && g_df_day == 2;
         day2_seen = 1, g_df_day = 2;
-        if (!host_day2) g_df_bosses = g_df_special = g_df_met = g_df_met_at = g_df_after = 0, g_df_kills_day = 0;
+        if (!host_day2) g_df_bosses = g_df_special = g_df_met = g_df_met_at = g_df_after = 0, g_df_kills_day = 0, g_df_killed2 = 0;
         g_df_go = g_df_used = 0;
         InterlockedExchange(&g_df_kills, 0), InterlockedExchange(&g_df_special_kills, 0);
-        logf("day flow: day 2 (7505): tier back to 0, count starts again (events: each family ran at most once, none again)");
+        logf("day flow: day 2 (7505): the count starts again, the tier from day 1 is kept (%d%%; events: each family ran at most once, none again)", df_target_tier());
         if (g_join != 4) {  // the host (or solo); a joiner takes the host's (df_state_sync)
             df_day2_count();
             df_check_met("at the start of day 2");
@@ -952,6 +955,7 @@ static void day_flow_frame(int in_world) {
     g_df_kills_day += (int)(k + sk);
     if (k > 0 || sk > 0) df_repass("a boss: camps and tier");
     if (g_df_day == 1) g_df_killed1 += (int)k;
+    else g_df_killed2 += (int)k;
     if (k > 0 || sk > 0) {
         if (g_df_met) g_df_after += (int)(k + sk);
         else g_df_bosses += (int)k, g_df_special = g_df_day == 2 ? g_df_special : g_df_special || sk > 0;  // day 2: below
