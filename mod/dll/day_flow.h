@@ -421,6 +421,14 @@ static void df_bases_check(void) {
     }
     logf("small bases: pattern %u: %d of %d sites with their point not known now (player block %08x):%s", pat, missing, all,
          me ? *(unsigned *)(me + CHR_BLOCK_ID) : 0, missing ? line : " none");
+    // Measurement (Ash and Rot, woods objects moved into the woods tile files): whether the entity lookup 0x5fc6f0 (the
+    // map that answers df_point_known) has the woods objects (tree 1046301585, tower map 1056301510, site 1047301955)
+    // and the Crater's far-half objects (1048201960 on 44_38, 1045391950 on 45_39); as with points, only while their
+    // file is loaded, so the player's block is in the line.
+    static const int ENT[5] = {1046301585, 1056301510, 1047301955, 1048201960, 1045391950};
+    at = 0;
+    for (int i = 0; i < 5; i++) at += snprintf(line + at, sizeof line - (size_t)at, " %d=%s", ENT[i], df_point_known(ENT[i]) ? "known" : "unknown");
+    logf("entities (woods / Crater objects): pattern %u, player block %08x:%s", pat, me ? *(unsigned *)(me + CHR_BLOCK_ID) : 0, line);
 }
 // Diagnostic for the crash at world teardown (deck-run3b, deck-run4: 0x14214e298 from 0x1406420d9): the
 // WorldGridAreaInfo destructor 0x140641f70 fires DL_PANIC "WorldGridAreaInfo::m_smallBaseBlocks" (leak) when its

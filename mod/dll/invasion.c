@@ -1132,9 +1132,9 @@ static void generate_hook(unsigned long long a1, unsigned long long a2, unsigned
     if (gm) memcpy(gm_before, gm + 0xa00, sizeof gm_before);
     if (pa) memcpy(pa_before, pa, sizeof pa_before);
     // The generator draws the pattern itself (a forced gm +0xb48 left items unpickable, runs 30..36); the launcher's
-    // weights make the five maps 20 % each. Its region argument v3 (u8 vector, the game's "rare map layer"): the
+    // weights make the base map 25 % and each pair 18.75 %. Its region argument v3 (u8 vector, the game's "rare map layer"): the
     // generator takes a set of a digit in its region-choice vector alone, and keeps only the digits whose bit every byte
-    // of its unlock vector has (0x1406b383d.., 0x1406b3938..), so v3 is emptied: a vector with no byte forces nothing and
+    // of its unlock vector v4 has (0x1406b383d.., 0x1406b3938..), so v3 and v4 are emptied: a vector with no byte forces nothing and
     // filters nothing, whichever of the two it is (runs with [1] / [2] here drew plain and region slots alike).
     // one-region (measurement only): that region's digit; the launcher left weights only on its sets.
     int want = g_settings[S_ONE_REGION] >= 1 && g_settings[S_ONE_REGION] <= 5 ? g_settings[S_ONE_REGION] : 0;
@@ -1142,7 +1142,10 @@ static void generate_hook(unsigned long long a1, unsigned long long a2, unsigned
         unsigned char *b = v3[1], *e = v3[2], *cap = v3[3];
         if (!want) {
             v3[2] = b;
-            logf("generate: region argument emptied (was [%s]): every map's set is drawn by its weight", t3);
+            // v4: the player's unlocked shifting-earth digits (bit d per byte; [14] on an account without Noklateo
+            // dropped digit 5, Fire over the City); emptied too, so every machine draws all five maps alike
+            if (v4 && !IsBadReadPtr(v4, 32)) v4[2] = v4[1];
+            logf("generate: region argument and unlock mask emptied (were [%s] [%s]): every map's set is drawn by its weight", t3, t4);
         } else if (b && e > b) {
             for (unsigned char *q = b; q < e; q++) *q = (unsigned char)want;
             logf("one-region (test): generator region argument set to %d", want);
@@ -2894,7 +2897,9 @@ static void sb_erase_hook(char *ga, unsigned *key) {
 static const unsigned VARIANT_SITES[] = {0x6362a7, 0x6363e6, 0x6363fb, 0x6396ae, 0x6396c3, 0x639ac2, 0x646ce1, 0x646d2f, 0x64a112,
                                          0x64aa02, 0x64b5c0, 0x64cafc, 0x64cb71, 0x64cc25, 0x64d9b7, 0x64db8c, 0x64dc47, 0x64dcf6,
                                          0x64dd98, 0x69ceb3, 0x69cfa2, 0x6ab5c6, 0x6ab63d, 0x6ab723, 0x6b0dcb, 0xbedc9f, 0xe7b48c};
-static const unsigned char PAIR_HALVES[4] = {0, 1, 2, 3};  // bit 0 west, bit 1 east (launcher TWO_PAIRS)
+// bit 0 west, bit 1 east: the halves under variant 6 + pair (launcher TWO_PAIRS); Ash and Rot's composed east half is
+// written under the Crater's own name m60_11_09_22 and keeps the game's variant 2
+static const unsigned char PAIR_HALVES[4] = {0, 1, 0, 3};
 static int g_variant_forced;
 static void variant_set(unsigned *out, unsigned want, const char *what, unsigned x, unsigned z) {
     if (*out != want && g_variant_forced++ < 40)

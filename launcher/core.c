@@ -39,7 +39,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 43
+#define BUILD_FORMAT 45
 #define BOSS_DEATHS_MIN 100  // the game (1.3.3) has 158 such flags; fewer = its event scripts changed
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
@@ -1209,7 +1209,9 @@ static int read_settings(void) {
 // 0x1406ab7a0: the first flag in gm +0xbb8 whose variant the tile has); the map request puts the record's last region
 // flag (the base region's) there, the DLL adds the added region's and gives its tiles their variant and flag space.
 // MapPatternSet: the set of digit d holds 40g+0..19 (d 0) or 40g+20..24 / 25..29 / 30..34 / 35..39 (d 1 / 2 / 3 / 5),
-// so each set is one map; each of the five weighs 2000 (20 %), every other set 0.
+// so each set is one map. The generator (0x1406b2aa0) draws a set by weight alone (0x1406b3cff: rand below the sum,
+// cumulative pick over the sets' weights, not times their pattern count), then a pattern uniformly in it (0x1406aec40):
+// the base map weighs 4000 (25 %), each pair 3000 (18.75 %), every other set 0.
 // one-region (measurement only): 1..5 = a real one-region map of that region digit (1 Mountaintop, 3 Rotted Woods):
 // no pattern merge, the game's own patterns and weights, only that region's sets drawn; 0 = the five maps.
 static int one_region(void) { int r = g_set[S_ONE_REGION]; return r >= 1 && r <= 5 ? r : 0; }
@@ -1227,9 +1229,12 @@ static const region_t R_MT = {20, 1, 7601, 11, 42, 43, 38, 39, "Mountaintop", "M
 // 44_37, which the game gives to Noklateo, keeps a's small bases), start group (SortieStartingPoint +0xc for set 190;
 // its exclusion column +0x10 must name neither region), whether b's tree-site rows (set 500) are copied, and the far
 // halves to compose (west 10_09 / east 11_09: a's variant file with b's tiles of that half taken from b's).
-typedef struct { const region_t *a, *b; int start, tree, halves; const char *map; } two_pair_t;  // halves: bit 0 west, bit 1 east
+// halves: bit 0 west, bit 1 east; bit 2: the east half keeps the base file's own name (m60_11_09_22, the game's variant
+// 2) instead of 6 + pair: Ash and Rot's Crater objects keep their region's variant (their entities have the Crater's
+// scheme, 10 4 8 2 ...); no other map loads that name (the base map is variant 0, Fire over the City's half is its 92).
+typedef struct { const region_t *a, *b; int start, tree, halves; const char *map; } two_pair_t;
 static const two_pair_t TWO_PAIRS[4] = {{&R_MT, &R_RW, 701, 1, 0, "Frozen Thicket"}, {&R_MT, &R_NK, 708, 0, 1, "City Beneath the Peak"},
-                                        {&R_CR, &R_RW, 701, 1, 2, "Ash and Rot"}, {&R_CR, &R_NK, 704, 0, 3, "Fire over the City"}};
+                                        {&R_CR, &R_RW, 701, 1, 2 | 4, "Ash and Rot"}, {&R_CR, &R_NK, 704, 0, 3, "Fire over the City"}};
 // The pair the current step works on (the table builders set it per slot or per pair).
 static int g_pair;
 static const two_pair_t *two_pair(void) { return &TWO_PAIRS[g_pair & 3]; }
@@ -1685,7 +1690,7 @@ static buf map_test_table(buf src, int table, buf flags, buf points, int two) {
         ok = kept > 0;
         logf_("one-region (test): MapPatternSet: %d sets of region %d kept with the game's weights (group %d, 0 any), %d weighted 0",
               kept, want, group + 1, zeroed);
-    } else if (table == 3) {  // weights below 1000: the five maps' sets (digit 0 20 patterns, 1 / 2 / 3 / 5 5 each) 2000, others 0
+    } else if (table == 3) {  // weights below 1000: the five maps' sets (digit 0 20 patterns 4000, 1 / 2 / 3 / 5 5 each 3000), others 0
         int kept = 0, zeroed = 0, group = map_draw_group();  // map-group (test): only that night boss group
         for (u32 i = 0; i < count; i++) {
             int id = (int)rd32(p.p + 0x40 + i * 24);
@@ -1693,11 +1698,11 @@ static buf map_test_table(buf src, int table, buf flags, buf points, int two) {
             if (id >= 1000) continue;
             int digit = id % 10, n = (int)rd32(row + 4);
             if (digit != 4 && digit <= 5 && (group < 0 || id / 10 == group) && n == (digit ? 5 : 20))
-                wr32(row, 2000), wr16(row + 0xe, 2000), kept++;
+                wr32(row, digit ? 3000 : 4000), wr16(row + 0xe, digit ? 3000 : 4000), kept++;
             else wr32(row, 0), wr16(row + 0xe, 0), zeroed++;
         }
         ok = kept == (group < 0 ? 40 : 5);
-        logf_("two-regions: MapPatternSet: %d sets weigh 2000 (the base map and the four pairs, 20 %% each; group %d, 0 any), %d weighted 0",
+        logf_("two-regions: MapPatternSet: %d sets weighted (the base map 4000 = 25 %%, the four pairs 3000 = 18.75 %% each; group %d, 0 any), %d weighted 0",
               kept, group + 1, zeroed);
     } else if (table == 0 && two) {
         // Record rules (09 §12-14): the record's flags are the pattern's rows in row order (rows with modifier 0
@@ -2171,7 +2176,7 @@ static int build_regulation(const char *game_dir) {
         // taking zlib here, a zstd compressor is the upgrade path.
         if (one_region()) logf_("one-region (test): maps of region %d only, the game's own patterns%s", one_region(),
                                 map_draw_group() >= 0 ? "; test: only one night boss group (map-group)" : "");
-        else logf_("Maps: the base map and four two-region maps (%s, %s, %s, %s; 40 compositions each), 20 %% each%s", TWO_PAIRS[0].map,
+        else logf_("Maps: the base map and four two-region maps (%s, %s, %s, %s; 40 compositions each), base 25 %%, each pair 18.75 %%%s", TWO_PAIRS[0].map,
                    TWO_PAIRS[1].map, TWO_PAIRS[2].map, TWO_PAIRS[3].map, map_draw_group() >= 0 ? "; test: only one night boss group (map-group)" : "");
         step = bnd4_replace(bundle, index, param);
         patched = bnd4_replace(step, sp_index, speffect2);
@@ -2782,6 +2787,132 @@ static int pair_b_tile(int x, int z) {  // the added region's tiles in that half
     return in && x >= g_half_x0 && x <= g_half_x1;
 }
 static buf dup_buf(buf b) { buf o = {xalloc(b.n ? b.n : 1), b.n}; memcpy(o.p, b.p, b.n); return o; }
+// The Rotted Woods' far half m60_11_09_32 holds, besides scenery, the woods tiles' objects with an entity (9 assets: the
+// trees 1046301580 / 1046301585 and the AEG099 sites 10x6301955 / 956 / 1056301500 their scripts use, the tower's map
+// 1056301510) and the two ObjActs on them (the tower's treasure map, flag 1056304580; the tree's rot cure, 1046304590):
+// the entities the woods tiles' scripts reference that no woods tile file has (analysis: refs vs the msb files). On Ash
+// and Rot the east half is the Crater's file (variant 2) with the woods' tiles, and none of them worked there (no 9192,
+// no woods boss, no map at the tower, every run since 0.2.4), while on Frozen Thicket (the woods' own half, variant 3)
+// they always did. The variant-3 tile files m60_44..45_36..37_30 (loaded on both maps) get them instead, with positions
+// from the half's frame (X 44..47 x Z 36..39, centre at the 46 / 38 corner) to the tile's (centre); both maps' east
+// halves leave them out.
+static float rd_f32(const u8 *p) { float f; memcpy(&f, p, 4); return f; }
+static void wr_f32(u8 *p, float f) { memcpy(p, &f, 4); }
+static int msb_entity(buf e) {  // a part's entity id (+0x60: its entity block, the id first), 0 if none
+    u64 o = e.n >= 0x68 ? rd64(e.p + 0x60) : 0;
+    return o && o + 4 <= e.n ? (int)rd32(e.p + o) : 0;
+}
+static int woods_tile(int x, int z) { return x >= 44 && x <= 45 && z >= 36 && z <= 37; }
+static int woods_moved_part(buf e) { int x, z; return rd32(e.p + 0xc) == 13 && msb_entity(e) && msb_tile(e, &x, &z) && woods_tile(x, z); }
+static int woods_moved_event(buf e) { int x, z; return msb_tile(e, &x, &z) && woods_tile(x, z); }
+// An entry with its name's tile prefix "m60_XX_ZZ_VV-" dropped (the tile files' own naming): the strings between the
+// name and the first data block are rebuilt (name, and for a part its sib path +0x18), 8-aligned, and every header
+// offset at or past that block moves with it. hdr: the header size (parts 0xc0, events 0x30).
+static int entry_offset_field(u64 hdr, u64 k) { return hdr == 0xc0 ? k >= 0x50 && k < 0xc0 : k >= 0x18 && k <= 0x28; }
+static buf entry_unprefixed(buf e, u64 hdr) {
+    u64 first = e.n, no = rd64(e.p);
+    for (u64 k = 8; k < hdr; k += 8) { u64 v = rd64(e.p + k); if (entry_offset_field(hdr, k) && v >= hdr && v < first) first = v; }
+    size_t nl = 0;
+    while (no + nl * 2 + 1 < e.n && (e.p[no + nl * 2] || e.p[no + nl * 2 + 1])) nl++;
+    size_t cut = nl > 13 && e.p[no + 24] == '-' ? 13 : 0;
+    u64 sib = hdr == 0xc0 ? rd64(e.p + 0x18) : 0, sib_len = 0;
+    if (sib) while (sib + sib_len + 1 < first && (e.p[sib + sib_len] || e.p[sib + sib_len + 1])) sib_len += 2;
+    u64 at = no + (nl - cut + 1) * 2, sib_at = at;
+    if (sib) at += sib_len + 2;
+    at = (at + 7) & ~7ull;
+    buf o = {xalloc(at + (e.n - first)), at + (e.n - first)};
+    memset(o.p, 0, o.n);
+    memcpy(o.p, e.p, hdr);
+    memcpy(o.p + no, e.p + no + cut * 2, (nl - cut) * 2);
+    if (sib) memcpy(o.p + sib_at, e.p + sib, sib_len), wr64(o.p + 0x18, sib_at);
+    memcpy(o.p + at, e.p + first, e.n - first);
+    for (u64 k = 8; k < hdr; k += 8) { u64 v = rd64(e.p + k); if (entry_offset_field(hdr, k) && v >= first && v <= e.n) wr64(o.p + k, v - first + at); }
+    return o;
+}
+// Tile file t (x, z) + the woods half's moved parts and events on that tile. Models: by name, new ones copied from the
+// half after the last of their type; parts after the last of their type (assets are last), own index fields; events
+// after the last of their type, their part index remapped, event number +8 past the tile's highest.
+static buf msb_tile_with(buf dt, const msb_file *H, int x, int z, int *moved_parts, int *moved_events) {
+    msb_file T, M;
+    buf none = {0};
+    if (!msb_parse(dt, &T) || T.nl != 6) return none;
+    enum { MODEL = 0, EVENT = 1, PARTS = 5 };
+    memcpy(&M, &T, sizeof M);
+    int nm = T.l[MODEL].n, np = T.l[PARTS].n, ne = T.l[EVENT].n, cap = 64;
+    buf *mod = xalloc(sizeof(buf) * (nm + cap)), *parts = xalloc(sizeof(buf) * (np + cap)), *ev = xalloc(sizeof(buf) * (ne + cap));
+    for (int i = 0; i < nm; i++) mod[i] = dup_buf(T.l[MODEL].e[i]);
+    for (int i = 0; i < np; i++) parts[i] = dup_buf(T.l[PARTS].e[i]);
+    for (int i = 0; i < ne; i++) ev[i] = dup_buf(T.l[EVENT].e[i]);
+    int hp = H->l[PARTS].n, *new_index = xalloc(sizeof(int) * (hp + 1)), hx, hz;
+    char a[64], b[64];
+    for (int i = 0; i < hp; i++) new_index[i] = -1;
+    for (int i = 0; i < hp && np < T.l[PARTS].n + cap; i++) {
+        buf src = H->l[PARTS].e[i];
+        if (!woods_moved_part(src) || !msb_tile(src, &hx, &hz) || hx != x || hz != z) continue;
+        int hm = (int)rd32(src.p + 0x14), mi = -1;
+        if (hm < 0 || hm >= H->l[MODEL].n) return none;
+        msb_name(H->l[MODEL].e[hm], a, sizeof a);
+        for (int k = 0; k < nm && mi < 0; k++) msb_name(mod[k], b, sizeof b), mi = strcmp(a, b) ? -1 : k;
+        if (mi < 0) {  // after the last model of its type
+            u32 t = rd32(H->l[MODEL].e[hm].p + 8);
+            int at = nm;
+            while (at > 0 && rd32(mod[at - 1].p + 8) != t) at--;
+            if (!at) at = nm;
+            memmove(mod + at + 1, mod + at, sizeof(buf) * (nm - at));
+            mod[at] = dup_buf(H->l[MODEL].e[hm]), wr32(mod[at].p + 0x18, 0), nm++, mi = at;
+            for (int k = 0; k < np; k++) if ((int)rd32(parts[k].p + 0x14) >= at) wr32(parts[k].p + 0x14, rd32(parts[k].p + 0x14) + 1);
+        }
+        buf e = entry_unprefixed(src, 0xc0);
+        float lx = rd_f32(e.p + 0x20) - (float)((x - 46) * 256 + 128), lz = rd_f32(e.p + 0x28) - (float)((z - 38) * 256 + 128);
+        wr_f32(e.p + 0x20, lx), wr_f32(e.p + 0x28, lz);
+        wr32(e.p + 0x14, (u32)mi), wr32(mod[mi].p + 0x18, rd32(mod[mi].p + 0x18) + 1);
+        msb_name(e, b, sizeof b);
+        const char *u = strrchr(b, '_');
+        wr32(e.p + 8, u ? (u32)atoi(u + 1) : 0);  // instance number from the name, as the tile files have it
+        new_index[i] = np, parts[np++] = e;  // assets are the last type: appended
+    }
+    for (int s = 0; s < H->l[EVENT].n && ne < T.l[EVENT].n + cap; s++) {
+        buf src = H->l[EVENT].e[s];
+        if (!woods_moved_event(src) || !msb_tile(src, &hx, &hz) || hx != x || hz != z) continue;
+        buf e = entry_unprefixed(src, 0x30);
+        u32 et = rd32(e.p + 0xc);
+        u64 to = rd64(e.p + 0x20);
+        int fo = et == 4 ? 8 : et == 7 ? 4 : -1;
+        if (fo >= 0 && to + fo + 4 <= e.n) {
+            int old = (int)rd32(e.p + to + fo);
+            if (old >= 0 && (old >= hp || new_index[old] < 0)) return logf_("pair: woods object event refers to a part not moved"), none;
+            wr32(e.p + to + fo, (u32)(old >= 0 ? new_index[old] : -1));
+        }
+        int top = 0, at = ne;
+        for (int k = 0; k < ne; k++) if ((int)rd32(ev[k].p + 8) > top) top = (int)rd32(ev[k].p + 8);
+        wr32(e.p + 8, (u32)(top + 1));
+        while (at > 0 && rd32(ev[at - 1].p + 0xc) != et) at--;
+        if (!at) at = ne;
+        memmove(ev + at + 1, ev + at, sizeof(buf) * (ne - at));
+        ev[at] = e, ne++, (*moved_events)++;
+    }
+    type_counter tc;
+    memset(&tc, 0, sizeof tc);
+    for (int k = 0; k < nm; k++) wr32(mod[k].p + 0xc, (u32)type_next(&tc, rd32(mod[k].p + 8)));
+    memset(&tc, 0, sizeof tc);
+    for (int i = 0; i < np; i++) {
+        u32 t = rd32(parts[i].p + 0xc);
+        wr32(parts[i].p + 0x10, (u32)type_next(&tc, t));
+        if (i >= T.l[PARTS].n && t == 13) {  // own index fields (asset block +0x68: +0x48 / +0x4c / +0x54)
+            u64 bo = rd64(parts[i].p + 0x68);
+            for (int o = 0x48; o <= 0x54; o += 4)
+                if (o != 0x50 && bo + o + 4 <= parts[i].n && (int)rd32(parts[i].p + bo + o) >= 0) wr32(parts[i].p + bo + o, (u32)i);
+        }
+    }
+    memset(&tc, 0, sizeof tc);
+    for (int i = 0; i < ne; i++) wr32(ev[i].p + 0x10, (u32)type_next(&tc, rd32(ev[i].p + 0xc)));
+    *moved_parts += np - T.l[PARTS].n;
+    M.l[MODEL].e = mod, M.l[MODEL].n = nm, M.l[PARTS].e = parts, M.l[PARTS].n = np, M.l[EVENT].e = ev, M.l[EVENT].n = ne;
+    buf out = msb_write(&M);
+    msb_file R;
+    if (!msb_parse(out, &R) || R.l[PARTS].n != np || R.l[EVENT].n != ne) { free(out.p); return none; }
+    return out;
+}
 // A (first variant, kept outside B's tiles) + B (on B's tiles) -> composed MSB; *from_b gets B's map-piece model
 // names (as "digits") that the composed file uses and A does not have.
 static buf msb_compose(buf da, buf db, char names_b[][16], int *nb, int cap) {
@@ -2813,7 +2944,8 @@ static buf msb_compose(buf da, buf db, char names_b[][16], int *nb, int cap) {
     for (int i = 0; i < pa; i++)
         if (!(msb_tile(A.l[PARTS].e[i], &x, &z) && pair_b_tile(x, z))) parts[np] = dup_buf(A.l[PARTS].e[i]), src_is_b[np] = 0, src_i[np++] = i;
     for (int i = 0; i < pb; i++)
-        if (msb_tile(B.l[PARTS].e[i], &x, &z) && pair_b_tile(x, z)) parts[np] = dup_buf(B.l[PARTS].e[i]), src_is_b[np] = 1, src_i[np++] = i;
+        if (msb_tile(B.l[PARTS].e[i], &x, &z) && pair_b_tile(x, z) && !(pair_b() == &R_RW && woods_moved_part(B.l[PARTS].e[i])))
+            parts[np] = dup_buf(B.l[PARTS].e[i]), src_is_b[np] = 1, src_i[np++] = i;
     int *use = xalloc(sizeof(int) * (nm + 1));
     memset(use, 0, sizeof(int) * (nm + 1));
     for (int i = 0; i < np; i++) {
@@ -2852,7 +2984,7 @@ static buf msb_compose(buf da, buf db, char names_b[][16], int *nb, int cap) {
         const msb_file *S = s2 ? &B : &A;
         for (int i = 0; i < S->l[EVENT].n; i++) {
             int on_b = msb_tile(S->l[EVENT].e[i], &x, &z) && pair_b_tile(x, z);
-            if (on_b != s2) continue;
+            if (on_b != s2 || (on_b && pair_b() == &R_RW && woods_moved_event(S->l[EVENT].e[i]))) continue;
             buf e = dup_buf(S->l[EVENT].e[i]);
             u32 et = rd32(e.p + 0xc);
             u64 to = e.n >= 0x30 ? rd64(e.p + 0x20) : 0;
@@ -2930,7 +3062,7 @@ static int compose_one_half(const char *game_dir, buf bhd, const char *bdt_path,
     snprintf(half, sizeof half, "%s", east ? "11_09" : "10_09");
     g_half_x0 = east ? 44 : 42, g_half_x1 = east ? 45 : 43;
     snprintf(an, sizeof an, "m60_%s_%d2", half, av), snprintf(bn, sizeof bn, "m60_%s_%d2", half, bv);
-    snprintf(nn, sizeof nn, "m60_%s_%d2", half, 6 + g_pair);
+    snprintf(nn, sizeof nn, "m60_%s_%d2", half, east && two_pair()->halves & 4 ? av : 6 + g_pair);
     snprintf(from, sizeof from, "/map/mapstudio/%s.msb.dcx", an);
     buf a = archive_read(bhd, bdt_path, from);
     snprintf(from, sizeof from, "/map/mapstudio/%s.msb.dcx", bn);
@@ -2949,7 +3081,7 @@ static int compose_one_half(const char *game_dir, buf bhd, const char *bdt_path,
             free(d.p), free(m.p);
         }
     } else logf_("pair: %s or %s not found in data2", an, bn);
-    if (ok) own = copy_half_folder(bhd, bdt_path, an, nn, g_half_x0), ok = own > 0;
+    if (ok && strcmp(an, nn)) own = copy_half_folder(bhd, bdt_path, an, nn, g_half_x0), ok = own > 0;
     for (int i = 0; ok && i < n; i++) {  // b's pieces the composed file uses, under the composed half's name (bytes as in the archive)
         snprintf(from, sizeof from, "/map/m60/%s/%s_%s.mapbnd.dcx", bn, bn, names[i]);
         buf p = archive_read(bhd, bdt_path, from);
@@ -2964,6 +3096,81 @@ static int compose_one_half(const char *game_dir, buf bhd, const char *bdt_path,
                   east ? "east" : "west", nn, own, an, copied, pair_b()->name, pair_a()->of);
     return ok;
 }
+static int write_msb(const char *name, buf m) {
+    char to[1300];
+    buf d = m.p ? dcx_write(m) : m;
+    snprintf(to, sizeof to, "%s" SEP "work" SEP "build" SEP "map" SEP "mapstudio" SEP "%s.msb.dcx", g_app, name);
+    make_parents(to);
+    int ok = d.p && write_file(to, d.p, d.n);
+    free(d.p);
+    return ok;
+}
+// The woods objects (see msb_entity): into the four variant-3 tile files, out of the woods' own east half (Frozen
+// Thicket's; Ash and Rot's composed half leaves them out in msb_compose).
+static int build_woods_objects(const char *game_dir, buf bhd, const char *bdt_path) {
+    char from[300], nm[64];
+    snprintf(from, sizeof from, "/map/mapstudio/m60_11_09_32.msb.dcx");
+    buf hz = archive_read(bhd, bdt_path, from), h = hz.p ? dcx_read(game_dir, hz) : hz;
+    msb_file H;
+    int ok = h.p && msb_parse(h, &H) && H.nl == 6, parts = 0, events = 0;
+    for (int t = 0; ok && t < 4; t++) {
+        int x = 44 + t / 2, z = 36 + t % 2;
+        snprintf(nm, sizeof nm, "m60_%d_%d_30", x, z);
+        snprintf(from, sizeof from, "/map/mapstudio/%s.msb.dcx", nm);
+        buf tz = archive_read(bhd, bdt_path, from), td = tz.p ? dcx_read(game_dir, tz) : tz;
+        buf m = td.p ? msb_tile_with(td, &H, x, z, &parts, &events) : td;
+        ok = m.p && write_msb(nm, m);
+        free(m.p), free(td.p), free(tz.p);
+    }
+    if (ok) {  // the woods' own east half without them (5 = parts, 1 = events)
+        msb_file M;
+        memcpy(&M, &H, sizeof M);
+        buf *p = xalloc(sizeof(buf) * (H.l[5].n + 1)), *e = xalloc(sizeof(buf) * (H.l[1].n + 1));
+        int np = 0, ne = 0, left = 0;
+        for (int i = 0; i < H.l[5].n; i++) if (!woods_moved_part(H.l[5].e[i])) p[np++] = H.l[5].e[i];
+        // part indices of the parts that stay: events (treasure +8 / ObjAct +4) and assets' own index fields
+        int *ni = xalloc(sizeof(int) * (H.l[5].n + 1));
+        for (int i = 0, k = 0; i < H.l[5].n; i++) ni[i] = woods_moved_part(H.l[5].e[i]) ? -1 : k++;
+        for (int i = 0; i < np; i++) {
+            p[i] = dup_buf(p[i]);
+            if (rd32(p[i].p + 0xc) != 13) continue;
+            u64 bo = rd64(p[i].p + 0x68);
+            for (int o = 0x48; o <= 0x54; o += 4)
+                if (o != 0x50 && bo + o + 4 <= p[i].n && (int)rd32(p[i].p + bo + o) >= 0) wr32(p[i].p + bo + o, (u32)i);
+        }
+        type_counter tc;
+        memset(&tc, 0, sizeof tc);
+        for (int i = 0; i < np; i++) wr32(p[i].p + 0x10, (u32)type_next(&tc, rd32(p[i].p + 0xc)));
+        for (int i = 0; i < H.l[1].n; i++) {
+            if (woods_moved_event(H.l[1].e[i])) continue;
+            buf ev = dup_buf(H.l[1].e[i]);
+            u32 et = rd32(ev.p + 0xc);
+            u64 to = rd64(ev.p + 0x20);
+            int fo = et == 4 ? 8 : et == 7 ? 4 : -1;
+            if (fo >= 0 && to + fo + 4 <= ev.n) {
+                int old = (int)rd32(ev.p + to + fo);
+                if (old >= 0 && old < H.l[5].n) wr32(ev.p + to + fo, (u32)ni[old]), left += ni[old] < 0;
+            }
+            e[ne++] = ev;
+        }
+        memset(&tc, 0, sizeof tc);
+        for (int i = 0; i < ne; i++) wr32(e[i].p + 0x10, (u32)type_next(&tc, rd32(e[i].p + 0xc)));
+        // models' use counts
+        int nmod = H.l[0].n;
+        buf *mo = xalloc(sizeof(buf) * (nmod + 1));
+        for (int k = 0; k < nmod; k++) mo[k] = dup_buf(H.l[0].e[k]), wr32(mo[k].p + 0x18, 0);
+        for (int i = 0; i < np; i++) { int mi = (int)rd32(p[i].p + 0x14); if (mi >= 0 && mi < nmod) wr32(mo[mi].p + 0x18, rd32(mo[mi].p + 0x18) + 1); }
+        M.l[0].e = mo, M.l[5].e = p, M.l[5].n = np, M.l[1].e = e, M.l[1].n = ne;
+        buf out = msb_write(&M);
+        ok = !left && write_msb("m60_11_09_32", out);
+        free(out.p);
+        logf_("pair: woods objects: %d parts and %d events moved from m60_11_09_32 into the tiles m60_44..45_36..37_30 (%d parts left in the half)%s",
+              parts, events, np, ok ? "" : "; FAILED");
+        ok = ok && parts == 9 && events == 2;
+    } else logf_("pair: woods objects: the woods tile files could not be built");
+    free(h.p), free(hz.p);
+    return ok;
+}
 static int build_pair_halves(const char *game_dir) {
     char bhd_path[1100], bdt_path[1100];
     snprintf(bhd_path, sizeof bhd_path, "%s" SEP "data2.bhd", game_dir);
@@ -2973,8 +3180,8 @@ static int build_pair_halves(const char *game_dir) {
     free(enc.p);
     rsa_use(DATA0_N, DATA0_E);
     if (!bhd.p || memcmp(bhd.p, "BHD5", 4)) return logf_("pair: data2 could not be read"), 0;
-    int ok = 1;
-    for (g_pair = 0; g_pair < 4; g_pair++)
+    int ok = build_woods_objects(game_dir, bhd, bdt_path);
+    for (g_pair = 0; ok && g_pair < 4; g_pair++)
         for (int east = 0; ok && east < 2; east++)
             if (two_pair()->halves >> east & 1) ok = compose_one_half(game_dir, bhd, bdt_path, east);
     free(bhd.p);
@@ -3341,10 +3548,23 @@ static const u32 FIRE_807800[][3] = {
     {0x4570, 0x3f09898a, 0x3f0fc6f9}, {0x4574, 0x3f6bebec, 0x3e835f6c}, {0x4814, 0x3e4ccccd, 0x3f800000}, {0x4818, 0x3e4ccccd, 0x3f25e354},
     {0x481c, 0x3f800000, 0x3d23d70b}, {0x4910, 0x3d20a0a1, 0x3e48c8c9}, {0x4914, 0x3d20a0a1, 0x3d6604bd}, {0x4918, 0x3e48c8c9, 0x3c008081},
 };
+// The fog after the day-1 night boss (common.emevd ev 1103: 7503 + 20 s -> 7520, SFX 807070 on the player, then the
+// clock to morning) is grey 0.753 (both smoke emitters' colour keyframes). It takes the colour of the rain outside the
+// circle (807400-807425, our no-rain removes it: 0.871 0.933 1.0, grey textures), its brightest channel kept (blue
+// stays 0.753, red and green scaled).
+static const u32 FOG_807070[][3] = {
+    {0x4104, 0x3f40c0c1, 0x3f27cef6}, {0x4108, 0x3f40c0c1, 0x3f33e71b}, {0x4114, 0x3f40c0c1, 0x3f27cef6}, {0x4118, 0x3f40c0c1, 0x3f33e71b},
+    {0x4134, 0x3f40c0c1, 0x3f27cef6}, {0x4138, 0x3f40c0c1, 0x3f33e71b}, {0x4144, 0x3f40c0c1, 0x3f27cef6}, {0x4148, 0x3f40c0c1, 0x3f33e71b},
+    {0x4154, 0x3f40c0c1, 0x3f27cef6}, {0x4158, 0x3f40c0c1, 0x3f33e71b}, {0x4164, 0x3f40c0c1, 0x3f27cef6}, {0x4168, 0x3f40c0c1, 0x3f33e71b},
+    {0x4574, 0x3f40c0c1, 0x3f27cef6}, {0x4578, 0x3f40c0c1, 0x3f33e71b}, {0x4584, 0x3f40c0c1, 0x3f27cef6}, {0x4588, 0x3f40c0c1, 0x3f33e71b},
+    {0x45a4, 0x3f40c0c1, 0x3f27cef6}, {0x45a8, 0x3f40c0c1, 0x3f33e71b}, {0x45b4, 0x3f40c0c1, 0x3f27cef6}, {0x45b8, 0x3f40c0c1, 0x3f33e71b},
+    {0x45c4, 0x3f40c0c1, 0x3f27cef6}, {0x45c8, 0x3f40c0c1, 0x3f33e71b}, {0x45d4, 0x3f40c0c1, 0x3f27cef6}, {0x45d8, 0x3f40c0c1, 0x3f33e71b},
+};
 static void build_fire_ring(const char *game_dir, buf bhd, const char *bdt) {
     static const struct { const char *name; const u32 (*w)[3]; int n; } FX[] = {
         {"\\f000807011.fxr", FIRE_807011, sizeof FIRE_807011 / sizeof *FIRE_807011},
-        {"\\f000807800.fxr", FIRE_807800, sizeof FIRE_807800 / sizeof *FIRE_807800}};
+        {"\\f000807800.fxr", FIRE_807800, sizeof FIRE_807800 / sizeof *FIRE_807800},
+        {"\\f000807070.fxr", FOG_807070, sizeof FOG_807070 / sizeof *FOG_807070}};
     char path[1300];
     snprintf(path, sizeof path, "%s" SEP "work" SEP "build" SEP "sfx" SEP "sfxbnd_commoneffects.ffxbnd.dcx", g_app);
     remove(path);  // the last build's, in case nothing is changed this time
@@ -3358,14 +3578,14 @@ static void build_fire_ring(const char *game_dir, buf bhd, const char *bdt) {
         for (int j = 0; ok && j < FX[k].n; j++) ok = FX[k].w[j][0] + 4 <= f.n && rd32(f.p + FX[k].w[j][0]) == FX[k].w[j][1];
         for (int j = 0; ok && j < FX[k].n; j++) wr32(f.p + FX[k].w[j][0], FX[k].w[j][2]);
         if (ok) done++;
-        else logf_("Fire ring: %s not as expected (game update?), left blue", FX[k].name + 1);
+        else logf_("Fire ring: %s not as expected (game update?), left as in the game", FX[k].name + 1);
     }
-    if (!bnd.p) logf_("Fire ring: the game's common effects not found, left blue");
+    if (!bnd.p) logf_("Fire ring: the game's common effects not found, left as in the game");
     if (done) {
         buf out = dcx_write(bnd);
         free(bnd.p), bnd.p = NULL;  // the unpacked archive is large (316 MB)
         int written = write_file(path, out.p, out.n);
-        logf_("Fire ring: %d of 2 effects recoloured (%zu bytes)%s", done, out.n, written ? "" : ", file NOT written");
+        logf_("Fire ring and fog: %d of 3 effects recoloured (%zu bytes)%s", done, out.n, written ? "" : ", file NOT written");
         free(out.p);
     }
     free(bnd.p);
