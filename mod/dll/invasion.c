@@ -2368,6 +2368,13 @@ static void summon_at_host_install(void);
 static void flag_note(char *man, unsigned id, int on, int before) {
     (void)man;
     if (on && before == 0 && id >= 10000000u && boss_death(id)) df_kill(id);
+    // the night bosses' and the final boss's ends, always logged: 7502 / 7507 "night boss of day 1 / 2 beaten"
+    // (EventFlag.txt; set by 90065900 or common 1190 / 1191 at any 4xxx0800 / 4xxx0850 of the night bosses' small maps);
+    // the final boss: a boss-family flag (nnn 800..899, d 0) of its small maps m16 / m18 / m19 (ev 12002001 moves the
+    // players there by the targeted Nightlord)
+    if (on && before == 0 && (id == 7502 || id == 7507)) logf("day flow: the night boss of day %d is beaten (flag %u)", id == 7502 ? 1 : 2, id);
+    if (on && before != 1 && id >= 16000000u && id < 20000000u && id / 1000000 != 17 && id % 1000 >= 800 && id % 1000 < 900 && id / 1000 % 10 == 0)
+        logf("day flow: a boss of the final boss maps is dead: boss-family flag %u (small map m%u_%02u)", id, id / 1000000, id / 10000 % 100);
     if (!setting(S_FLAG_LOG)) {
         // always (boss-grace check): a boss-family flag (nnn 800..899 in a block with d = 0, the d digit being
         // (id / 1000) % 10 in tile ids 10XXYYdnnn / 10XYVddnnn and small-map ids) turned on, or dropped for want of a
@@ -2921,6 +2928,54 @@ static unsigned *variant_hook(unsigned *out, unsigned *id, unsigned long long mo
         variant_set(out, top | (unsigned)(6 + g_pair) << 4 | 2, "composed half (lod2)", x, z);
     return out;
 }
+// Small bases and their lod-2 tile (pair maps). The insert 0x1406427b0 (only from 0x140628ab2, a field tile's MSB pass)
+// files each small base in its grid area's multimap (+0xd0) under the tile's key lifted to lod 2 with the TILE's variant
+// (deck-now3, Ash and Rot 0.2.8: woods small maps m46_53 / 56 / 63 / 67 / 68 under 3c0b0932). Everything after that is by
+// key, from the lod-2 tile whose block key it is (CS::WorldBlockResBase::Update 0x140627e60: state 3 waits 0x1406457f0,
+// state 7 0x140645690, state 9 places them with 0x140642220; 0x140627c40 enables / disables them by key, 0x140645db0 erases
+// them at its unload). On the game's maps a cell's tiles have its lod-2 tile's variant; on a pair's map they do not (Ash
+// and Rot's east half is variant 2, its woods tiles 3; the composed halves are 6 + pair), so those small bases had no tile
+// to place them: no woods boss on Ash and Rot ever, while Frozen Thicket (east half variant 3) had them. Here the new
+// entry's key gets the variant the cell's lod-2 tile is loaded with (the game's choice through variant_hook). In the
+// multimap only lod-2 keys occur and a cell's keys differ only in the variant nibble, so the rewritten key keeps the order.
+static unsigned long long sb_insert_hook(unsigned long long a1, unsigned long long a2, unsigned long long a3, unsigned long long a4,
+                                         unsigned long long a5, unsigned long long a6, unsigned long long a7, unsigned long long a8,
+                                         unsigned long long a9, unsigned long long a10, unsigned long long a11, unsigned long long a12,
+                                         unsigned long long a13, unsigned long long a14) {
+    typedef unsigned long long (*insert_t)(unsigned long long, unsigned long long, unsigned long long, unsigned long long, unsigned long long,
+                                           unsigned long long, unsigned long long, unsigned long long, unsigned long long, unsigned long long,
+                                           unsigned long long, unsigned long long, unsigned long long, unsigned long long);
+    unsigned long long r = ((insert_t)(g_base + 0x6427b0))(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+    char *ga = (char *)a1, *head = ga && !IsBadReadPtr(ga + 0xd0, 8) ? *(char **)(ga + 0xd0) : NULL;
+    if (!r || !g_two_active || g_pair < 0 || !head || IsBadReadPtr(head, 0x30)) return r;
+    static int logged;
+    int guard = 0;
+    for (char *n = *(char **)head; n && n != head && guard < 1024; guard++) {  // in order, from the leftmost
+        if (IsBadReadPtr(n, 0x30)) break;
+        if (*(unsigned long long *)(n + 0x28) == r) {
+            unsigned k = *(unsigned *)(n + 0x20), x = k >> 16 & 0xff, z = k >> 8 & 0xff;
+            if (k >> 24 != 60 || (k & 0xf) != 2 || z != 9 || (x != 10 && x != 11)) break;
+            unsigned id = k & ~0xf0u, out = id;
+            variant_hook(&out, &id, 0);
+            unsigned want = (k & ~0xf0u) | (out & 0xf0u);
+            if (want != k) {
+                *(unsigned *)(n + 0x20) = want;
+                if (logged++ < 40) logf("small-base registry: small base %08x filed under %08x, the cell's lod-2 tile (was %08x, its tile's variant)",
+                                        *(char **)r && !IsBadReadPtr(*(char **)r + 8, 4) ? *(unsigned *)(*(char **)r + 8) : 0, want, k);
+            }
+            break;
+        }
+        if (*(char *)(*(char **)(n + 0x10) + 0x19) == 0) {
+            n = *(char **)(n + 0x10);
+            while (*(char *)(*(char **)n + 0x19) == 0) n = *(char **)n;
+        } else {
+            char *p = *(char **)(n + 8);
+            while (*(char *)(p + 0x19) == 0 && n == *(char **)(p + 0x10)) n = p, p = *(char **)(p + 8);
+            n = p;
+        }
+    }
+    return r;
+}
 // No rain (fixed, every player): the raindrops outside the circle and the circle's wall are one effect, the
 // play-area effect (GPARAM group "PlayAreaEffect": RainDrop and Border fields, values in mapbase.gparam). The
 // render object CS::StageRend (0x3c22750 +0x10 -> 0xe15f20) draws it while its byte +0xc553 is 1; the circle
@@ -3347,6 +3402,7 @@ static void hook_acceptance(void) {
     hook_call(0xc27a41, 0x6b06f0, (void *)map_request_hook, "two-regions: map request");
     hook_call(0x5e7ff6, 0x6ab300, (void *)tile_flag_space_hook, "two-regions: tile flag space");
     hook_call(0x627dba, 0x645db0, (void *)sb_erase_hook, "two-regions: small-base erase");
+    hook_call(0x628ab2, 0x6427b0, (void *)sb_insert_hook, "two-regions: small-base insert");
     map_pack_install();
     for (unsigned i = 0; i < sizeof VARIANT_SITES / sizeof *VARIANT_SITES; i++)
         hook_call(VARIANT_SITES[i], 0x6ab7a0, (void *)variant_hook, "pair: per-tile variant");

@@ -39,7 +39,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 45
+#define BUILD_FORMAT 47
 #define BOSS_DEATHS_MIN 100  // the game (1.3.3) has 158 such flags; fewer = its event scripts changed
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
@@ -1829,6 +1829,15 @@ static buf map_test_table(buf src, int table, buf flags, buf points, int two) {
             int n_a = 0;
             for (u32 i = 0; i < rd16(p.p + 0x0A); i++) n_a += (int)rd32(p.p + rd64(p.p + 0x40 + i * 24 + 8) + 4) == STAGED + a_pat;
             ok = remove_pattern(&p, slot) && copy_pattern_rows(&p, STAGED + a_pat, slot, keep_a_base, &sets[pr]) > 0;
+            // the castle (attach point 190, small maps 4941 / 4942 / 4943): the region sources gave a night boss group's 5 slots
+            // of a pair few variants (Ash and Rot's group 5: 4941 x4 + 4943 x1; the base patterns 40g + 0..4 / 10..14 would
+            // still leave 2 of 3 in some groups), so slot i of the pair (0..4) gets variant i % 3: every group of every
+            // pair with a castle row has all three; maps without one (Noklateo's) keep none
+            int castle = 4941 + (slot % 40 - 20) % 5 % 3;
+            for (u32 i = 0; ok && i < rd16(p.p + 0x0A); i++) {
+                u8 *row = p.p + rd64(p.p + 0x40 + i * 24 + 8);
+                if ((int)rd32(row + 4) == slot && rd32(row + 8) == 190 && rd32(row + 0xc) >= 4941 && rd32(row + 0xc) <= 4943) wr32(row + 0xc, (u32)castle);
+            }
             memset(sets[pr].a_has, 0, sizeof sets[pr].a_has);
             for (u32 i = 0; i < rd16(p.p + 0x0A); i++) {
                 const u8 *row = p.p + rd64(p.p + 0x40 + i * 24 + 8);
@@ -1948,11 +1957,26 @@ static buf param_add_pattern_rows(buf p, const extra_row *extra, int n_extra) {
 //   area codes (LotResultSmallBaseAndSpot 0x18: +4 pattern, +8 attach point, +0xc small map, +0x10 instance).
 static const struct { int flag, modifier, map; } DF_KINDS[4] = {{8075, 604, 4678}, {8076, 603, 4552}, {8078, 601, 4553}, {8079, 602, 4555}};
 static const struct { int set, flag, flag2; } DF_FAMILIES[3] = {{3010, 7701, 7721}, {3030, 7704, 7724}, {3080, 7707, 7727}};
+// The variant a field tile's small bases match on map pr (audit 2026-11-22, a model, not read in the game's code: it gives
+// every vanilla row but the 94 on 44_37 / point 129): the tile loads the added region's variant on its tiles (the DLL's
+// tile hook), else the base region's if it has a file there (the Mountaintop only on X 42-43, the woods only on 44-45),
+// else the added region's, else 0; its small bases are those whose point (SmallBaseAndSpotAttachPoint +7) has that
+// variant on a tile with its own flag space (the base region's own terrain, 0x1406ab3c0, or the added region's tiles,
+// the DLL's flag-space hook), 0 elsewhere. A point of another variant is never placed on that map.
+static int tile_point_variant(int pr, int x, int z) {
+    if (pr < 0) return 0;
+    const region_t *a = TWO_PAIRS[pr].a, *b = TWO_PAIRS[pr].b;
+    int on_b = (x >= b->x0 && x <= b->x1 && z >= b->z0 && z <= b->z1) || (b == &R_NK && x == 44 && z == 37);
+    if (on_b) return b->kind;
+    int a_file = a == &R_MT ? x <= 43 : a == &R_RW ? x >= 44 : 1;
+    return a_file && x >= a->x0 && x <= a->x1 && z >= a->z0 && z <= a->z1 ? a->kind : 0;
+}
 static int point_outside_regions(buf points, int at, int pr) {  // pr -1: the base map, no region
     for (u32 i = 0; i < rd16(points.p + 0x0A); i++) {
         if ((int)rd32(points.p + 0x40 + i * 24) != at) continue;
         const u8 *r = points.p + rd64(points.p + 0x40 + i * 24 + 8);
         int code = (int)rd32(r + 0xc), area = r[4], x = r[5], z = r[6];
+        if (area == 60 && x >= 42 && x <= 45 && z >= 36 && z <= 39 && r[7] != tile_point_variant(pr, x, z)) return 0;
         const region_t *g[2] = {pr >= 0 ? TWO_PAIRS[pr].a : NULL, pr >= 0 ? TWO_PAIRS[pr].b : NULL};
         for (int k = 0; k < 2 && g[k]; k++)
             if (code == g[k]->area || (area == 60 && x >= g[k]->x0 && x <= g[k]->x1 && z >= g[k]->z0 && z <= g[k]->z1)) return 0;
@@ -2802,9 +2826,30 @@ static int msb_entity(buf e) {  // a part's entity id (+0x60: its entity block, 
     u64 o = e.n >= 0x68 ? rd64(e.p + 0x60) : 0;
     return o && o + 4 <= e.n ? (int)rd32(e.p + o) : 0;
 }
-static int woods_tile(int x, int z) { return x >= 44 && x <= 45 && z >= 36 && z <= 37; }
-static int woods_moved_part(buf e) { int x, z; return rd32(e.p + 0xc) == 13 && msb_entity(e) && msb_tile(e, &x, &z) && woods_tile(x, z); }
-static int woods_moved_event(buf e) { int x, z; return msb_tile(e, &x, &z) && woods_tile(x, z); }
+// The same for every region tile a pair map loads under another variant than its far half's (audit 2026-11-22: the
+// script-referenced entities of the far halves, e.g. the Mountaintop's sites 10x8101500.., the Crater's 1048201960 and its
+// buried chests, Noklateo's 10265015xx, lie only in the halves m60_10_09_V2 / m60_11_09_V2): City Beneath the Peak loads
+// the Mountaintop's (1) and Noklateo's (5) west tiles under the composed half 72, Fire over the City the Crater's (2) and
+// Noklateo's under 92 on both sides. The tile files are shared between the maps (_10: Frozen Thicket and City Beneath the
+// Peak, _20: Ash and Rot and Fire over the City, _50: City Beneath the Peak and Fire over the City), so a variant's objects
+// go into all of its tiles and out of every half (the natives' overrides and the composed ones). Characters in the halves
+// (the Mountaintop's c0100 / c5810 of the dragon chain 103910080x, Noklateo's c1000) stay: Frozen Thicket's dragon works
+// from its half, and a character far map part may need its far range (not moved, not known).
+static int msb_tile_variant(buf e) {  // the variant digit of the entry's tile prefix "m60_XX_ZZ_V0-", -1 if none
+    char nm[64];
+    int x, z, v;
+    msb_name(e, nm, sizeof nm);
+    return sscanf(nm, "m60_%2d_%2d_%1d0-", &x, &z, &v) == 3 ? v : -1;
+}
+static int region_moved_tile(int x, int z, int v) {
+    if (z < 36 || z > 39 || x < 42 || x > 45) return 0;
+    return v == 1 ? x <= 43 : v == 2 ? 1 : v == 3 ? x >= 44 && z <= 37 : v == 5 ? (x <= 43 && z <= 37) || x >= 44 : 0;
+}
+static int woods_moved_part(buf e) {
+    int x, z, v = msb_tile_variant(e);
+    return v > 0 && rd32(e.p + 0xc) == 13 && msb_entity(e) && msb_tile(e, &x, &z) && region_moved_tile(x, z, v);
+}
+static int woods_moved_event(buf e) { int x, z, v = msb_tile_variant(e); return v > 0 && msb_tile(e, &x, &z) && region_moved_tile(x, z, v); }
 // An entry with its name's tile prefix "m60_XX_ZZ_VV-" dropped (the tile files' own naming): the strings between the
 // name and the first data block are rebuilt (name, and for a part its sib path +0x18), 8-aligned, and every header
 // offset at or past that block moves with it. hdr: the header size (parts 0xc0, events 0x30).
@@ -2832,7 +2877,7 @@ static buf entry_unprefixed(buf e, u64 hdr) {
 // Tile file t (x, z) + the woods half's moved parts and events on that tile. Models: by name, new ones copied from the
 // half after the last of their type; parts after the last of their type (assets are last), own index fields; events
 // after the last of their type, their part index remapped, event number +8 past the tile's highest.
-static buf msb_tile_with(buf dt, const msb_file *H, int x, int z, int *moved_parts, int *moved_events) {
+static buf msb_tile_with(buf dt, const msb_file *H, int x, int z, int v, int *moved_parts, int *moved_events) {
     msb_file T, M;
     buf none = {0};
     if (!msb_parse(dt, &T) || T.nl != 6) return none;
@@ -2848,7 +2893,7 @@ static buf msb_tile_with(buf dt, const msb_file *H, int x, int z, int *moved_par
     for (int i = 0; i < hp; i++) new_index[i] = -1;
     for (int i = 0; i < hp && np < T.l[PARTS].n + cap; i++) {
         buf src = H->l[PARTS].e[i];
-        if (!woods_moved_part(src) || !msb_tile(src, &hx, &hz) || hx != x || hz != z) continue;
+        if (!woods_moved_part(src) || !msb_tile(src, &hx, &hz) || hx != x || hz != z || msb_tile_variant(src) != v) continue;
         int hm = (int)rd32(src.p + 0x14), mi = -1;
         if (hm < 0 || hm >= H->l[MODEL].n) return none;
         msb_name(H->l[MODEL].e[hm], a, sizeof a);
@@ -2863,7 +2908,13 @@ static buf msb_tile_with(buf dt, const msb_file *H, int x, int z, int *moved_par
             for (int k = 0; k < np; k++) if ((int)rd32(parts[k].p + 0x14) >= at) wr32(parts[k].p + 0x14, rd32(parts[k].p + 0x14) + 1);
         }
         buf e = entry_unprefixed(src, 0xc0);
-        float lx = rd_f32(e.p + 0x20) - (float)((x - 46) * 256 + 128), lz = rd_f32(e.p + 0x28) - (float)((z - 38) * 256 + 128);
+        msb_name(e, b, sizeof b);
+        for (int k = 0; k < np; k++) {  // a tile part of that name already: the prefixed name stays
+            char c[64];
+            msb_name(parts[k], c, sizeof c);
+            if (!strcmp(b, c)) { free(e.p), e = dup_buf(src); break; }
+        }
+        float lx = rd_f32(e.p + 0x20) - (float)((x - (x < 44 ? 42 : 46)) * 256 + 128), lz = rd_f32(e.p + 0x28) - (float)((z - 38) * 256 + 128);
         wr_f32(e.p + 0x20, lx), wr_f32(e.p + 0x28, lz);
         wr32(e.p + 0x14, (u32)mi), wr32(mod[mi].p + 0x18, rd32(mod[mi].p + 0x18) + 1);
         msb_name(e, b, sizeof b);
@@ -2873,7 +2924,7 @@ static buf msb_tile_with(buf dt, const msb_file *H, int x, int z, int *moved_par
     }
     for (int s = 0; s < H->l[EVENT].n && ne < T.l[EVENT].n + cap; s++) {
         buf src = H->l[EVENT].e[s];
-        if (!woods_moved_event(src) || !msb_tile(src, &hx, &hz) || hx != x || hz != z) continue;
+        if (!woods_moved_event(src) || !msb_tile(src, &hx, &hz) || hx != x || hz != z || msb_tile_variant(src) != v) continue;
         buf e = entry_unprefixed(src, 0x30);
         u32 et = rd32(e.p + 0xc);
         u64 to = rd64(e.p + 0x20);
@@ -2942,9 +2993,10 @@ static buf msb_compose(buf da, buf db, char names_b[][16], int *nb, int cap) {
     buf *parts = xalloc(sizeof(buf) * (pa + pb + 1));
     int *src_is_b = xalloc(sizeof(int) * (pa + pb + 1)), *src_i = xalloc(sizeof(int) * (pa + pb + 1));
     for (int i = 0; i < pa; i++)
-        if (!(msb_tile(A.l[PARTS].e[i], &x, &z) && pair_b_tile(x, z))) parts[np] = dup_buf(A.l[PARTS].e[i]), src_is_b[np] = 0, src_i[np++] = i;
+        if (!(msb_tile(A.l[PARTS].e[i], &x, &z) && pair_b_tile(x, z)) && !woods_moved_part(A.l[PARTS].e[i]))
+            parts[np] = dup_buf(A.l[PARTS].e[i]), src_is_b[np] = 0, src_i[np++] = i;
     for (int i = 0; i < pb; i++)
-        if (msb_tile(B.l[PARTS].e[i], &x, &z) && pair_b_tile(x, z) && !(pair_b() == &R_RW && woods_moved_part(B.l[PARTS].e[i])))
+        if (msb_tile(B.l[PARTS].e[i], &x, &z) && pair_b_tile(x, z) && !woods_moved_part(B.l[PARTS].e[i]))
             parts[np] = dup_buf(B.l[PARTS].e[i]), src_is_b[np] = 1, src_i[np++] = i;
     int *use = xalloc(sizeof(int) * (nm + 1));
     memset(use, 0, sizeof(int) * (nm + 1));
@@ -2984,7 +3036,7 @@ static buf msb_compose(buf da, buf db, char names_b[][16], int *nb, int cap) {
         const msb_file *S = s2 ? &B : &A;
         for (int i = 0; i < S->l[EVENT].n; i++) {
             int on_b = msb_tile(S->l[EVENT].e[i], &x, &z) && pair_b_tile(x, z);
-            if (on_b != s2 || (on_b && pair_b() == &R_RW && woods_moved_event(S->l[EVENT].e[i]))) continue;
+            if (on_b != s2 || woods_moved_event(S->l[EVENT].e[i])) continue;
             buf e = dup_buf(S->l[EVENT].e[i]);
             u32 et = rd32(e.p + 0xc);
             u64 to = e.n >= 0x30 ? rd64(e.p + 0x20) : 0;
@@ -3105,70 +3157,81 @@ static int write_msb(const char *name, buf m) {
     free(d.p);
     return ok;
 }
-// The woods objects (see msb_entity): into the four variant-3 tile files, out of the woods' own east half (Frozen
-// Thicket's; Ash and Rot's composed half leaves them out in msb_compose).
-static int build_woods_objects(const char *game_dir, buf bhd, const char *bdt_path) {
-    char from[300], nm[64];
-    snprintf(from, sizeof from, "/map/mapstudio/m60_11_09_32.msb.dcx");
-    buf hz = archive_read(bhd, bdt_path, from), h = hz.p ? dcx_read(game_dir, hz) : hz;
-    msb_file H;
-    int ok = h.p && msb_parse(h, &H) && H.nl == 6, parts = 0, events = 0;
-    for (int t = 0; ok && t < 4; t++) {
-        int x = 44 + t / 2, z = 36 + t % 2;
-        snprintf(nm, sizeof nm, "m60_%d_%d_30", x, z);
-        snprintf(from, sizeof from, "/map/mapstudio/%s.msb.dcx", nm);
-        buf tz = archive_read(bhd, bdt_path, from), td = tz.p ? dcx_read(game_dir, tz) : tz;
-        buf m = td.p ? msb_tile_with(td, &H, x, z, &parts, &events) : td;
-        ok = m.p && write_msb(nm, m);
-        free(m.p), free(td.p), free(tz.p);
+// The region objects (see msb_entity): into each region tile file, out of the region's own half (written again as an
+// override; the composed halves leave them out in msb_compose). The base map's files (_00 / _02) stay the game's.
+static int strip_half(const msb_file *H, const char *name, int *left_parts) {
+    msb_file M;
+    memcpy(&M, H, sizeof M);
+    buf *p = xalloc(sizeof(buf) * (H->l[5].n + 1)), *e = xalloc(sizeof(buf) * (H->l[1].n + 1));
+    int np = 0, ne = 0, left = 0;
+    int *ni = xalloc(sizeof(int) * (H->l[5].n + 1));
+    for (int i = 0; i < H->l[5].n; i++) if (!woods_moved_part(H->l[5].e[i])) p[np++] = H->l[5].e[i];
+    for (int i = 0, k = 0; i < H->l[5].n; i++) ni[i] = woods_moved_part(H->l[5].e[i]) ? -1 : k++;
+    for (int i = 0; i < np; i++) {  // part indices: assets' own index fields
+        p[i] = dup_buf(p[i]);
+        if (rd32(p[i].p + 0xc) != 13) continue;
+        u64 bo = rd64(p[i].p + 0x68);
+        for (int o = 0x48; o <= 0x54; o += 4)
+            if (o != 0x50 && bo + o + 4 <= p[i].n && (int)rd32(p[i].p + bo + o) >= 0) wr32(p[i].p + bo + o, (u32)i);
     }
-    if (ok) {  // the woods' own east half without them (5 = parts, 1 = events)
-        msb_file M;
-        memcpy(&M, &H, sizeof M);
-        buf *p = xalloc(sizeof(buf) * (H.l[5].n + 1)), *e = xalloc(sizeof(buf) * (H.l[1].n + 1));
-        int np = 0, ne = 0, left = 0;
-        for (int i = 0; i < H.l[5].n; i++) if (!woods_moved_part(H.l[5].e[i])) p[np++] = H.l[5].e[i];
-        // part indices of the parts that stay: events (treasure +8 / ObjAct +4) and assets' own index fields
-        int *ni = xalloc(sizeof(int) * (H.l[5].n + 1));
-        for (int i = 0, k = 0; i < H.l[5].n; i++) ni[i] = woods_moved_part(H.l[5].e[i]) ? -1 : k++;
-        for (int i = 0; i < np; i++) {
-            p[i] = dup_buf(p[i]);
-            if (rd32(p[i].p + 0xc) != 13) continue;
-            u64 bo = rd64(p[i].p + 0x68);
-            for (int o = 0x48; o <= 0x54; o += 4)
-                if (o != 0x50 && bo + o + 4 <= p[i].n && (int)rd32(p[i].p + bo + o) >= 0) wr32(p[i].p + bo + o, (u32)i);
+    type_counter tc;
+    memset(&tc, 0, sizeof tc);
+    for (int i = 0; i < np; i++) wr32(p[i].p + 0x10, (u32)type_next(&tc, rd32(p[i].p + 0xc)));
+    for (int i = 0; i < H->l[1].n; i++) {  // events that stay (treasure +8 / ObjAct +4 part index)
+        if (woods_moved_event(H->l[1].e[i])) continue;
+        buf ev = dup_buf(H->l[1].e[i]);
+        u32 et = rd32(ev.p + 0xc);
+        u64 to = rd64(ev.p + 0x20);
+        int fo = et == 4 ? 8 : et == 7 ? 4 : -1;
+        if (fo >= 0 && to + fo + 4 <= ev.n) {
+            int old = (int)rd32(ev.p + to + fo);
+            if (old >= 0 && old < H->l[5].n) wr32(ev.p + to + fo, (u32)ni[old]), left += ni[old] < 0;
         }
-        type_counter tc;
-        memset(&tc, 0, sizeof tc);
-        for (int i = 0; i < np; i++) wr32(p[i].p + 0x10, (u32)type_next(&tc, rd32(p[i].p + 0xc)));
-        for (int i = 0; i < H.l[1].n; i++) {
-            if (woods_moved_event(H.l[1].e[i])) continue;
-            buf ev = dup_buf(H.l[1].e[i]);
-            u32 et = rd32(ev.p + 0xc);
-            u64 to = rd64(ev.p + 0x20);
-            int fo = et == 4 ? 8 : et == 7 ? 4 : -1;
-            if (fo >= 0 && to + fo + 4 <= ev.n) {
-                int old = (int)rd32(ev.p + to + fo);
-                if (old >= 0 && old < H.l[5].n) wr32(ev.p + to + fo, (u32)ni[old]), left += ni[old] < 0;
-            }
-            e[ne++] = ev;
+        e[ne++] = ev;
+    }
+    memset(&tc, 0, sizeof tc);
+    for (int i = 0; i < ne; i++) wr32(e[i].p + 0x10, (u32)type_next(&tc, rd32(e[i].p + 0xc)));
+    int nmod = H->l[0].n;  // models' use counts
+    buf *mo = xalloc(sizeof(buf) * (nmod + 1));
+    for (int k = 0; k < nmod; k++) mo[k] = dup_buf(H->l[0].e[k]), wr32(mo[k].p + 0x18, 0);
+    for (int i = 0; i < np; i++) { int mi = (int)rd32(p[i].p + 0x14); if (mi >= 0 && mi < nmod) wr32(mo[mi].p + 0x18, rd32(mo[mi].p + 0x18) + 1); }
+    M.l[0].e = mo, M.l[5].e = p, M.l[5].n = np, M.l[1].e = e, M.l[1].n = ne;
+    buf out = msb_write(&M);
+    int ok = !left && write_msb(name, out);
+    free(out.p);
+    *left_parts = np;
+    return ok;
+}
+static int build_woods_objects(const char *game_dir, buf bhd, const char *bdt_path) {
+    static const int HALVES[6][2] = {{10, 1}, {10, 2}, {10, 5}, {11, 2}, {11, 3}, {11, 5}};
+    char from[300], nm[64], hn[64];
+    int ok = 1, all_parts = 0, all_events = 0, tiles = 0;
+    for (int h = 0; ok && h < 6; h++) {
+        int hx0 = HALVES[h][0] == 10 ? 42 : 44, v = HALVES[h][1], parts = 0, events = 0, left = 0;
+        snprintf(hn, sizeof hn, "m60_%d_09_%d2", HALVES[h][0], v);
+        snprintf(from, sizeof from, "/map/mapstudio/%s.msb.dcx", hn);
+        buf hz = archive_read(bhd, bdt_path, from), hd = hz.p ? dcx_read(game_dir, hz) : hz;
+        msb_file H;
+        ok = hd.p && msb_parse(hd, &H) && H.nl == 6;
+        for (int t = 0; ok && t < 8; t++) {
+            int x = hx0 + t / 4, z = 36 + t % 4;
+            if (!region_moved_tile(x, z, v)) continue;
+            snprintf(nm, sizeof nm, "m60_%d_%d_%d0", x, z, v);
+            snprintf(from, sizeof from, "/map/mapstudio/%s.msb.dcx", nm);
+            buf tz = archive_read(bhd, bdt_path, from), td = tz.p ? dcx_read(game_dir, tz) : tz;
+            int p0 = parts, e0 = events;
+            buf m = td.p ? msb_tile_with(td, &H, x, z, v, &parts, &events) : td;
+            if (m.p && (parts > p0 || events > e0)) ok = write_msb(nm, m), tiles++;  // a tile with nothing to take stays the game's
+            else ok = m.p != NULL;
+            free(m.p), free(td.p), free(tz.p);
         }
-        memset(&tc, 0, sizeof tc);
-        for (int i = 0; i < ne; i++) wr32(e[i].p + 0x10, (u32)type_next(&tc, rd32(e[i].p + 0xc)));
-        // models' use counts
-        int nmod = H.l[0].n;
-        buf *mo = xalloc(sizeof(buf) * (nmod + 1));
-        for (int k = 0; k < nmod; k++) mo[k] = dup_buf(H.l[0].e[k]), wr32(mo[k].p + 0x18, 0);
-        for (int i = 0; i < np; i++) { int mi = (int)rd32(p[i].p + 0x14); if (mi >= 0 && mi < nmod) wr32(mo[mi].p + 0x18, rd32(mo[mi].p + 0x18) + 1); }
-        M.l[0].e = mo, M.l[5].e = p, M.l[5].n = np, M.l[1].e = e, M.l[1].n = ne;
-        buf out = msb_write(&M);
-        ok = !left && write_msb("m60_11_09_32", out);
-        free(out.p);
-        logf_("pair: woods objects: %d parts and %d events moved from m60_11_09_32 into the tiles m60_44..45_36..37_30 (%d parts left in the half)%s",
-              parts, events, np, ok ? "" : "; FAILED");
-        ok = ok && parts == 9 && events == 2;
-    } else logf_("pair: woods objects: the woods tile files could not be built");
-    free(h.p), free(hz.p);
+        if (ok) ok = strip_half(&H, hn, &left);
+        logf_("pair: region objects: %d parts and %d events moved from %s into its tiles (%d parts left in the half)%s", parts, events, hn, left,
+              ok ? "" : "; FAILED");
+        all_parts += parts, all_events += events;
+        free(hd.p), free(hz.p);
+    }
+    if (ok) logf_("pair: region objects: %d parts and %d events in %d tile files", all_parts, all_events, tiles);
     return ok;
 }
 static int build_pair_halves(const char *game_dir) {
@@ -3549,16 +3612,19 @@ static const u32 FIRE_807800[][3] = {
     {0x481c, 0x3f800000, 0x3d23d70b}, {0x4910, 0x3d20a0a1, 0x3e48c8c9}, {0x4914, 0x3d20a0a1, 0x3d6604bd}, {0x4918, 0x3e48c8c9, 0x3c008081},
 };
 // The fog after the day-1 night boss (common.emevd ev 1103: 7503 + 20 s -> 7520, SFX 807070 on the player, then the
-// clock to morning) is grey 0.753 (both smoke emitters' colour keyframes). It takes the colour of the rain outside the
-// circle (807400-807425, our no-rain removes it: 0.871 0.933 1.0, grey textures), its brightest channel kept (blue
-// stays 0.753, red and green scaled).
+// clock to morning) is grey 0.753 (both smoke emitters' colour keyframes). It takes the hue of the rain outside the
+// circle (807400-807425, our no-rain removes it: 0.871 0.933 1.0, grey textures, hue ~211 degrees), made bluer for
+// the owner (saturation 0.35, blue 0.80): 0.52 0.654 0.80; alpha keyframes unchanged.
 static const u32 FOG_807070[][3] = {
-    {0x4104, 0x3f40c0c1, 0x3f27cef6}, {0x4108, 0x3f40c0c1, 0x3f33e71b}, {0x4114, 0x3f40c0c1, 0x3f27cef6}, {0x4118, 0x3f40c0c1, 0x3f33e71b},
-    {0x4134, 0x3f40c0c1, 0x3f27cef6}, {0x4138, 0x3f40c0c1, 0x3f33e71b}, {0x4144, 0x3f40c0c1, 0x3f27cef6}, {0x4148, 0x3f40c0c1, 0x3f33e71b},
-    {0x4154, 0x3f40c0c1, 0x3f27cef6}, {0x4158, 0x3f40c0c1, 0x3f33e71b}, {0x4164, 0x3f40c0c1, 0x3f27cef6}, {0x4168, 0x3f40c0c1, 0x3f33e71b},
-    {0x4574, 0x3f40c0c1, 0x3f27cef6}, {0x4578, 0x3f40c0c1, 0x3f33e71b}, {0x4584, 0x3f40c0c1, 0x3f27cef6}, {0x4588, 0x3f40c0c1, 0x3f33e71b},
-    {0x45a4, 0x3f40c0c1, 0x3f27cef6}, {0x45a8, 0x3f40c0c1, 0x3f33e71b}, {0x45b4, 0x3f40c0c1, 0x3f27cef6}, {0x45b8, 0x3f40c0c1, 0x3f33e71b},
-    {0x45c4, 0x3f40c0c1, 0x3f27cef6}, {0x45c8, 0x3f40c0c1, 0x3f33e71b}, {0x45d4, 0x3f40c0c1, 0x3f27cef6}, {0x45d8, 0x3f40c0c1, 0x3f33e71b},
+    {0x4104, 0x3f40c0c1, 0x3f051eb8}, {0x4108, 0x3f40c0c1, 0x3f276c8b}, {0x410c, 0x3f40c0c1, 0x3f4ccccd}, {0x4114, 0x3f40c0c1, 0x3f051eb8},
+    {0x4118, 0x3f40c0c1, 0x3f276c8b}, {0x411c, 0x3f40c0c1, 0x3f4ccccd}, {0x4134, 0x3f40c0c1, 0x3f051eb8}, {0x4138, 0x3f40c0c1, 0x3f276c8b},
+    {0x413c, 0x3f40c0c1, 0x3f4ccccd}, {0x4144, 0x3f40c0c1, 0x3f051eb8}, {0x4148, 0x3f40c0c1, 0x3f276c8b}, {0x414c, 0x3f40c0c1, 0x3f4ccccd},
+    {0x4154, 0x3f40c0c1, 0x3f051eb8}, {0x4158, 0x3f40c0c1, 0x3f276c8b}, {0x415c, 0x3f40c0c1, 0x3f4ccccd}, {0x4164, 0x3f40c0c1, 0x3f051eb8},
+    {0x4168, 0x3f40c0c1, 0x3f276c8b}, {0x416c, 0x3f40c0c1, 0x3f4ccccd}, {0x4574, 0x3f40c0c1, 0x3f051eb8}, {0x4578, 0x3f40c0c1, 0x3f276c8b},
+    {0x457c, 0x3f40c0c1, 0x3f4ccccd}, {0x4584, 0x3f40c0c1, 0x3f051eb8}, {0x4588, 0x3f40c0c1, 0x3f276c8b}, {0x458c, 0x3f40c0c1, 0x3f4ccccd},
+    {0x45a4, 0x3f40c0c1, 0x3f051eb8}, {0x45a8, 0x3f40c0c1, 0x3f276c8b}, {0x45ac, 0x3f40c0c1, 0x3f4ccccd}, {0x45b4, 0x3f40c0c1, 0x3f051eb8},
+    {0x45b8, 0x3f40c0c1, 0x3f276c8b}, {0x45bc, 0x3f40c0c1, 0x3f4ccccd}, {0x45c4, 0x3f40c0c1, 0x3f051eb8}, {0x45c8, 0x3f40c0c1, 0x3f276c8b},
+    {0x45cc, 0x3f40c0c1, 0x3f4ccccd}, {0x45d4, 0x3f40c0c1, 0x3f051eb8}, {0x45d8, 0x3f40c0c1, 0x3f276c8b}, {0x45dc, 0x3f40c0c1, 0x3f4ccccd},
 };
 static void build_fire_ring(const char *game_dir, buf bhd, const char *bdt) {
     static const struct { const char *name; const u32 (*w)[3]; int n; } FX[] = {
