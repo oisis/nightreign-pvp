@@ -41,9 +41,9 @@ void core_save_lang(const char *code);
 int core_load_debug(void);
 void core_save_debug(int on);
 // Voice chat, from the window's Settings: <app>/voice-settings.toml (the DLL's voice, voice-key, voice-team-key,
-// voice-range, voice-volume, voice-mute). core_load_voice gives the defaults when there is no file (returns 0 then).
+// voice-range, voice-volume, voice-level, voice-duck, voice-duck-amount, voice-mute). core_load_voice gives the defaults when there is no file (returns 0 then).
 // Keys are Windows virtual-key codes. Applies from the next "Play with the mod".
-typedef struct { int on, key, team_key, range, volume; char mute[256]; } core_voice;
+typedef struct { int on, key, team_key, range, volume, level, duck, duck_amount; char mute[256]; } core_voice;
 int core_load_voice(core_voice *v);
 void core_save_voice(const core_voice *v);
 // Build the mod's files from the player's own game files into <app>/work/build and write the

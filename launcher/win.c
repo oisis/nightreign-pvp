@@ -7,7 +7,7 @@
 #include <string.h>
 
 enum { ID_FOLDER = 100, ID_BROWSE, ID_PLAY, ID_UNINSTALL, ID_LOG, ID_CLOSE, ID_BACKUP, ID_HELP, ID_LANG, ID_LANG_LABEL, ID_DEBUG, ID_SETTINGS,
-       ID_S_DEBUG = 200, ID_S_OK, ID_S_CANCEL, ID_S_VOICE, ID_S_KEY, ID_S_TEAM, ID_S_RANGE, ID_S_VOLUME, ID_S_MUTE };
+       ID_S_DEBUG = 200, ID_S_OK, ID_S_CANCEL, ID_S_VOICE, ID_S_KEY, ID_S_TEAM, ID_S_RANGE, ID_S_VOLUME, ID_S_MUTE, ID_S_LEVEL, ID_S_DUCK, ID_S_DUCK_AMOUNT };
 static const char *const *T = UI_TEXT[L_EN];
 static HWND g_window, g_folder, g_log;
 
@@ -99,7 +99,10 @@ static LRESULT CALLBACK set_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         v.on = SendMessageW(GetDlgItem(w, ID_S_VOICE), BM_GETCHECK, 0, 0) == BST_CHECKED;
         v.key = VOICE_KEYS[k >= 0 && k < VOICE_KEY_COUNT ? k : 0].vk, v.team_key = VOICE_KEYS[tk >= 0 && tk < VOICE_KEY_COUNT ? tk : 0].vk;
         v.range = (int)GetDlgItemInt(w, ID_S_RANGE, NULL, FALSE), v.volume = (int)GetDlgItemInt(w, ID_S_VOLUME, NULL, FALSE);
-        v.range = v.range < 5 ? 5 : v.range > 999 ? 999 : v.range, v.volume = v.volume > 200 ? 200 : v.volume;
+        v.range = v.range < 5 ? 5 : v.range > 999 ? 999 : v.range, v.volume = v.volume > 100 ? 100 : v.volume;
+        v.level = VOICE_LEVELS[SendMessageW(GetDlgItem(w, ID_S_LEVEL), CB_GETCURSEL, 0, 0) == 1];
+        v.duck = SendMessageW(GetDlgItem(w, ID_S_DUCK), BM_GETCHECK, 0, 0) == BST_CHECKED;
+        v.duck_amount = (int)GetDlgItemInt(w, ID_S_DUCK_AMOUNT, NULL, FALSE), v.duck_amount = v.duck_amount > 90 ? 90 : v.duck_amount;
         GetDlgItemTextW(w, ID_S_MUTE, t, 256);
         if (!WideCharToMultiByte(CP_UTF8, 0, t, -1, v.mute, sizeof v.mute, NULL, NULL)) v.mute[0] = 0;
         core_save_voice(&v);
@@ -125,14 +128,15 @@ static void settings(void) {
     RECT r;
     GetWindowRect(g_window, &r);
     g_set_win = CreateWindowW(L"NightreignInvasionsSettings", wide(T[T_SETTINGS]), WS_CAPTION | WS_SYSMENU | WS_POPUP, r.left + 60,
-                              r.top + 60, 560, 350, g_window, NULL, GetModuleHandleW(NULL), NULL);
+                              r.top + 60, 560, 446, g_window, NULL, GetModuleHandleW(NULL), NULL);
     HWND debug = set_child(L"BUTTON", T[T_DEBUG_LOG], BS_AUTOCHECKBOX, ID_S_DEBUG, 12, 14, 520, 22);
     SendMessageW(debug, BM_SETCHECK, core_load_debug() ? BST_CHECKED : BST_UNCHECKED, 0);
     core_voice v;
     core_load_voice(&v);
     HWND voice = set_child(L"BUTTON", T[T_VOICE], BS_AUTOCHECKBOX, ID_S_VOICE, 12, 48, 520, 22);
     SendMessageW(voice, BM_SETCHECK, v.on ? BST_CHECKED : BST_UNCHECKED, 0);
-    for (int i = 0; i < 5; i++) set_child(L"STATIC", T[T_VOICE_KEY + i], 0, 0, 12, 82 + i * 32, i == 4 ? 520 : 300, 20);
+    static const int label[7] = {T_VOICE_KEY, T_VOICE_TEAM_KEY, T_VOICE_RANGE, T_VOICE_VOLUME, T_VOICE_LEVEL, T_VOICE_DUCK_AMOUNT, T_VOICE_MUTE};
+    for (int i = 0; i < 7; i++) set_child(L"STATIC", T[label[i]], 0, 0, 12, 82 + (i + (i >= 5)) * 32, i == 6 ? 520 : 300, 20);  // row 5: the box
     for (int k = 0; k < 2; k++) {
         HWND c = set_child(L"COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL, k ? ID_S_TEAM : ID_S_KEY, 320, 78 + k * 32, 210, 300);
         for (int i = 0; i < VOICE_KEY_COUNT; i++) SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)wide(VOICE_KEYS[i].name));
@@ -141,11 +145,18 @@ static void settings(void) {
     char num[16];
     snprintf(num, sizeof num, "%d", v.range);
     set_child(L"EDIT", num, ES_NUMBER | WS_BORDER, ID_S_RANGE, 320, 142, 80, 22);
-    snprintf(num, sizeof num, "%d", v.volume);
+    snprintf(num, sizeof num, "%d", v.volume > 100 ? 100 : v.volume);
     set_child(L"EDIT", num, ES_NUMBER | WS_BORDER, ID_S_VOLUME, 320, 174, 80, 22);
-    set_child(L"EDIT", v.mute, ES_AUTOHSCROLL | WS_BORDER, ID_S_MUTE, 12, 232, 520, 22);
-    set_child(L"BUTTON", "OK", BS_DEFPUSHBUTTON, ID_S_OK, 330, 266, 95, 28);
-    set_child(L"BUTTON", T[T_CLOSE], BS_PUSHBUTTON, ID_S_CANCEL, 435, 266, 95, 28);
+    HWND level = set_child(L"COMBOBOX", "", CBS_DROPDOWNLIST, ID_S_LEVEL, 320, 206, 210, 100);
+    SendMessageW(level, CB_ADDSTRING, 0, (LPARAM)wide(T[T_VOICE_NORMAL])), SendMessageW(level, CB_ADDSTRING, 0, (LPARAM)wide(T[T_VOICE_LOUD]));
+    SendMessageW(level, CB_SETCURSEL, voice_level_index(v.level), 0);
+    HWND duck = set_child(L"BUTTON", T[T_VOICE_DUCK], BS_AUTOCHECKBOX, ID_S_DUCK, 12, 238, 520, 22);
+    SendMessageW(duck, BM_SETCHECK, v.duck ? BST_CHECKED : BST_UNCHECKED, 0);
+    snprintf(num, sizeof num, "%d", v.duck_amount > 90 ? 90 : v.duck_amount);
+    set_child(L"EDIT", num, ES_NUMBER | WS_BORDER, ID_S_DUCK_AMOUNT, 320, 270, 80, 22);
+    set_child(L"EDIT", v.mute, ES_AUTOHSCROLL | WS_BORDER, ID_S_MUTE, 12, 328, 520, 22);
+    set_child(L"BUTTON", "OK", BS_DEFPUSHBUTTON, ID_S_OK, 330, 362, 95, 28);
+    set_child(L"BUTTON", T[T_CLOSE], BS_PUSHBUTTON, ID_S_CANCEL, 435, 362, 95, 28);
     EnableWindow(g_window, FALSE);
     ShowWindow(g_set_win, SW_SHOW);
 }

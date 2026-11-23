@@ -98,7 +98,8 @@ static void on_settings(GtkButton *b, gpointer u) {
     // voice chat
     core_voice v;
     core_load_voice(&v);
-    GtkWidget *voice = gtk_check_button_new_with_label(T[T_VOICE]), *form = gtk_grid_new(), *key[2], *range, *volume, *mute;
+    GtkWidget *voice = gtk_check_button_new_with_label(T[T_VOICE]), *form = gtk_grid_new(), *key[2], *range, *volume, *mute, *level, *amount;
+    GtkWidget *duck = gtk_check_button_new_with_label(T[T_VOICE_DUCK]);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(voice), v.on);
     gtk_box_pack_start(GTK_BOX(grid), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(grid), voice, FALSE, FALSE, 0);
@@ -108,12 +109,22 @@ static void on_settings(GtkButton *b, gpointer u) {
         for (int i = 0; i < VOICE_KEY_COUNT; i++) gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(key[k]), VOICE_KEYS[i].name);
         gtk_combo_box_set_active(GTK_COMBO_BOX(key[k]), voice_key_index(k ? v.team_key : v.key));
     }
-    range = gtk_spin_button_new_with_range(5, 999, 1), volume = gtk_spin_button_new_with_range(0, 200, 5), mute = gtk_entry_new();
+    range = gtk_spin_button_new_with_range(5, 999, 1), volume = gtk_spin_button_new_with_range(0, 100, 5), mute = gtk_entry_new();
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(range), v.range), gtk_spin_button_set_value(GTK_SPIN_BUTTON(volume), v.volume);
     gtk_entry_set_text(GTK_ENTRY(mute), v.mute), gtk_entry_set_max_length(GTK_ENTRY(mute), sizeof v.mute - 1);
-    GtkWidget *rows[5] = {key[0], key[1], range, volume, mute};
-    for (int i = 0; i < 5; i++) {
-        GtkWidget *l = gtk_label_new(T[T_VOICE_KEY + i]);
+    level = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(level), T[T_VOICE_NORMAL]), gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(level), T[T_VOICE_LOUD]);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(level), voice_level_index(v.level));
+    amount = gtk_spin_button_new_with_range(0, 90, 5), gtk_spin_button_set_value(GTK_SPIN_BUTTON(amount), v.duck_amount);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(duck), v.duck);
+    GtkWidget *rows[8] = {key[0], key[1], range, volume, level, NULL, amount, mute};
+    static const int label[8] = {T_VOICE_KEY, T_VOICE_TEAM_KEY, T_VOICE_RANGE, T_VOICE_VOLUME, T_VOICE_LEVEL, T_VOICE_DUCK, T_VOICE_DUCK_AMOUNT, T_VOICE_MUTE};
+    for (int i = 0; i < 8; i++) {
+        if (!rows[i]) {  // the ducking box: a whole row
+            gtk_grid_attach(GTK_GRID(form), duck, 0, i, 2, 1);
+            continue;
+        }
+        GtkWidget *l = gtk_label_new(T[label[i]]);
         gtk_label_set_xalign(GTK_LABEL(l), 0);
         gtk_grid_attach(GTK_GRID(form), l, 0, i, 1, 1), gtk_grid_attach(GTK_GRID(form), rows[i], 1, i, 1, 1);
         gtk_widget_set_hexpand(rows[i], TRUE);
@@ -127,6 +138,8 @@ static void on_settings(GtkButton *b, gpointer u) {
         v.key = VOICE_KEYS[gtk_combo_box_get_active(GTK_COMBO_BOX(key[0])) < 0 ? 0 : gtk_combo_box_get_active(GTK_COMBO_BOX(key[0]))].vk;
         v.team_key = VOICE_KEYS[gtk_combo_box_get_active(GTK_COMBO_BOX(key[1])) < 0 ? 0 : gtk_combo_box_get_active(GTK_COMBO_BOX(key[1]))].vk;
         v.range = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(range)), v.volume = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(volume));
+        v.level = VOICE_LEVELS[gtk_combo_box_get_active(GTK_COMBO_BOX(level)) == 1];
+        v.duck = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(duck)), v.duck_amount = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(amount));
         snprintf(v.mute, sizeof v.mute, "%s", gtk_entry_get_text(GTK_ENTRY(mute)));
         core_save_voice(&v);
     }

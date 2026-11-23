@@ -11,7 +11,8 @@ static const char *const LANG_NAME[LANG_COUNT] = {"English", "Polski", "Deutsch"
 
 enum { T_TITLE, T_GAME_FOLDER, T_BROWSE, T_PLAY, T_BACKUP, T_HELP, T_UNINSTALL, T_CLOSE, T_LANGUAGE, T_NOT_FOUND,
        T_FOUND, T_PICK, T_BAD_FOLDER, T_CONFIRM_UNINSTALL, T_NO_SAVE, T_BACKUP_DONE, T_BACKUP_FAILED, T_HELP_TEXT,
-       T_DEBUG_LOG, T_SETTINGS, T_VOICE, T_VOICE_KEY, T_VOICE_TEAM_KEY, T_VOICE_RANGE, T_VOICE_VOLUME, T_VOICE_MUTE, T_COUNT };
+       T_DEBUG_LOG, T_SETTINGS, T_VOICE, T_VOICE_KEY, T_VOICE_TEAM_KEY, T_VOICE_RANGE, T_VOICE_VOLUME, T_VOICE_MUTE,
+       T_VOICE_LEVEL, T_VOICE_NORMAL, T_VOICE_LOUD, T_VOICE_DUCK, T_VOICE_DUCK_AMOUNT, T_COUNT };
 
 static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
     [L_EN] = {
@@ -54,6 +55,11 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "Range in metres:",
         "Volume in %:",
         "Muted players (Steam names or ids, separated by commas):",
+        "Voice level:",
+        "Normal",
+        "Loud",
+        "Lower the game's sound while someone speaks",
+        "Lower the game's sound by %:",
     },
     [L_PL] = {
         "Nightreign Invasions " MOD_VERSION,
@@ -95,6 +101,11 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "Zasięg w metrach:",
         "Głośność w %:",
         "Wyciszeni gracze (nazwy Steam lub id, oddzielone przecinkami):",
+        "Poziom głosu:",
+        "Normalny",
+        "Głośny",
+        "Ściszaj dźwięk gry, gdy ktoś mówi",
+        "Ściszenie dźwięku gry w %:",
     },
     [L_DE] = {
         "Nightreign Invasions " MOD_VERSION,
@@ -139,6 +150,11 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "Reichweite in Metern:",
         "Lautstärke in %:",
         "Stummgeschaltete Spieler (Steam-Namen oder IDs, durch Kommas getrennt):",
+        "Stimmpegel:",
+        "Normal",
+        "Laut",
+        "Spielton leiser, während jemand spricht",
+        "Spielton leiser um %:",
     },
     [L_FR] = {
         "Nightreign Invasions " MOD_VERSION,
@@ -184,6 +200,11 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "Portée en mètres :",
         "Volume en % :",
         "Joueurs rendus muets (noms Steam ou identifiants, séparés par des virgules) :",
+        "Niveau de la voix :",
+        "Normal",
+        "Fort",
+        "Baisser le son du jeu quand quelqu'un parle",
+        "Baisse du son du jeu en % :",
     },
     [L_ES] = {
         "Nightreign Invasions " MOD_VERSION,
@@ -227,9 +248,17 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "Alcance en metros:",
         "Volumen en %:",
         "Jugadores silenciados (nombres de Steam o ids, separados por comas):",
+        "Nivel de voz:",
+        "Normal",
+        "Alto",
+        "Bajar el sonido del juego cuando alguien habla",
+        "Bajar el sonido del juego en %:",
     },
 };
 
+// voice-level in the Settings window: Normal = 18 dB below full scale, Loud = 10 (another number in the file: the nearer).
+static const int VOICE_LEVELS[2] = {18, 10};
+static inline int voice_level_index(int db) { return db <= 14; }
 // Keys offered for voice chat (Windows virtual-key codes, as the DLL reads them with GetAsyncKeyState); 0 = none.
 static const struct { const char *name; int vk; } VOICE_KEYS[] = {
     {"-", 0}, {"V", 0x56}, {"B", 0x42}, {"C", 0x43}, {"G", 0x47}, {"H", 0x48}, {"J", 0x4a}, {"K", 0x4b}, {"N", 0x4e}, {"T", 0x54},

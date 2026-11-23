@@ -1186,6 +1186,7 @@ int core_load_voice(core_voice *v) {
     snprintf(path, sizeof path, "%s" SEP "voice-settings.toml", g_app);
     int found = load_settings(path, s);
     v->on = s[S_VOICE], v->key = s[S_VOICE_KEY], v->team_key = s[S_VOICE_TEAM_KEY], v->range = s[S_VOICE_RANGE], v->volume = s[S_VOICE_VOLUME];
+    v->level = s[S_VOICE_LEVEL], v->duck = s[S_VOICE_DUCK], v->duck_amount = s[S_VOICE_DUCK_AMOUNT];
     v->mute[0] = 0;
     buf t = found ? read_file(path) : (buf){0};
     if (t.p) settings_text((const char *)t.p, t.n, "voice-mute", v->mute, sizeof v->mute);
@@ -1193,15 +1194,16 @@ int core_load_voice(core_voice *v) {
     return found;
 }
 void core_save_voice(const core_voice *v) {
-    char path[1300], text[600], mute[256];
+    char path[1300], text[700], mute[256];
     snprintf(mute, sizeof mute, "%s", v->mute);
     for (char *c = mute; *c; c++)
         if (*c == '#' || *c == '\r' || *c == '\n') *c = ' ';  // one line, no comment start
     snprintf(path, sizeof path, "%s" SEP "voice-settings.toml", g_app);
     int n = snprintf(text, sizeof text,
                      "# Written by the launcher's Settings window (voice chat); keys are Windows virtual-key codes.\n"
-                     "voice = %s\nvoice-key = %d\nvoice-team-key = %d\nvoice-range = %d\nvoice-volume = %d\nvoice-mute = %s\n",
-                     v->on ? "true" : "false", v->key, v->team_key, v->range, v->volume, mute);
+                     "voice = %s\nvoice-key = %d\nvoice-team-key = %d\nvoice-range = %d\nvoice-volume = %d\nvoice-level = %d\nvoice-duck = %s\n"
+                     "voice-duck-amount = %d\nvoice-mute = %s\n",
+                     v->on ? "true" : "false", v->key, v->team_key, v->range, v->volume, v->level, v->duck ? "true" : "false", v->duck_amount, mute);
     write_file(path, (const u8 *)text, (size_t)n);
 }
 static int read_settings(void) {
@@ -1218,6 +1220,7 @@ static int read_settings(void) {
     if (core_load_voice(&cv)) {  // and its voice chat settings
         g_set[S_VOICE] = (short)cv.on, g_set[S_VOICE_KEY] = (short)cv.key, g_set[S_VOICE_TEAM_KEY] = (short)cv.team_key;
         g_set[S_VOICE_RANGE] = (short)cv.range, g_set[S_VOICE_VOLUME] = (short)cv.volume;
+        g_set[S_VOICE_LEVEL] = (short)cv.level, g_set[S_VOICE_DUCK] = (short)cv.duck, g_set[S_VOICE_DUCK_AMOUNT] = (short)cv.duck_amount;
         snprintf(mute, sizeof mute, "%s", cv.mute);
     }
     for (int i = 0; i < SETTINGS_COUNT; i++)
@@ -4192,7 +4195,7 @@ int core_selftest(void) {
                                 "pair = -1\r\nboss-flow = 3\r\nchallenge-bosses = 2";
         short v[SETTINGS_COUNT];
         char bad[96];
-        static const short want[SETTINGS_COUNT] = {-1, 0, -1, 15, -1, -1, 3, -1, -1, -1, 250, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+        static const short want[SETTINGS_COUNT] = {-1, 0, -1, 15, -1, -1, 3, -1, -1, -1, 250, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
         int good = settings_parse(t, sizeof t - 1, v, bad, sizeof bad) == 4 && !memcmp(v, want, sizeof v) &&
                    !strcmp(bad, "nope = true, loot-test = yes, one-region = 1000, boss-flow = 3");
         char bad2[8];
@@ -4201,13 +4204,15 @@ int core_selftest(void) {
         good = good && !load_settings("/nonexistent/test-settings.toml", v);
         for (int i = 0; i < SETTINGS_COUNT; i++) good = good && v[i] == setting_default(i);
         // voice: numbers, a key code, the free-text mute list (skipped by the parser, read by settings_text)
-        static const char vt[] = "voice = true\nvoice-key = 86\nvoice-range = 1000\nvoice-mute = Ann B, 76561197960287930 # x\r\n";
+        static const char vt[] = "voice = true\nvoice-key = 86\nvoice-range = 1000\nvoice-mute = Ann B, 76561197960287930 # x\r\n"
+                                 "voice-level = 18\nvoice-duck = false\nvoice-duck-amount = 30\n";
         char mt[64];
         good = good && settings_parse(vt, sizeof vt - 1, v, bad, sizeof bad) == 1 && !strcmp(bad, "voice-range = 1000") && v[S_VOICE] == 1 &&
-               v[S_VOICE_KEY] == 86 && v[S_VOICE_TEAM_KEY] == -1 && settings_text(vt, sizeof vt - 1, "voice-mute", mt, sizeof mt) &&
+               v[S_VOICE_KEY] == 86 && v[S_VOICE_TEAM_KEY] == -1 && v[S_VOICE_LEVEL] == 18 && v[S_VOICE_DUCK] == 0 && v[S_VOICE_DUCK_AMOUNT] == 30 && settings_text(vt, sizeof vt - 1, "voice-mute", mt, sizeof mt) &&
                !strcmp(mt, "Ann B, 76561197960287930") && !settings_text(vt, sizeof vt - 1, "voice-pad", mt, sizeof mt);
         good = good && setting_default(S_VOICE) == 0 && setting_default(S_VOICE_KEY) == 0x56 && setting_default(S_VOICE_TEAM_KEY) == 0x42 &&
-               setting_default(S_VOICE_RANGE) == 40 && setting_default(S_VOICE_VOLUME) == 100;
+               setting_default(S_VOICE_RANGE) == 40 && setting_default(S_VOICE_VOLUME) == 100 && setting_default(S_VOICE_LEVEL) == 10 &&
+               setting_default(S_VOICE_DUCK) == 1 && setting_default(S_VOICE_DUCK_AMOUNT) == 50;
         if (!good) { ok = 0; logf_("selftest: test settings parser failed"); }
     }
     {  // window texts: every key in every language, none empty; T_BACKUP_DONE has exactly one %s

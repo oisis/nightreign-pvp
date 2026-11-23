@@ -7,12 +7,14 @@
 #include <string.h>
 
 enum { S_LOOT_TEST, S_DEBUG_LOG, S_NO_HOST, S_TEST_LEVEL, S_FLAG_LOG, S_MAP_DUMP, S_MAP_GROUP, S_ONE_REGION, S_BOSS_FLOW, S_REVIVE_HITS, S_ULT_PVP, S_PARTY, S_SLOT_TEST,
-       S_VOICE, S_VOICE_KEY, S_VOICE_TEAM_KEY, S_VOICE_RANGE, S_VOICE_VOLUME, S_VOICE_PAD, S_VOICE_TEAM_PAD, S_VOICE_LOOPBACK, SETTINGS_COUNT };
+       S_VOICE, S_VOICE_KEY, S_VOICE_TEAM_KEY, S_VOICE_RANGE, S_VOICE_VOLUME, S_VOICE_PAD, S_VOICE_TEAM_PAD, S_VOICE_LOOPBACK,
+       S_VOICE_LEVEL, S_VOICE_DUCK, S_VOICE_DUCK_AMOUNT, SETTINGS_COUNT };
 static const char *const SETTING_NAMES[SETTINGS_COUNT] = {"loot-test",
                                                           "debug-log", "no-host", "test-level", "flag-log",
                                                           "map-dump", "map-group", "one-region", "boss-flow", "revive-hits", "ult-pvp", "party", "slot-test",
                                                           "voice", "voice-key", "voice-team-key", "voice-range", "voice-volume",
-                                                          "voice-pad", "voice-team-pad", "voice-loopback"};
+                                                          "voice-pad", "voice-team-pad", "voice-loopback",
+                                                          "voice-level", "voice-duck", "voice-duck-amount"};
 // Settings whose value is free text (not true / false or a number): read with settings_text, skipped by settings_parse.
 // voice-mute: players never heard, Steam names or 17-digit Steam ids, separated by commas.
 static const char *const SETTING_TEXT[] = {"voice-mute"};
@@ -27,11 +29,14 @@ static const char *const SETTING_RETIRED[] = {"pair", "map", "variant-test", "pa
                                                "challenge-bosses"};
 // Settings that take a whole number 0..999 instead of true / false (0 = off).
 static int setting_is_number(int i) { return i == S_TEST_LEVEL || i == S_MAP_GROUP || i == S_ONE_REGION || i == S_BOSS_FLOW || i == S_ULT_PVP || i == S_PARTY ||
-                                         (i >= S_VOICE_KEY && i <= S_VOICE_TEAM_PAD); }
+                                         (i >= S_VOICE_KEY && i <= S_VOICE_TEAM_PAD) || i == S_VOICE_LEVEL || i == S_VOICE_DUCK_AMOUNT; }
 // Settings that are on when the file does not mention them.
-// boss-flow: 4, the day flow. Voice: push-to-talk V (Windows virtual-key 0x56), team B (0x42), 40 m, volume 100 %.
+// boss-flow: 4, the day flow. Voice: push-to-talk V (Windows virtual-key 0x56), team B (0x42), 40 m, volume 100 %;
+// voice-level: the AGC's speech target in dB below full scale (10 "loud", 18 "normal"); voice-duck on, the game's sound
+// down by voice-duck-amount 50 % while someone is heard.
 static int setting_default(int i) {
-    return i == S_BOSS_FLOW ? 4 : i == S_VOICE_KEY ? 0x56 : i == S_VOICE_TEAM_KEY ? 0x42 : i == S_VOICE_RANGE ? 40 : i == S_VOICE_VOLUME ? 100 : 0;
+    return i == S_BOSS_FLOW ? 4 : i == S_VOICE_KEY ? 0x56 : i == S_VOICE_TEAM_KEY ? 0x42 : i == S_VOICE_RANGE ? 40 : i == S_VOICE_VOLUME ? 100 :
+           i == S_VOICE_LEVEL ? 10 : i == S_VOICE_DUCK ? 1 : i == S_VOICE_DUCK_AMOUNT ? 50 : 0;
 }
 
 static int settings_word(const char *s, size_t n, const char *w) {  // case-insensitive, whole word

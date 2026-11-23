@@ -25,9 +25,25 @@
 //   (INFERRED: XX = block byte 2, ZZ = byte 1, 256 m; a "voice: tile check" line measures it at the first tile change);
 //   the same field tile: its local positions; else the same block: world positions (INFERRED: the same frame there);
 //   else too far.
+// - AGC (voice_agc_run): per speaker on the decoded PCM, before the ring, to voice-level dB below full scale (10
+//   "loud", 18 "normal"); voice-volume (0..100 %) is a trim on top.
+// - Ducking (voice-duck, voice-duck-amount %): while any speaker's buffer plays, the game's own sound goes down; back
+//   up DUCK_HOLD_MS after the last one stops, over DUCK_RELEASE_MS. The game's sound is Wwise, statically linked, and
+//   the exe exports the SDK by its mangled names (VERIFIED, export table): AK::SoundEngine::SetOutputVolume(id, vol)
+//   (0x1423cc830: refuses a non-finite volume, else queues message 0x17 {id, vol} for the audio thread, AK_Success);
+//   the audio thread's handler (0x14241e839) finds the device by id and stores vol at device +0x154, which the mix
+//   ramps to from +0x150 over one buffer (0x1424330b0) and then copies to +0x150 (0x14243233d). GetOutputID(0, 0)
+//   gives the main output's id (0x1423c5d70: the device list's first default entry); IsInitialized is the byte at
+//   0x1446f7218. The game itself never sets it: the only code path to SetOutputVolume is the MagicOrchestra wrapper
+//   0x1423a29d0, which nothing references (only its .pdata entry); so its value is the SDK's 1.0 (INFERRED: the device
+//   constructor copies it from its settings) and the restore is 1.0. It is a runtime volume, never saved; it is set
+//   back to 1.0 when the voice thread ends (Steam shutdown, while the game thread waits in SteamAPI_Shutdown). Our own
+//   XAudio2 engine is not Wwise's, so the voices are not ducked.
 // Log: one "voice: " line at the start, a "voice: " summary per speaker every LAG_LOG_MS, details with debug-log only.
 #define sqrtf __builtin_sqrtf  // no math.h: its logf is not ours
 #define fabsf __builtin_fabsf
+#define log10f __builtin_log10f
+#define expf __builtin_expf
 #include <xaudio2.h>
 
 #define VOICE_CHANNEL (LAG_CHANNEL + 1)
@@ -51,6 +67,56 @@ typedef struct {
     unsigned block, field;   // ChrIns +0x38; the field tile the local position is in (0: none)
     float local[3], world[3];
 } voice_hdr;
+// Receiving-side automatic gain (Steam's decoded speech is quiet): the speech level is the RMS of 20 ms frames above
+// the gate, smoothed (fast up, slow down), and the gain takes it to the target. Frames below the gate keep the gain
+// but are not brought above AGC_NOISE_DB; a frame's gain never takes its peak past full scale (the limiter).
+// 10^(dB/20) is expf(dB * 0.115129255f): powf would pull in api-ms-win-crt-math.
+static float g_agc_target = -10;  // dBFS, -voice-level
+#define AGC_MAX_DB 24.0f
+#define AGC_MIN_DB -12.0f
+#define AGC_GATE_DB -50.0f
+#define AGC_NOISE_DB -40.0f
+#define AGC_ATTACK_S 0.03f
+#define AGC_RELEASE_S 1.0f
+typedef struct {
+    int primed;
+    float lvl_db, agc_db, g;  // speech level; the gain toward the target; the last frame's applied gain (linear)
+    float sum_db;              // for the 15 s summary: agc_db summed over the speech frames
+    unsigned frames, limits;   // speech frames; frames the limiter turned down
+} voice_agc;
+static void voice_agc_run(voice_agc *a, short *x, unsigned n, unsigned rate) {
+    unsigned fr = rate / 50;
+    if (a->g <= 0) a->g = 1;
+    for (unsigned at = 0; at < n; at += fr) {
+        unsigned m = n - at < fr ? n - at : fr;
+        short *p = x + at;
+        float e = 0, pk = 0;
+        for (unsigned i = 0; i < m; i++) {
+            float v = p[i];
+            e += v * v, v = fabsf(v), pk = v > pk ? v : pk;
+        }
+        float rms = sqrtf(e / (float)m) / 32768.0f, db = rms > 1e-6f ? 20 * log10f(rms) : -120;
+        if (db > AGC_GATE_DB) {
+            if (!a->primed) a->primed = 1, a->lvl_db = db;
+            else a->lvl_db += (db - a->lvl_db) * (1 - expf(-(float)m / ((float)rate * (db > a->lvl_db ? AGC_ATTACK_S : AGC_RELEASE_S))));
+            float t = g_agc_target - a->lvl_db;
+            a->agc_db = t > AGC_MAX_DB ? AGC_MAX_DB : t < AGC_MIN_DB ? AGC_MIN_DB : t;
+            a->sum_db += a->agc_db, a->frames++;
+        }
+        float g = expf(a->agc_db * 0.115129255f);
+        if (db <= AGC_GATE_DB && db > AGC_NOISE_DB - AGC_MAX_DB) {
+            float cap = expf((AGC_NOISE_DB - db) * 0.115129255f);
+            g = g > cap ? cap : g;
+        }
+        if (pk * g > 32000) g = 32000 / pk, a->limits++;
+        float gi = g < a->g ? g : a->g, step = (g - gi) / (float)m;  // down at once, up over the frame
+        for (unsigned i = 0; i < m; i++) {
+            float v = p[i] * (gi += step);
+            p[i] = (short)(v >= 32767 ? 32767 : v <= -32768 ? -32768 : v < 0 ? v - 0.5f : v + 0.5f);
+        }
+        a->g = g;
+    }
+}
 typedef struct { int ok; unsigned block, field; float local[3], world[3]; int cam; float right[2]; } voice_where;
 typedef struct {
     u64 id;
@@ -61,6 +127,7 @@ typedef struct {
     int playing, seq_ok, invader, muted;
     unsigned short seq;
     float gain, pan;
+    voice_agc agc;
     DWORD last_pkt, heard, invader_at, name_at, detail_at;
     unsigned rx, rx_pkts, tx, tx_pkts, late, overflow, distant, team_drop;
     wchar_t name[48];
@@ -239,6 +306,7 @@ static void voice_push(voice_spk *s, const void *data, unsigned n) {
     }
     if (g_voice.decompress(g_diag.user, data, n, pcm, sizeof pcm, &got, g_voice.rate) != 0) return;
     got /= 2;
+    voice_agc_run(&s->agc, pcm, got, g_voice.rate);
     unsigned max = g_voice.rate * VOICE_MAX_MS / 1000;
     for (unsigned i = 0; i < got; i++) s->ring[s->wr++ & (VOICE_RING - 1)] = pcm[i];
     if (s->wr - s->rd > max) s->rd = s->wr - max, s->overflow++;
@@ -284,14 +352,44 @@ static void voice_log(void) {
         voice_spk *s = &g_voice.spk[i];
         if (!s->id || !(s->rx_pkts | s->tx_pkts | s->late | s->overflow | s->distant | s->team_drop)) continue;
         logf("voice: %s %04x%s: sent %u B in %u pkts, received %u B in %u pkts, late %u, jitter buffer full %u, out of range %u, team "
-             "refused %u", s->id == g_voice.me ? "us" : "member", id_tag(s->id), s->muted ? " (muted)" : "", s->tx, s->tx_pkts,
-             s->rx, s->rx_pkts, s->late, s->overflow, s->distant, s->team_drop);
+             "refused %u, AGC %+.1f dB average, limiter %u", s->id == g_voice.me ? "us" : "member", id_tag(s->id), s->muted ? " (muted)" : "", s->tx, s->tx_pkts,
+             s->rx, s->rx_pkts, s->late, s->overflow, s->distant, s->team_drop,
+             s->agc.frames ? s->agc.sum_db / (float)s->agc.frames : 0.0f, s->agc.limits);
+        s->agc.sum_db = 0, s->agc.frames = s->agc.limits = 0;
         s->rx = s->rx_pkts = s->tx = s->tx_pkts = s->late = s->overflow = s->distant = s->team_drop = 0;
     }
     if (g_voice.too_big || g_voice.strangers) logf("voice: %u captures too big for one packet, %u packets from outside the lobby", g_voice.too_big, g_voice.strangers);
     g_voice.too_big = g_voice.strangers = 0;
 }
 
+#define DUCK_DOWN_MS 50
+#define DUCK_HOLD_MS 300
+#define DUCK_RELEASE_MS 500
+static struct {
+    unsigned char (*ready)(void);
+    u64 (*out_id)(unsigned, unsigned);
+    int (*set)(u64, float);
+    float now, sent;  // the envelope; the last volume sent (1: none / restored)
+    DWORD heard, at;
+} g_duck = {.now = 1, .sent = 1};
+static void duck_send(float v) {
+    if (!g_duck.ready()) return;  // no engine (not yet, or gone): nothing to scale
+    g_duck.set(g_duck.out_id(0, 0), v), g_duck.sent = v;
+}
+// Voice thread, every step: heard = some speaker's buffer is playing.
+static void voice_duck(int heard) {
+    if (!g_duck.set) return;
+    DWORD now = GetTickCount(), dt = now - g_duck.at;
+    g_duck.at = now;
+    if (dt > 100) dt = 100;
+    if (heard) g_duck.heard = now | 1;
+    float low = 1 - g_settings[S_VOICE_DUCK_AMOUNT] / 100.0f, want = g_duck.heard && now - g_duck.heard < DUCK_HOLD_MS ? low : 1, was = g_duck.now;
+    if (g_duck.now > want) g_duck.now -= (1 - low) * (float)dt / DUCK_DOWN_MS, g_duck.now = g_duck.now < want ? want : g_duck.now;
+    else if (g_duck.now < want) g_duck.now += (1 - low) * (float)dt / DUCK_RELEASE_MS, g_duck.now = g_duck.now > want ? want : g_duck.now;
+    if (g_debug_log && was == 1 && g_duck.now < 1) logf("voice detail: ducking the game's sound to %.0f %%", low * 100);
+    if (g_debug_log && was < 1 && g_duck.now == 1) logf("voice detail: game's sound back to 100 %%");
+    if (fabsf(g_duck.now - g_duck.sent) > 0.005f || (g_duck.now == want && g_duck.sent != want)) duck_send(g_duck.now);
+}
 static void voice_step(void) {
     static DWORD next_log;
     u64 me = g_voice.me = g_diag.self(g_diag.user);
@@ -392,11 +490,14 @@ static void voice_step(void) {
         voice_push(s, pk + sizeof *h, n - (unsigned)sizeof *h);
         voice_apply(s, gain, pan);
         if (g_debug_log && now - s->detail_at > 1000)
-            s->detail_at = now, logf("voice detail: from %04x%s: distance %.1f m, gain %.2f, pan %.2f, buffered %u ms", id_tag(from),
-                                     h->flags & VOICE_TEAM ? " (team)" : "", dist, gain, pan, (s->wr - s->rd) * 1000 / g_voice.rate);
+            s->detail_at = now, logf("voice detail: from %04x%s: distance %.1f m, gain %.2f, pan %.2f, buffered %u ms, AGC %+.1f dB (speech %.1f dBFS)",
+                                     id_tag(from), h->flags & VOICE_TEAM ? " (team)" : "", dist, gain, pan, (s->wr - s->rd) * 1000 / g_voice.rate,
+                                     s->agc.agc_db, s->agc.lvl_db);
     }
+    int heard = 0;
     for (int i = 0; i < VOICE_SLOTS; i++)
-        if (g_voice.spk[i].id) voice_feed(&g_voice.spk[i]);
+        if (g_voice.spk[i].id) voice_feed(&g_voice.spk[i]), heard |= g_voice.spk[i].playing && g_voice.spk[i].gain > 0.05f;
+    voice_duck(heard);
     if ((int)(now - next_log) >= 0) next_log = now + LAG_LOG_MS, voice_log();
 }
 static DWORD WINAPI voice_thread(LPVOID unused) {
@@ -405,8 +506,9 @@ static DWORD WINAPI voice_thread(LPVOID unused) {
         Sleep(10);
         InterlockedIncrement(&g_steam_busy);
         if (g_steam_down) {  // Steam is being shut down (process exit): no more Steam calls from this thread
+            if (g_duck.set && g_duck.sent != 1) duck_send(1);  // never leave the game's sound down
             InterlockedDecrement(&g_steam_busy);
-            logf("voice: stopped (Steam shutting down)");
+            logf("voice: stopped (Steam shutting down)%s", g_duck.sent != 1 ? "; the game's sound could NOT be restored (Wwise gone)" : "");
             return 0;
         }
         voice_step();
@@ -427,6 +529,10 @@ static void voice_start(void) {
     g_voice.persona = (void *)GetProcAddress(m, "SteamAPI_ISteamFriends_GetFriendPersonaName");
     g_voice.friends = friends ? friends() : NULL;
     g_voice.loopback = setting(S_VOICE_LOOPBACK);
+    if (g_settings[S_VOICE_VOLUME] > 100) g_settings[S_VOICE_VOLUME] = 100;  // a trim on the AGC now (0.3.3 allowed 200)
+    if (g_settings[S_VOICE_LEVEL] < 6 || g_settings[S_VOICE_LEVEL] > 30) g_settings[S_VOICE_LEVEL] = g_settings[S_VOICE_LEVEL] < 6 ? 6 : 30;
+    if (g_settings[S_VOICE_DUCK_AMOUNT] > 90) g_settings[S_VOICE_DUCK_AMOUNT] = 90;
+    g_agc_target = -(float)g_settings[S_VOICE_LEVEL];
     if (!g_voice.start || !g_voice.stop || !g_voice.avail || !g_voice.get || !g_voice.decompress || !g_voice.opt_rate) {
         logf("voice: NOT started: Steam voice exports missing from steam_api64.dll");
         return;
@@ -470,15 +576,28 @@ static void voice_start(void) {
         if (*t) muted++;
         while (*t && *t != ',') t++;
     }
+    const char *duck = "off (voice-duck false or voice-duck-amount 0)";
+    if (setting(S_VOICE_DUCK) && g_settings[S_VOICE_DUCK_AMOUNT] > 0) {  // the game's Wwise, by its exports (see the top)
+        HMODULE exe = GetModuleHandleA(NULL);
+        g_duck.ready = (void *)GetProcAddress(exe, "?IsInitialized@SoundEngine@AK@@YA_NXZ");
+        g_duck.out_id = (void *)GetProcAddress(exe, "?GetOutputID@SoundEngine@AK@@YA_KKK@Z");
+        g_duck.set = (void *)GetProcAddress(exe, "?SetOutputVolume@SoundEngine@AK@@YA?AW4AKRESULT@@_KM@Z");
+        if (!g_duck.ready || !g_duck.out_id) g_duck.set = NULL;
+        duck = g_duck.set ? "Wwise AK::SoundEngine::SetOutputVolume on the main output (exe export)" : "not available (Wwise exports not in the exe)";
+    }
     InitializeCriticalSection(&g_vw_lock);
     g_voice.ready = 1;
     CreateThread(NULL, 0, voice_thread, NULL, 0, NULL);
     logf("voice: on%s: Steam voice ok, %u Hz (Steam's optimal %u); XAudio2 2.9 ok, %u output channels; push-to-talk key 0x%02x, team key 0x%02x, "
-         "pad %d / %d%s; range %d m (full to %.0f m), volume %d %%, %d muted; P2P channel %d; camera pan from CSCamera 0x%x",
+         "pad %d / %d%s; range %d m (full to %.0f m), volume %d %%, AGC target %.0f dBFS, %d muted; P2P channel %d; camera pan from CSCamera 0x%x",
          g_voice.loopback ? " (LOOPBACK test: your own voice, no network)" : "", g_voice.rate, rate, g_voice.out_ch, g_settings[S_VOICE_KEY],
          g_settings[S_VOICE_TEAM_KEY], g_settings[S_VOICE_PAD], g_settings[S_VOICE_TEAM_PAD],
          g_voice.xinput ? " (XInput)" : g_settings[S_VOICE_PAD] > 0 || g_settings[S_VOICE_TEAM_PAD] > 0 ? " (XInput NOT loaded)" : "",
-         g_settings[S_VOICE_RANGE], VOICE_FULL_M, g_settings[S_VOICE_VOLUME], muted, VOICE_CHANNEL, RVA_CS_CAMERA);
+         g_settings[S_VOICE_RANGE], VOICE_FULL_M, g_settings[S_VOICE_VOLUME], g_agc_target, muted, VOICE_CHANNEL, RVA_CS_CAMERA);
+    if (g_duck.set)
+        logf("voice: ducking: %s, the game's sound to %d %% while someone is heard (down %d ms, back after %d ms over %d ms)", duck,
+             100 - g_settings[S_VOICE_DUCK_AMOUNT], DUCK_DOWN_MS, DUCK_HOLD_MS, DUCK_RELEASE_MS);
+    else logf("voice: ducking: %s", duck);
 }
 // Run thread: once Steam and the P2P interface (lag_tick) are there.
 static void voice_tick(void) {
