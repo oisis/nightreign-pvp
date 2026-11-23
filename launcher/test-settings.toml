@@ -10,3 +10,7 @@ revive-hits = false       # test, invasions: a downed player is finished by the 
 ult-pvp = 100             # test, invasions: ultimate damage against players of the other side in percent (100 = unchanged, 0..999)
 party = 0                 # test only: a number mixed into the squad matchmaking key, to keep test runs apart (0 = off)
 slot-test = false         # test: new session members take the highest free player slot first (3 machines reach slots 3 and 2)
+voice-loopback = false    # test: voice chat plays your own voice back to you (push-to-talk key held), no network
+voice-pad = 0             # voice chat: XInput pad button for push-to-talk, 1..16 = bit 0..15 of the buttons (9 LB, 10 RB, 13 A); 0 = none
+voice-team-pad = 0        # the same for the team key
+# voice, voice-key, voice-team-key, voice-range, voice-volume, voice-mute: the launcher's Settings window (it overrides them here)

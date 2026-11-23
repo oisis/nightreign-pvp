@@ -71,10 +71,20 @@ jobs:
         run: |
           V=$(tr -d '[:space:]' < VERSION)
           set -- "$NRPVP_WORK"/dist/packages/*.zip
-          # Changelog: the subjects of the commits since the previous version's tag.
+          # Changelog: for each commit since the previous version's tag, the "- " points of its
+          # message body (wrapped lines joined); a commit without points gives its subject.
           PREV=$(git tag -l 'v*' --sort=-v:refname | grep -v -- '-dev' | head -n 1)
           { echo "## Changes"; echo
-            if [ -n "$PREV" ]; then git log --no-merges --format='- %s' "$PREV..HEAD" | sed 's/^- \[build\] */- /'
+            if [ -n "$PREV" ]; then git log --no-merges --format='%x01%s%n%b' "$PREV..HEAD" | awk '
+              function flush(  i) { if (cur != "") { b[++n] = cur; cur = "" }
+                if (subj == "") return
+                if (n) for (i = 1; i <= n; i++) print b[i]; else print "- " subj }
+              /^\x01/ { flush(); subj = substr($0, 2); sub(/^\[build\] */, "", subj); n = 0; next }
+              /^Co-Authored-By:/ { next }
+              /^- / { if (cur != "") b[++n] = cur; cur = $0; next }
+              /^  +[^ ]/ && cur != "" { t = $0; sub(/^ +/, "", t); cur = cur " " t; next }
+              { if (cur != "") { b[++n] = cur; cur = "" } }
+              END { flush() }'
             else echo "- First test release"; fi
           } > notes.md
           gh release create "v$V" "$@" --target "$GITHUB_SHA" --title "$V" --prerelease --notes-file notes.md

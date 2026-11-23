@@ -7,7 +7,7 @@
 #include <string.h>
 
 enum { ID_FOLDER = 100, ID_BROWSE, ID_PLAY, ID_UNINSTALL, ID_LOG, ID_CLOSE, ID_BACKUP, ID_HELP, ID_LANG, ID_LANG_LABEL, ID_DEBUG, ID_SETTINGS,
-       ID_S_DEBUG = 200, ID_S_OK, ID_S_CANCEL };
+       ID_S_DEBUG = 200, ID_S_OK, ID_S_CANCEL, ID_S_VOICE, ID_S_KEY, ID_S_TEAM, ID_S_RANGE, ID_S_VOLUME, ID_S_MUTE };
 static const char *const *T = UI_TEXT[L_EN];
 static HWND g_window, g_folder, g_log;
 
@@ -81,7 +81,7 @@ static void set_texts(void) {
     SetWindowTextW(GetDlgItem(g_window, ID_SETTINGS), wide(T[T_SETTINGS]));
 }
 
-// Settings: the debug log; saved with OK. A small window of its own,
+// Settings: the debug log and voice chat; saved with OK. A small window of its own,
 // the main window disabled while it is open.
 static HWND g_set_win;
 static HWND set_child(const wchar_t *cls, const char *text, DWORD style, int id, int x, int y, int w, int h) {
@@ -93,6 +93,16 @@ static HWND set_child(const wchar_t *cls, const char *text, DWORD style, int id,
 static LRESULT CALLBACK set_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_COMMAND && LOWORD(wp) == ID_S_OK) {
         core_save_debug(SendMessageW(GetDlgItem(w, ID_S_DEBUG), BM_GETCHECK, 0, 0) == BST_CHECKED);
+        core_voice v;
+        wchar_t t[256];
+        int k = (int)SendMessageW(GetDlgItem(w, ID_S_KEY), CB_GETCURSEL, 0, 0), tk = (int)SendMessageW(GetDlgItem(w, ID_S_TEAM), CB_GETCURSEL, 0, 0);
+        v.on = SendMessageW(GetDlgItem(w, ID_S_VOICE), BM_GETCHECK, 0, 0) == BST_CHECKED;
+        v.key = VOICE_KEYS[k >= 0 && k < VOICE_KEY_COUNT ? k : 0].vk, v.team_key = VOICE_KEYS[tk >= 0 && tk < VOICE_KEY_COUNT ? tk : 0].vk;
+        v.range = (int)GetDlgItemInt(w, ID_S_RANGE, NULL, FALSE), v.volume = (int)GetDlgItemInt(w, ID_S_VOLUME, NULL, FALSE);
+        v.range = v.range < 5 ? 5 : v.range > 999 ? 999 : v.range, v.volume = v.volume > 200 ? 200 : v.volume;
+        GetDlgItemTextW(w, ID_S_MUTE, t, 256);
+        if (!WideCharToMultiByte(CP_UTF8, 0, t, -1, v.mute, sizeof v.mute, NULL, NULL)) v.mute[0] = 0;
+        core_save_voice(&v);
         DestroyWindow(w);
         return 0;
     }
@@ -115,11 +125,27 @@ static void settings(void) {
     RECT r;
     GetWindowRect(g_window, &r);
     g_set_win = CreateWindowW(L"NightreignInvasionsSettings", wide(T[T_SETTINGS]), WS_CAPTION | WS_SYSMENU | WS_POPUP, r.left + 60,
-                              r.top + 60, 480, 135, g_window, NULL, GetModuleHandleW(NULL), NULL);
-    HWND debug = set_child(L"BUTTON", T[T_DEBUG_LOG], BS_AUTOCHECKBOX, ID_S_DEBUG, 12, 14, 440, 22);
+                              r.top + 60, 560, 350, g_window, NULL, GetModuleHandleW(NULL), NULL);
+    HWND debug = set_child(L"BUTTON", T[T_DEBUG_LOG], BS_AUTOCHECKBOX, ID_S_DEBUG, 12, 14, 520, 22);
     SendMessageW(debug, BM_SETCHECK, core_load_debug() ? BST_CHECKED : BST_UNCHECKED, 0);
-    set_child(L"BUTTON", "OK", BS_DEFPUSHBUTTON, ID_S_OK, 250, 56, 95, 28);
-    set_child(L"BUTTON", T[T_CLOSE], BS_PUSHBUTTON, ID_S_CANCEL, 355, 56, 95, 28);
+    core_voice v;
+    core_load_voice(&v);
+    HWND voice = set_child(L"BUTTON", T[T_VOICE], BS_AUTOCHECKBOX, ID_S_VOICE, 12, 48, 520, 22);
+    SendMessageW(voice, BM_SETCHECK, v.on ? BST_CHECKED : BST_UNCHECKED, 0);
+    for (int i = 0; i < 5; i++) set_child(L"STATIC", T[T_VOICE_KEY + i], 0, 0, 12, 82 + i * 32, i == 4 ? 520 : 300, 20);
+    for (int k = 0; k < 2; k++) {
+        HWND c = set_child(L"COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL, k ? ID_S_TEAM : ID_S_KEY, 320, 78 + k * 32, 210, 300);
+        for (int i = 0; i < VOICE_KEY_COUNT; i++) SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)wide(VOICE_KEYS[i].name));
+        SendMessageW(c, CB_SETCURSEL, voice_key_index(k ? v.team_key : v.key), 0);
+    }
+    char num[16];
+    snprintf(num, sizeof num, "%d", v.range);
+    set_child(L"EDIT", num, ES_NUMBER | WS_BORDER, ID_S_RANGE, 320, 142, 80, 22);
+    snprintf(num, sizeof num, "%d", v.volume);
+    set_child(L"EDIT", num, ES_NUMBER | WS_BORDER, ID_S_VOLUME, 320, 174, 80, 22);
+    set_child(L"EDIT", v.mute, ES_AUTOHSCROLL | WS_BORDER, ID_S_MUTE, 12, 232, 520, 22);
+    set_child(L"BUTTON", "OK", BS_DEFPUSHBUTTON, ID_S_OK, 330, 266, 95, 28);
+    set_child(L"BUTTON", T[T_CLOSE], BS_PUSHBUTTON, ID_S_CANCEL, 435, 266, 95, 28);
     EnableWindow(g_window, FALSE);
     ShowWindow(g_set_win, SW_SHOW);
 }

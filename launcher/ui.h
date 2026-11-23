@@ -11,7 +11,7 @@ static const char *const LANG_NAME[LANG_COUNT] = {"English", "Polski", "Deutsch"
 
 enum { T_TITLE, T_GAME_FOLDER, T_BROWSE, T_PLAY, T_BACKUP, T_HELP, T_UNINSTALL, T_CLOSE, T_LANGUAGE, T_NOT_FOUND,
        T_FOUND, T_PICK, T_BAD_FOLDER, T_CONFIRM_UNINSTALL, T_NO_SAVE, T_BACKUP_DONE, T_BACKUP_FAILED, T_HELP_TEXT,
-       T_DEBUG_LOG, T_SETTINGS, T_COUNT };
+       T_DEBUG_LOG, T_SETTINGS, T_VOICE, T_VOICE_KEY, T_VOICE_TEAM_KEY, T_VOICE_RANGE, T_VOICE_VOLUME, T_VOICE_MUTE, T_COUNT };
 
 static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
     [L_EN] = {
@@ -48,6 +48,12 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "Close: closes this window.",
         "Debug log",
         "Settings",
+        "Voice chat (push to talk; players near you hear you)",
+        "Push-to-talk key:",
+        "Team key (host and allies, any distance):",
+        "Range in metres:",
+        "Volume in %:",
+        "Muted players (Steam names or ids, separated by commas):",
     },
     [L_PL] = {
         "Nightreign Invasions " MOD_VERSION,
@@ -83,6 +89,12 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "Zamknij: zamyka to okno.",
         "Szczegółowy log",
         "Ustawienia",
+        "Czat głosowy (naciśnij i mów; słyszą cię gracze w pobliżu)",
+        "Klawisz mówienia:",
+        "Klawisz drużyny (host i sojusznicy, z każdej odległości):",
+        "Zasięg w metrach:",
+        "Głośność w %:",
+        "Wyciszeni gracze (nazwy Steam lub id, oddzielone przecinkami):",
     },
     [L_DE] = {
         "Nightreign Invasions " MOD_VERSION,
@@ -121,6 +133,12 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "Schließen: schließt dieses Fenster.",
         "Ausführliches Protokoll",
         "Einstellungen",
+        "Sprachchat (Taste halten und sprechen; Spieler in der Nähe hören dich)",
+        "Sprechtaste:",
+        "Teamtaste (Host und Verbündete, jede Entfernung):",
+        "Reichweite in Metern:",
+        "Lautstärke in %:",
+        "Stummgeschaltete Spieler (Steam-Namen oder IDs, durch Kommas getrennt):",
     },
     [L_FR] = {
         "Nightreign Invasions " MOD_VERSION,
@@ -160,6 +178,12 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "Fermer : ferme cette fenêtre.",
         "Journal détaillé",
         "Paramètres",
+        "Chat vocal (maintenir pour parler ; les joueurs proches vous entendent)",
+        "Touche pour parler :",
+        "Touche d'équipe (hôte et alliés, à toute distance) :",
+        "Portée en mètres :",
+        "Volume en % :",
+        "Joueurs rendus muets (noms Steam ou identifiants, séparés par des virgules) :",
     },
     [L_ES] = {
         "Nightreign Invasions " MOD_VERSION,
@@ -197,8 +221,27 @@ static const char *const UI_TEXT[LANG_COUNT][T_COUNT] = {
         "Cerrar: cierra esta ventana.",
         "Registro detallado",
         "Ajustes",
+        "Chat de voz (mantén pulsado para hablar; te oyen los jugadores cercanos)",
+        "Tecla para hablar:",
+        "Tecla de equipo (anfitrión y aliados, a cualquier distancia):",
+        "Alcance en metros:",
+        "Volumen en %:",
+        "Jugadores silenciados (nombres de Steam o ids, separados por comas):",
     },
 };
+
+// Keys offered for voice chat (Windows virtual-key codes, as the DLL reads them with GetAsyncKeyState); 0 = none.
+static const struct { const char *name; int vk; } VOICE_KEYS[] = {
+    {"-", 0}, {"V", 0x56}, {"B", 0x42}, {"C", 0x43}, {"G", 0x47}, {"H", 0x48}, {"J", 0x4a}, {"K", 0x4b}, {"N", 0x4e}, {"T", 0x54},
+    {"U", 0x55}, {"X", 0x58}, {"Y", 0x59}, {"Z", 0x5a}, {"Caps Lock", 0x14}, {"Tab", 0x09}, {"Left Alt", 0xa4}, {"Left Ctrl", 0xa2},
+    {"Mouse 4", 0x05}, {"Mouse 5", 0x06}, {"F1", 0x70}, {"F2", 0x71}, {"F3", 0x72}, {"F4", 0x73}, {"F5", 0x74}, {"F6", 0x75},
+    {"F7", 0x76}, {"F8", 0x77}, {"F9", 0x78}, {"F10", 0x79}, {"F11", 0x7a}, {"F12", 0x7b}};
+#define VOICE_KEY_COUNT ((int)(sizeof VOICE_KEYS / sizeof *VOICE_KEYS))
+static inline int voice_key_index(int vk) {  // a code not in the list: none
+    for (int i = 0; i < VOICE_KEY_COUNT; i++)
+        if (VOICE_KEYS[i].vk == vk) return i;
+    return 0;
+}
 
 // A language code ("pl_PL.UTF-8", "de", ...) to a table index; English when it is none of the five.
 static int ui_lang_from_code(const char *code) {

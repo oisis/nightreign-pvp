@@ -39,7 +39,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 50
+#define BUILD_FORMAT 51
 #define BOSS_DEATHS_MIN 100  // the game (1.3.3) has 158 such flags; fewer = its event scripts changed
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
@@ -1180,11 +1180,46 @@ static int load_settings(const char *path, short v[SETTINGS_COUNT]) {  // 0: no 
     free(t.p);
     return 1;
 }
+int core_load_voice(core_voice *v) {
+    char path[1300];
+    short s[SETTINGS_COUNT];
+    snprintf(path, sizeof path, "%s" SEP "voice-settings.toml", g_app);
+    int found = load_settings(path, s);
+    v->on = s[S_VOICE], v->key = s[S_VOICE_KEY], v->team_key = s[S_VOICE_TEAM_KEY], v->range = s[S_VOICE_RANGE], v->volume = s[S_VOICE_VOLUME];
+    v->mute[0] = 0;
+    buf t = found ? read_file(path) : (buf){0};
+    if (t.p) settings_text((const char *)t.p, t.n, "voice-mute", v->mute, sizeof v->mute);
+    free(t.p);
+    return found;
+}
+void core_save_voice(const core_voice *v) {
+    char path[1300], text[600], mute[256];
+    snprintf(mute, sizeof mute, "%s", v->mute);
+    for (char *c = mute; *c; c++)
+        if (*c == '#' || *c == '\r' || *c == '\n') *c = ' ';  // one line, no comment start
+    snprintf(path, sizeof path, "%s" SEP "voice-settings.toml", g_app);
+    int n = snprintf(text, sizeof text,
+                     "# Written by the launcher's Settings window (voice chat); keys are Windows virtual-key codes.\n"
+                     "voice = %s\nvoice-key = %d\nvoice-team-key = %d\nvoice-range = %d\nvoice-volume = %d\nvoice-mute = %s\n",
+                     v->on ? "true" : "false", v->key, v->team_key, v->range, v->volume, mute);
+    write_file(path, (const u8 *)text, (size_t)n);
+}
 static int read_settings(void) {
-    char path[1300], on[200] = "";
+    char path[1300], on[200] = "", mute[256] = "";
     snprintf(path, sizeof path, "%s" SEP "test-settings.toml", g_app);
     int found = load_settings(path, g_set);
+    {  // voice-mute is free text: from test-settings.toml, unless the window's voice settings exist
+        buf t = read_file(path);
+        if (t.p) settings_text((const char *)t.p, t.n, "voice-mute", mute, sizeof mute);
+        free(t.p);
+    }
     g_set[S_DEBUG_LOG] = (short)core_load_debug();  // the window's "Debug log" box decides
+    core_voice cv;
+    if (core_load_voice(&cv)) {  // and its voice chat settings
+        g_set[S_VOICE] = (short)cv.on, g_set[S_VOICE_KEY] = (short)cv.key, g_set[S_VOICE_TEAM_KEY] = (short)cv.team_key;
+        g_set[S_VOICE_RANGE] = (short)cv.range, g_set[S_VOICE_VOLUME] = (short)cv.volume;
+        snprintf(mute, sizeof mute, "%s", cv.mute);
+    }
     for (int i = 0; i < SETTINGS_COUNT; i++)
         if (g_set[i]) snprintf(on + strlen(on), sizeof on - strlen(on), " %s", SETTING_NAMES[i]);
     logf_(found ? "Test settings:%s" : "Test settings:%s (no test-settings.toml next to the launcher)", on[0] ? on : " none");
@@ -1196,6 +1231,7 @@ static int read_settings(void) {
     for (int i = 0; i < SETTINGS_COUNT; i++)
         if (setting_is_number(i)) fprintf(f, "%s = %d\n", SETTING_NAMES[i], g_set[i]);
         else fprintf(f, "%s = %s\n", SETTING_NAMES[i], g_set[i] ? "true" : "false");
+    fprintf(f, "voice-mute = %s\n", mute);
     fclose(f);
     return 1;
 }
@@ -2877,6 +2913,10 @@ static int msb_entity(buf e) {  // a part's entity id (+0x60: its entity block, 
     u64 o = e.n >= 0x68 ? rd64(e.p + 0x60) : 0;
     return o && o + 4 <= e.n ? (int)rd32(e.p + o) : 0;
 }
+static int point_entity(buf e) {  // a point's entity id (+0x50: its entity block, the id at +4), 0 if none
+    u64 o = e.n >= 0x58 ? rd64(e.p + 0x50) : 0;
+    return o && o + 8 <= e.n ? (int)rd32(e.p + o + 4) : 0;
+}
 // The same for every region tile a pair map loads under another variant than its far half's (audit 2026-11-22: the
 // script-referenced entities of the far halves, e.g. the Mountaintop's sites 10x8101500.., the Crater's 1048201960 and its
 // buried chests, Noklateo's 10265015xx, lie only in the halves m60_10_09_V2 / m60_11_09_V2): City Beneath the Peak loads
@@ -3115,11 +3155,26 @@ static buf msb_compose(buf da, buf db, char names_b[][16], int *nb, int cap) {
     }
     memset(&tc, 0, sizeof tc);
     for (int i = 0; i < ne; i++) wr32(ev[i].p + 0x10, (u32)type_next(&tc, rd32(ev[i].p + 0xc)));
-    // points: by tile, index in type renumbered
+    // points: by tile, index in type renumbered. An attach point (type 54) of b's tile whose entity a's half has too (a
+    // site both variants share: Noklateo's 44_37 sites 109 / 308 / 358 on Fire over the City) is taken from a: the game
+    // made no small base at b's copy, which names b's variant (m60_44_37_50, block 3c2c2550), while a's (the base region's,
+    // the tile's variant without our hook) worked (analysis 09, the 44_37 hole of 0.3.1 / 0.3.2).
     int qa = A.l[POINT].n, qb = B.l[POINT].n, nq = 0;
     buf *pt = xalloc(sizeof(buf) * (qa + qb + 1));
     for (int i = 0; i < qa; i++) if (!(msb_tile(A.l[POINT].e[i], &x, &z) && pair_b_tile(x, z))) pt[nq++] = dup_buf(A.l[POINT].e[i]);
-    for (int i = 0; i < qb; i++) if (msb_tile(B.l[POINT].e[i], &x, &z) && pair_b_tile(x, z)) pt[nq++] = dup_buf(B.l[POINT].e[i]);
+    for (int i = 0; i < qb; i++) {
+        buf p = B.l[POINT].e[i];
+        if (!(msb_tile(p, &x, &z) && pair_b_tile(x, z))) continue;
+        int ent = rd32(p.p + 8) == 54 ? point_entity(p) : 0;
+        for (int k = 0; ent > 0 && k < qa; k++) {
+            int ax, az;
+            if (rd32(A.l[POINT].e[k].p + 8) == 54 && point_entity(A.l[POINT].e[k]) == ent && msb_tile(A.l[POINT].e[k], &ax, &az) && ax == x && az == z) {
+                p = A.l[POINT].e[k];
+                break;
+            }
+        }
+        pt[nq++] = dup_buf(p);
+    }
     memset(&tc, 0, sizeof tc);
     for (int i = 0; i < nq; i++) wr32(pt[i].p + 0xc, (u32)type_next(&tc, rd32(pt[i].p + 8)));
     M.l[MODEL].e = mout, M.l[MODEL].n = kept;
@@ -4137,7 +4192,7 @@ int core_selftest(void) {
                                 "pair = -1\r\nboss-flow = 3\r\nchallenge-bosses = 2";
         short v[SETTINGS_COUNT];
         char bad[96];
-        static const short want[SETTINGS_COUNT] = {-1, 0, -1, 15, -1, -1, 3, -1, -1, -1, 250, -1, -1};
+        static const short want[SETTINGS_COUNT] = {-1, 0, -1, 15, -1, -1, 3, -1, -1, -1, 250, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
         int good = settings_parse(t, sizeof t - 1, v, bad, sizeof bad) == 4 && !memcmp(v, want, sizeof v) &&
                    !strcmp(bad, "nope = true, loot-test = yes, one-region = 1000, boss-flow = 3");
         char bad2[8];
@@ -4145,6 +4200,14 @@ int core_selftest(void) {
         good = good && settings_parse(old, sizeof old - 1, v, bad2, sizeof bad2) == 0;
         good = good && !load_settings("/nonexistent/test-settings.toml", v);
         for (int i = 0; i < SETTINGS_COUNT; i++) good = good && v[i] == setting_default(i);
+        // voice: numbers, a key code, the free-text mute list (skipped by the parser, read by settings_text)
+        static const char vt[] = "voice = true\nvoice-key = 86\nvoice-range = 1000\nvoice-mute = Ann B, 76561197960287930 # x\r\n";
+        char mt[64];
+        good = good && settings_parse(vt, sizeof vt - 1, v, bad, sizeof bad) == 1 && !strcmp(bad, "voice-range = 1000") && v[S_VOICE] == 1 &&
+               v[S_VOICE_KEY] == 86 && v[S_VOICE_TEAM_KEY] == -1 && settings_text(vt, sizeof vt - 1, "voice-mute", mt, sizeof mt) &&
+               !strcmp(mt, "Ann B, 76561197960287930") && !settings_text(vt, sizeof vt - 1, "voice-pad", mt, sizeof mt);
+        good = good && setting_default(S_VOICE) == 0 && setting_default(S_VOICE_KEY) == 0x56 && setting_default(S_VOICE_TEAM_KEY) == 0x42 &&
+               setting_default(S_VOICE_RANGE) == 40 && setting_default(S_VOICE_VOLUME) == 100;
         if (!good) { ok = 0; logf_("selftest: test settings parser failed"); }
     }
     {  // window texts: every key in every language, none empty; T_BACKUP_DONE has exactly one %s

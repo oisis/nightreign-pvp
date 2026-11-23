@@ -3,6 +3,7 @@
 #include "ui.h"
 #include <gtk/gtk.h>
 #include <libgen.h>
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -84,7 +85,7 @@ static void set_texts(void) {
     gtk_button_set_label(GTK_BUTTON(g_settings), T[T_SETTINGS]);
 }
 
-// Settings: the debug log; saved when the dialog is closed with OK.
+// Settings: the debug log and voice chat; saved when the dialog is closed with OK.
 static void on_settings(GtkButton *b, gpointer u) {
     (void)b; (void)u;
     GtkWidget *d = gtk_dialog_new_with_buttons(T[T_SETTINGS], GTK_WINDOW(g_window), GTK_DIALOG_MODAL, "_OK", GTK_RESPONSE_OK,
@@ -94,10 +95,40 @@ static void on_settings(GtkButton *b, gpointer u) {
     GtkWidget *debug = gtk_check_button_new_with_label(T[T_DEBUG_LOG]);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(debug), core_load_debug());
     gtk_box_pack_start(GTK_BOX(grid), debug, FALSE, FALSE, 0);
+    // voice chat
+    core_voice v;
+    core_load_voice(&v);
+    GtkWidget *voice = gtk_check_button_new_with_label(T[T_VOICE]), *form = gtk_grid_new(), *key[2], *range, *volume, *mute;
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(voice), v.on);
+    gtk_box_pack_start(GTK_BOX(grid), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(grid), voice, FALSE, FALSE, 0);
+    gtk_grid_set_row_spacing(GTK_GRID(form), 6), gtk_grid_set_column_spacing(GTK_GRID(form), 8);
+    for (int k = 0; k < 2; k++) {
+        key[k] = gtk_combo_box_text_new();
+        for (int i = 0; i < VOICE_KEY_COUNT; i++) gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(key[k]), VOICE_KEYS[i].name);
+        gtk_combo_box_set_active(GTK_COMBO_BOX(key[k]), voice_key_index(k ? v.team_key : v.key));
+    }
+    range = gtk_spin_button_new_with_range(5, 999, 1), volume = gtk_spin_button_new_with_range(0, 200, 5), mute = gtk_entry_new();
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(range), v.range), gtk_spin_button_set_value(GTK_SPIN_BUTTON(volume), v.volume);
+    gtk_entry_set_text(GTK_ENTRY(mute), v.mute), gtk_entry_set_max_length(GTK_ENTRY(mute), sizeof v.mute - 1);
+    GtkWidget *rows[5] = {key[0], key[1], range, volume, mute};
+    for (int i = 0; i < 5; i++) {
+        GtkWidget *l = gtk_label_new(T[T_VOICE_KEY + i]);
+        gtk_label_set_xalign(GTK_LABEL(l), 0);
+        gtk_grid_attach(GTK_GRID(form), l, 0, i, 1, 1), gtk_grid_attach(GTK_GRID(form), rows[i], 1, i, 1, 1);
+        gtk_widget_set_hexpand(rows[i], TRUE);
+    }
+    gtk_box_pack_start(GTK_BOX(grid), form, FALSE, FALSE, 0);
     gtk_container_add(GTK_CONTAINER(area), grid);
     gtk_widget_show_all(d);
     if (gtk_dialog_run(GTK_DIALOG(d)) == GTK_RESPONSE_OK) {
         core_save_debug(gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(debug)));
+        v.on = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(voice));
+        v.key = VOICE_KEYS[gtk_combo_box_get_active(GTK_COMBO_BOX(key[0])) < 0 ? 0 : gtk_combo_box_get_active(GTK_COMBO_BOX(key[0]))].vk;
+        v.team_key = VOICE_KEYS[gtk_combo_box_get_active(GTK_COMBO_BOX(key[1])) < 0 ? 0 : gtk_combo_box_get_active(GTK_COMBO_BOX(key[1]))].vk;
+        v.range = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(range)), v.volume = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(volume));
+        snprintf(v.mute, sizeof v.mute, "%s", gtk_entry_get_text(GTK_ENTRY(mute)));
+        core_save_voice(&v);
     }
     gtk_widget_destroy(d);
 }

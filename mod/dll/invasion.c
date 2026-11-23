@@ -68,7 +68,7 @@ static const char *const KEY_LINES[] = {
     "host: session up", "host: expedition reached", "host: expedition over", "host: member admitted", "role: ",
     "host: no member left", "leave done", "join: search started", "joining lobby", "join -> ", "stopping (",
     "in the host's world", "world sync at step", "invasion won", "invasion lost", "invasion neither", "level: ", "map test", "two-regions", "expedition: result", "reward test: won", "reward test: lost", "extra life", "game over requested", "the game's result",
-    "expedition end requested", "flags: ", "lag: ", "move check: ", "map pin: ", "name tag: ", "scaling: ", "version: ", "counts overlay: ", "capacity: ", "slot: ", "map test",  "still down", "watchdog", "no map load", "went back", "code patch", "crash", "small-base registry"};
+    "expedition end requested", "flags: ", "lag: ", "voice: ", "move check: ", "map pin: ", "name tag: ", "scaling: ", "version: ", "counts overlay: ", "capacity: ", "slot: ", "map test",  "still down", "watchdog", "no map load", "went back", "code patch", "crash", "small-base registry"};
 static void logf(const char *fmt, ...) {
     char line[1024];
     va_list ap;
@@ -7041,6 +7041,7 @@ static void host_expedition(int step) {
 #include "overlay.h"
 #include "capacity.h"
 #include "day_flow.h"
+#include "voice.h"
 // Counts for the overlay (counts only: no names, no ids): our lobbies of our version, by the phase the host publishes.
 // In the hub (the local player's map block 0x0a......, m10 the Roundtable Hold) at most every 30 s through its own
 // list request while no search is running; a running search's result is counted instead (counts_from_list).
@@ -7080,7 +7081,9 @@ static void counts_from_list(unsigned n) {
         lines[k] = line[k];
     }
     logf("counts: squads in an expedition %d, looking for a player %d, hosts waiting in the hub %d", in_game, looking, waiting);
-    ov_set_lines(lines, 3);
+    for (int k = 0; k < 3; k++) g_counts_lines[k] = line[k];
+    g_counts_n = 3;
+    if (!g_voice_ov) ov_set_lines(lines, 3);
 }
 static int counts_in_hub(void) {
     char *me = local_player();
@@ -7088,7 +7091,7 @@ static int counts_in_hub(void) {
     return me && (blk >> 24) == 0x0a && !g_in_expedition && g_join != 4;
 }
 static void counts_tick(void) {  // game thread (step hook)
-    if (g_ov_off) return;
+    if (g_ov_off || voice_ov_tick()) return;
     if (!counts_in_hub()) {
         ov_hide();
         return;
@@ -7625,6 +7628,7 @@ static void step_hook(void *ctrl, void *time, int step) {
     summon_at_host_frame();
     crash_watch_members();
     squad_count_tick();
+    voice_frame();
     counts_tick();
     static int told_invader;
     if (g_join != 4) {
@@ -7990,6 +7994,7 @@ static DWORD WINAPI run(LPVOID self) {
         code_patch_check();
         level_watch();
         lag_tick();
+        voice_tick();
         act_wrap_tick();
         hooks_retry();
         if (1) marker_tick();
