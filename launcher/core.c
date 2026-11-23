@@ -39,7 +39,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 47
+#define BUILD_FORMAT 49
 #define BOSS_DEATHS_MIN 100  // the game (1.3.3) has 158 such flags; fewer = its event scripts changed
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
@@ -1226,8 +1226,8 @@ static const region_t R_MT = {20, 1, 7601, 11, 42, 43, 38, 39, "Mountaintop", "M
                       R_RW = {30, 3, 7603, 13, 44, 45, 36, 37, "Rotted Woods", "Rotted Woods'", "woods"},
                       R_NK = {35, 5, 7605, 15, 42, 43, 36, 37, "Noklateo", "Noklateo's", "Noklateo"};
 // A pair: base region a (map type a; its patterns' rows outside b's tiles), added region b (its tiles take b's rows;
-// 44_37, which the game gives to Noklateo, keeps a's small bases), start group (SortieStartingPoint +0xc for set 190;
-// its exclusion column +0x10 must name neither region), whether b's tree-site rows (set 500) are copied, and the far
+// Noklateo's include 44_37, which the game gives it and the DLL loads in its variant), start group (SortieStartingPoint
+// +0xc for set 190; its exclusion column +0x10 must name neither region), whether b's tree-site rows (set 500) are copied, and the far
 // halves to compose (west 10_09 / east 11_09: a's variant file with b's tiles of that half taken from b's).
 // halves: bit 0 west, bit 1 east; bit 2: the east half keeps the base file's own name (m60_11_09_22, the game's variant
 // 2) instead of 6 + pair: Ash and Rot's Crater objects keep their region's variant (their entities have the Crater's
@@ -1507,10 +1507,13 @@ static int spot_doubles(buf bases, const attach_sets *s) {
 // region's own patterns never use the points in its area (checked on the tables: 0 of 80 / 66 / 104 /
 // 112), the other patterns do. (Run 37 used a usage statistic instead and kept 32 Mountaintop small
 // bases inside the Rotted Woods.)
-// The added region's field tiles for its small bases (Noklateo without 44_37: see the pair table).
+// The added region's field tiles: 1 its 2x2 block, 2 Noklateo's extra tile 44_37 (the game's table 0x1406ab3c0; the DLL
+// loads it in variant 5, which keeps of the base points there only 109 / 308 / 358, whose entities m60_11_09_52 has, so
+// 44_37 takes Noklateo's rows like its other tiles), 0 neither.
 static int two_added_tile(int x, int z) {
     const region_t *b = pair_b();
-    return x >= b->x0 && x <= b->x1 && z >= b->z0 && z <= b->z1;
+    if (x >= b->x0 && x <= b->x1 && z >= b->z0 && z <= b->z1) return 1;
+    return b == &R_NK && x == 44 && z == 37 ? 2 : 0;
 }
 static int attach_points(buf points, attach_sets *s) {
     memset(s, 0, sizeof *s);
@@ -1522,30 +1525,26 @@ static int attach_points(buf points, attach_sets *s) {
         if (id >= ATTACH_MAX) continue;
         if (rd32(row + 0xc) == (u32)pair_a()->area) s->gone_a[id] = 1, in_a++;
         if (rd32(row + 0xc) == (u32)pair_b()->area) s->gone_b[id] = 1, in_b++;
-        s->woods[id] = row[4] == 60 && two_added_tile(row[5], row[6]);  // +4 area, +5 X, +6 Z
+        s->woods[id] = row[4] == 60 ? (u8)two_added_tile(row[5], row[6]) : 0;  // +4 area, +5 X, +6 Z
     }
     logf_("two-regions: attach points in the %s area %d, in the %s %d", pair_a()->of, in_a, pair_b()->of, in_b);
     return in_a > 0 && in_b > 0;
 }
-// Churches (SmallBaseAndSpotDefine rows with map icon 3, "Church": +0x2c; their small-base ids as
-// int16s at +4..+0x2b) per two-regions pattern -> work/native/two-regions.txt ("pattern churches"),
-// which the DLL reads for decision 26 (more HP flask charges at the start).
+// Churches: the small maps with the Sacred Flask statue, a talk script (t900004100 / 4101 / 4130 of m41_00 / m41_01 /
+// m41_30, ActionButton 6111) whose EstusAllocationUpdate(HP + 1) is the exe's 0x140fd90e0 (type 0: +0xff through
+// 0x20d9d0). Not SmallBaseAndSpotDefine's map icon: icon 3 (m34_xx, counted up to 0.3.1) are ruins (no talk script,
+// no 2004[86]), and m41_30 has icon 1. Run 39 (pattern 39): +1 at 19:24:05 in small base 2900030d (m41_00 on point
+// 313); the other +1 was a fixed field statue (m60_43_38_20; also m60_43_36_40, m60_43_39_40, m60_44_38_40), which
+// is not a small base and not counted here. m51_00 has the script too but stands on no pattern.
+// ponytail: a fixed list from the 1.3.3 data; read the talk ids from the small maps' MSBs if a patch adds statue maps.
+// Per two-regions pattern -> work/native/two-regions.txt ("pattern churches"); with boss-flow 4 (the default) the DLL
+// only logs it and pins the churches (the start stays the game's 3, every statue gives its +1).
 // Every church of the composed pattern counts (run 49: church 104 in Noklateo's area stands on pattern 22).
 // Also one line per church of each pattern: "church <pattern> <attach point> <area> <X> <Z> <x> <z>" (the
 // point's tile +4..+6 and position +0x38 / +0x40 in SmallBaseAndSpotAttachPoint), for the DLL's debug log.
-static int write_churches(buf define, buf bases, buf points) {
-    short church[64];
-    int nc = 0;
-    u64 dsize = param_row_size(define);
-    if (dsize < 0x30) return 0;
-    for (u32 i = 0; i < rd16(define.p + 0x0A); i++) {
-        const u8 *row = define.p + rd64(define.p + 0x40 + i * 24 + 8);
-        if (rd32(row + 0x2c) != 3) continue;
-        for (int k = 0; k < 20 && nc < 64; k++) {
-            short v = (short)rd16(row + 4 + 2 * k);
-            if (v != -1) church[nc++] = v;
-        }
-    }
+static int write_churches(buf bases, buf points) {
+    static const short church[] = {4100, 4101, 4130};
+    const int nc = (int)(sizeof church / sizeof *church);
     int count[TWO_PATTERNS] = {0};
     for (u32 i = 0; i < rd16(bases.p + 0x0A); i++) {
         const u8 *row = bases.p + rd64(bases.p + 0x40 + i * 24 + 8);
@@ -1610,10 +1609,9 @@ static const u8 *pac_row(int id) {
         if ((int)rd32(g_pac.p + 0x40 + i * 24) == id) return g_pac.p + rd64(g_pac.p + 0x40 + i * 24 + 8);
     return NULL;
 }
-static int site_added_tile(int x, int z) { return two_added_tile(x, z) || (pair_b() == &R_NK && x == 44 && z == 37); }
 static int site_ok(int id) {
     const u8 *r = pac_row(id);
-    if (!r || param_row_size(g_pac) < 0x28 || r[4] != 60 || site_added_tile(r[5], r[6])) return 0;
+    if (!r || param_row_size(g_pac) < 0x28 || r[4] != 60 || two_added_tile(r[5], r[6])) return 0;
     int req = (int)rd32(r + 0x18), e1 = (int)rd32(r + 0x1c), e2 = (int)rd32(r + 0x20), aa = pair_a()->area, ba = pair_b()->area;
     return e1 != aa && e1 != ba && e2 != aa && e2 != ba && (req == 0 || req == aa);
 }
@@ -1807,14 +1805,15 @@ static buf map_test_table(buf src, int table, buf flags, buf points, int two) {
             memcpy(pa, sets[0].pa, sizeof pa), memcpy(pb, sets[0].pb, sizeof pb);
             ok = attach_points(points, &sets[pr]);
             sets[pr].pairs = pairs, memcpy(sets[pr].pa, pa, sizeof pa), memcpy(sets[pr].pb, pb, sizeof pb);
-            // a base source's rows on the added region's tiles are exactly its rows at points of the added region's area
+            // a base source's rows on the added region's 2x2 block are exactly its rows at points of the added region's area
+            // (not on 44_37: its points have the Rotted Woods' area code 13 or none)
             int odd = 0;
             for (u32 i = 0; ok && i < rd16(p.p + 0x0A); i++) {
                 const u8 *row = p.p + rd64(p.p + 0x40 + i * 24 + 8);
                 int pat = (int)rd32(row + 4);
                 u32 at = rd32(row + 8);
                 if (pat >= 0 && pat < TWO_PATTERNS && pat % 40 >= pair_a()->off && pat % 40 < pair_a()->off + 5 && at < ATTACH_MAX &&
-                    sets[pr].woods[at] != sets[pr].gone_b[at])
+                    (sets[pr].woods[at] == 1) != sets[pr].gone_b[at])
                     odd++;
             }
             if (odd) logf_("two-regions: check failed: %d %s small bases where %s tile and %s area disagree", odd, pair_a()->name, pair_b()->tiles, pair_b()->name), ok = 0;
@@ -1962,7 +1961,9 @@ static const struct { int set, flag, flag2; } DF_FAMILIES[3] = {{3010, 7701, 772
 // tile hook), else the base region's if it has a file there (the Mountaintop only on X 42-43, the woods only on 44-45),
 // else the added region's, else 0; its small bases are those whose point (SmallBaseAndSpotAttachPoint +7) has that
 // variant on a tile with its own flag space (the base region's own terrain, 0x1406ab3c0, or the added region's tiles,
-// the DLL's flag-space hook), 0 elsewhere. A point of another variant is never placed on that map.
+// the DLL's flag-space hook), 0 elsewhere. A point of another variant is never placed on that map. (Of the 94 on 44_37, 88
+// are Noklateo's own rows at base points: 109 / 308 / 358, whose entities m60_11_09_52 keeps, and the hordes' 642..644.)
+// Day-flow sites stay off both regions' tiles, Noklateo's 44_37 included.
 static int tile_point_variant(int pr, int x, int z) {
     if (pr < 0) return 0;
     const region_t *a = TWO_PAIRS[pr].a, *b = TWO_PAIRS[pr].b;
@@ -1979,9 +1980,70 @@ static int point_outside_regions(buf points, int at, int pr) {  // pr -1: the ba
         if (area == 60 && x >= 42 && x <= 45 && z >= 36 && z <= 39 && r[7] != tile_point_variant(pr, x, z)) return 0;
         const region_t *g[2] = {pr >= 0 ? TWO_PAIRS[pr].a : NULL, pr >= 0 ? TWO_PAIRS[pr].b : NULL};
         for (int k = 0; k < 2 && g[k]; k++)
-            if (code == g[k]->area || (area == 60 && x >= g[k]->x0 && x <= g[k]->x1 && z >= g[k]->z0 && z <= g[k]->z1)) return 0;
+            if (code == g[k]->area || (area == 60 && ((x >= g[k]->x0 && x <= g[k]->x1 && z >= g[k]->z0 && z <= g[k]->z1) ||
+                                                      (g[k] == &R_NK && x == 44 && z == 37))))
+                return 0;
         return 1;
     }
+    return 0;
+}
+// One spot (decision 31's rule, spot_pairs): same tile, under 1 m apart (SmallBaseAndSpotAttachPoint +0x38..+0x40). The
+// game's points come in exact clusters (at most 0.005 m apart; the next distance is 2.68 m, 708 / 718): 2xxx = xxx, the
+// arena points 5xx with the event kinds' 520.. / 540.. / 560.. / 580.. and 8xx, a base and its spot (305 / 755).
+static u8 g_spot_have[ATTACH_MAX];
+static u32 g_spot_tile[ATTACH_MAX];
+static float g_spot_xyz[ATTACH_MAX][3];
+static void spot_index(buf points) {
+    memset(g_spot_have, 0, sizeof g_spot_have);
+
+    for (u32 i = 0; param_row_size(points) >= 0x44 && i < rd16(points.p + 0x0A); i++) {
+        u32 id = rd32(points.p + 0x40 + i * 24);
+        const u8 *row = points.p + rd64(points.p + 0x40 + i * 24 + 8);
+        if (id >= ATTACH_MAX) continue;
+        g_spot_have[id] = 1, g_spot_tile[id] = rd32(row + 4);
+        for (int k = 0; k < 3; k++) memcpy(&g_spot_xyz[id][k], row + 0x38 + 4 * k, 4);
+    }
+}
+static int same_spot(int a, int b) {
+    if (a == b) return 1;
+    if (a < 0 || b < 0 || a >= ATTACH_MAX || b >= ATTACH_MAX || !g_spot_have[a] || !g_spot_have[b] || g_spot_tile[a] != g_spot_tile[b]) return 0;
+    float dx = g_spot_xyz[a][0] - g_spot_xyz[b][0], dy = g_spot_xyz[a][1] - g_spot_xyz[b][1], dz = g_spot_xyz[a][2] - g_spot_xyz[b][2];
+    return dx * dx + dy * dy + dz * dz < 1.0f;
+}
+// The pattern's night-boss arenas (owner, 2026-11-23: no added site at a night boss arena or circle point): its
+// LotResultPlayAreaParam row's day-1 / day-2 sites (+8 / +0xc, after arena_sites), each site's (PlayAreaCreateParam)
+// +0x24 bossAttachPoint and +0x3c extraBossAttachPoint (5xx / 8xx / 11xx, on one spot with the event kinds' 520.. /
+// 540.. / 560.. / 580.. and 2xxx) and its circle centre +4..+6 tile, +8 / +0xc x / z (the arena point's x / z on every
+// site but 1010: centre -48 82 on 45_37, point 513 at -90.5 96.3). Only the pattern's own: every event kind point
+// is some site's arena point (any pattern's would leave no event site at all: build of 2026-11-23, 0 of 1772); the
+// game's own patterns put small bases on their own arena spots 210 times (LotResultSmallBaseAndSpot, 1.3.3).
+static buf g_lpa;  // LotResultPlayAreaParam (day_flow_maps)
+static int arena_spot(int pat, int at) {
+    const u8 *row = NULL;
+    for (u32 i = 0; g_lpa.p && i < rd16(g_lpa.p + 0x0A) && !row; i++)
+        if ((int)rd32(g_lpa.p + 0x40 + i * 24) == pat) row = g_lpa.p + rd64(g_lpa.p + 0x40 + i * 24 + 8);
+    for (int d = 0; row && d < 2; d++) {
+        const u8 *r = pac_row((int)rd32(row + 8 + 4 * d));
+        if (!r || param_row_size(g_pac) < 0x40) continue;
+        if (same_spot((int)rd32(r + 0x24), at) || same_spot((int)rd32(r + 0x3c), at)) return 1;
+        float x, z;
+        memcpy(&x, r + 8, 4), memcpy(&z, r + 0xc, 4);
+        if (at >= 0 && at < ATTACH_MAX && g_spot_have[at] && (rd32(r + 4) & 0xffffff) == (g_spot_tile[at] & 0xffffff) &&  // +7 (variant) left out
+            (x - g_spot_xyz[at][0]) * (x - g_spot_xyz[at][0]) + (z - g_spot_xyz[at][2]) * (z - g_spot_xyz[at][2]) < 1.0f)
+            return 1;
+    }
+    return 0;
+}
+// A spot the pattern already uses: its rows in bases, or the rows added for it so far (xb[from..nb)); or one of its
+// night-boss arenas'.
+static int spot_in_pattern(buf bases, int pat, int at, const extra_row *xb, int from, int nb) {
+    if (arena_spot(pat, at)) return 1;
+    for (u32 j = 0; j < rd16(bases.p + 0x0A); j++) {
+        const u8 *q = bases.p + rd64(bases.p + 0x40 + j * 24 + 8);
+        if ((int)rd32(q + 4) == pat && same_spot((int)rd32(q + 8), at)) return 1;
+    }
+    for (int k = from; k < nb; k++)
+        if (xb[k].pattern == pat && same_spot((int)rd32(xb[k].data + 8), at)) return 1;
     return 0;
 }
 static int day_flow_maps(buf maps[4], buf points) {
@@ -1995,6 +2057,7 @@ static int day_flow_maps(buf maps[4], buf points) {
     }
     static extra_row xf[TWO_PATTERNS * 6], xb[TWO_PATTERNS * 64];
     int nf = 0, nb = 0, fam_added = 0, kinds_added = 0, sites = 0, hordes_added = 0, hordes_sites = 0;
+    spot_index(points), g_lpa = maps[1];
     u64 fsize = param_row_size(flags), bsize = param_row_size(bases);
     if (fsize != 0x1c || bsize != 0x18) return 0;
     for (int pat = 0; pat < TWO_PATTERNS; pat++) {  // the five maps: the base map's patterns too
@@ -2009,6 +2072,7 @@ static int day_flow_maps(buf maps[4], buf points) {
             if (f >= 8075 && f <= 8079) special = 1;
         }
         if (!meta) continue;
+        int pat_xb = nb;  // this pattern's added rows start here
         for (int k = 0; k < 3; k++) {
             if (has[DF_FAMILIES[k].flag - 7700] || has[DF_FAMILIES[k].flag2 - 7700]) continue;
             u8 *d = xf[nf].data;
@@ -2036,12 +2100,7 @@ static int day_flow_maps(buf maps[4], buf points) {
                 if (!donor_of[m - 4600]) donor_of[m - 4600] = r;
                 if (at < 615 || at > 662 || seen_pt[at - 615]) continue;
                 seen_pt[at - 615] = 1;
-                int taken = 0;
-                for (u32 j = 0; j < rd16(bases.p + 0x0A) && !taken; j++) {
-                    const u8 *q = bases.p + rd64(bases.p + 0x40 + j * 24 + 8);
-                    taken = (int)rd32(q + 4) == pat && (int)rd32(q + 8) == at;
-                }
-                if (taken || !point_outside_regions(points, at, slot_pair(pat))) continue;
+                if (spot_in_pattern(bases, pat, at, xb, pat_xb, nb) || !point_outside_regions(points, at, slot_pair(pat))) continue;
                 int mm = placed % 7;
                 const u8 *d = donor_of[mm] ? donor_of[mm] : r;
                 memset(xb[nb].data, 0, sizeof xb[nb].data);
@@ -2066,13 +2125,8 @@ static int day_flow_maps(buf maps[4], buf points) {
             const u8 *r = bases.p + rd64(bases.p + 0x40 + i * 24 + 8);
             if ((int)rd32(r + 0xc) != DF_KINDS[kind].map) continue;
             if (donor < 0) donor = (int)i;
-            int at = (int)rd32(r + 8), taken = 0;
-            for (u32 j = 0; j < rd16(bases.p + 0x0A) && !taken; j++) {
-                const u8 *q = bases.p + rd64(bases.p + 0x40 + j * 24 + 8);
-                taken = (int)rd32(q + 4) == pat && (int)rd32(q + 8) == at;
-            }
-            for (int k = nb - picked; k < nb && !taken; k++) taken = xb[k].pattern == pat && (int)rd32(xb[k].data + 8) == at;
-            if (taken || !point_outside_regions(points, at, slot_pair(pat))) continue;
+            int at = (int)rd32(r + 8);
+            if (spot_in_pattern(bases, pat, at, xb, pat_xb, nb) || !point_outside_regions(points, at, slot_pair(pat))) continue;
             memset(xb[nb].data, 0, sizeof xb[nb].data);
             memcpy(xb[nb].data, r, 0x18);
             wr32(xb[nb].data + 8, (u32)at), xb[nb].data[0x10] = (u8)picked;
@@ -2124,8 +2178,7 @@ static int map_tables(buf bundle, int index[4], buf maps[4]) {
     }
     if (two) {
         chest_group_report(maps[0]);
-        int d = bnd4_find(bundle, "\\SmallBaseAndSpotDefine.param");
-        if (d < 0 || !write_churches(bnd4_file(bundle, d), maps[2], bnd4_file(bundle, ap))) return 0;
+        if (!write_churches(maps[2], bnd4_file(bundle, ap))) return 0;
         if (!day_flow_maps(maps, bnd4_file(bundle, ap)) || !write_pattern_bosses(maps[2])) return 0;
     }
     return 1;
@@ -2805,11 +2858,7 @@ static int type_next(type_counter *c, u32 t) {
     if (c->n < 128) c->type[c->n] = t, c->count[c->n++] = 1;
     return 0;
 }
-static int pair_b_tile(int x, int z) {  // the added region's tiles in that half (Noklateo with 44_37, as the game's table)
-    const region_t *b = pair_b();
-    int in = (x >= b->x0 && x <= b->x1 && z >= b->z0 && z <= b->z1) || (b == &R_NK && x == 44 && z == 37);
-    return in && x >= g_half_x0 && x <= g_half_x1;
-}
+static int pair_b_tile(int x, int z) { return two_added_tile(x, z) && x >= g_half_x0 && x <= g_half_x1; }  // the added region's tiles in that half
 static buf dup_buf(buf b) { buf o = {xalloc(b.n ? b.n : 1), b.n}; memcpy(o.p, b.p, b.n); return o; }
 // The Rotted Woods' far half m60_11_09_32 holds, besides scenery, the woods tiles' objects with an entity (9 assets: the
 // trees 1046301580 / 1046301585 and the AEG099 sites 10x6301955 / 956 / 1056301500 their scripts use, the tower's map
@@ -2964,8 +3013,8 @@ static buf msb_tile_with(buf dt, const msb_file *H, int x, int z, int v, int *mo
     if (!msb_parse(out, &R) || R.l[PARTS].n != np || R.l[EVENT].n != ne) { free(out.p); return none; }
     return out;
 }
-// A (first variant, kept outside B's tiles) + B (on B's tiles) -> composed MSB; *from_b gets B's map-piece model
-// names (as "digits") that the composed file uses and A does not have.
+// A (first variant, kept outside B's tiles) + B (on B's tiles) -> composed MSB; names_b gets the map-piece model names
+// (as "digits") of B's parts, whose files come from B's folder.
 static buf msb_compose(buf da, buf db, char names_b[][16], int *nb, int cap) {
     msb_file A, B, M;
     buf none = {0};
@@ -2975,9 +3024,9 @@ static buf msb_compose(buf da, buf db, char names_b[][16], int *nb, int cap) {
     // models: union by name (A first), then only the ones parts use
     int na = A.l[MODEL].n, nbm = B.l[MODEL].n, nm = 0;
     buf *mod = xalloc(sizeof(buf) * (na + nbm + 1));
-    int *map_a = xalloc(sizeof(int) * (na + 1)), *map_b = xalloc(sizeof(int) * (nbm + 1)), *from_b = xalloc(sizeof(int) * (na + nbm + 1));
+    int *map_a = xalloc(sizeof(int) * (na + 1)), *map_b = xalloc(sizeof(int) * (nbm + 1));
     char a_name[64], b_name[64];
-    for (int i = 0; i < na; i++) mod[nm] = A.l[MODEL].e[i], from_b[nm] = 0, map_a[i] = nm++;
+    for (int i = 0; i < na; i++) mod[nm] = A.l[MODEL].e[i], map_a[i] = nm++;
     for (int i = 0; i < nbm; i++) {
         msb_name(B.l[MODEL].e[i], b_name, sizeof b_name);
         int k = 0;
@@ -2985,7 +3034,7 @@ static buf msb_compose(buf da, buf db, char names_b[][16], int *nb, int cap) {
             msb_name(mod[k], a_name, sizeof a_name);
             if (!strcmp(a_name, b_name)) break;
         }
-        if (k == nm) mod[nm] = B.l[MODEL].e[i], from_b[nm] = 1, nm++;
+        if (k == nm) mod[nm] = B.l[MODEL].e[i], nm++;
         map_b[i] = k;
     }
     // parts: A's outside B's tiles, B's on them; model index remapped; own-index fields; index in type
@@ -2998,12 +3047,12 @@ static buf msb_compose(buf da, buf db, char names_b[][16], int *nb, int cap) {
     for (int i = 0; i < pb; i++)
         if (msb_tile(B.l[PARTS].e[i], &x, &z) && pair_b_tile(x, z) && !woods_moved_part(B.l[PARTS].e[i]))
             parts[np] = dup_buf(B.l[PARTS].e[i]), src_is_b[np] = 1, src_i[np++] = i;
-    int *use = xalloc(sizeof(int) * (nm + 1));
-    memset(use, 0, sizeof(int) * (nm + 1));
+    int *use = xalloc(sizeof(int) * (nm + 1)), *use_b = xalloc(sizeof(int) * (nm + 1)), both = 0;
+    memset(use, 0, sizeof(int) * (nm + 1)), memset(use_b, 0, sizeof(int) * (nm + 1));
     for (int i = 0; i < np; i++) {
         int old = (int)rd32(parts[i].p + 0x14), nw = src_is_b[i] ? (old >= 0 && old < nbm ? map_b[old] : -1) : (old >= 0 && old < na ? map_a[old] : -1);
         if (nw < 0) return logf_("pair: a part's model index is out of range"), none;
-        wr32(parts[i].p + 0x14, (u32)nw), use[nw]++;
+        wr32(parts[i].p + 0x14, (u32)nw), use[nw]++, use_b[nw] += src_is_b[i];
     }
     int *renum = xalloc(sizeof(int) * (nm + 1)), kept = 0;
     buf *mout = xalloc(sizeof(buf) * (nm + 1));
@@ -3012,7 +3061,12 @@ static buf msb_compose(buf da, buf db, char names_b[][16], int *nb, int cap) {
         if (!use[k]) continue;
         mout[kept] = dup_buf(mod[k]);
         wr32(mout[kept].p + 0x18, (u32)use[k]);
-        if (from_b[k] && rd32(mout[kept].p + 8) == 0 && *nb < cap) {  // a map piece of B's
+        // a map piece B's parts use: B's file, also where A has a piece of that name (its own model of that tile: the
+        // Noklateo city's 25423700 ... are the Mountaintop's / Crater's plain terrain in their folders; the model entry
+        // stays A's, the loader takes the file by name from the half's folder). Pieces are per tile, so A's parts (off
+        // B's tiles) never share one with B's; if they did, A's file stays (counted in the log).
+        both += use_b[k] && use_b[k] < use[k] && rd32(mout[kept].p + 8) == 0;
+        if (use_b[k] == use[k] && rd32(mout[kept].p + 8) == 0 && *nb < cap) {
             msb_name(mout[kept], b_name, sizeof b_name);
             if (b_name[0] == 'm' && strlen(b_name) < 16) strcpy(names_b[(*nb)++], b_name + 1);
         }
@@ -3080,8 +3134,8 @@ static buf msb_compose(buf da, buf db, char names_b[][16], int *nb, int cap) {
     }
     int from_b_parts = 0;
     for (int i = 0; i < np; i++) from_b_parts += src_is_b[i];
-    logf_("pair: composed half: %d parts (%d %s, %d %s), %d models, %d events, %d points, %d %s pieces; check: %s%s",
-          np, np - from_b_parts, pair_a()->name, from_b_parts, pair_b()->name, kept, ne, nq, *nb, pair_b()->name, bad ? "FAILED" : "read back fine",
+    logf_("pair: composed half: %d parts (%d %s, %d %s), %d models, %d events, %d points, %d %s pieces (%d in both); check: %s%s",
+          np, np - from_b_parts, pair_a()->name, from_b_parts, pair_b()->name, kept, ne, nq, *nb, pair_b()->name, both, bad ? "FAILED" : "read back fine",
           lost ? ", event part references lost" : "");
     return bad ? none : out;
 }
@@ -3397,6 +3451,65 @@ static void emevd_boss_entities(buf d, const u32 *flags, int have) {
             for (int x = 0; x < ne; x++) boss_entity_add(flags, have, fls[f], ents[x]);
     }
 }
+// Bosses without a death flag of their own, for the night window's hiding only (owner, 2026-11-23: every field boss and
+// every boss that invades): the targets of "Display Boss Health Bar" 2003[11] (entity +4), "Link To Boss Health Bar"
+// 2003[102] (+8) and "Set Character HP Bar Display" 2004[30] (+0) in the field tiles' and small maps' scripts, literal
+// or through a called event's parameter (common_func's or the script's own; one level is all the game uses: checked on
+// the 1.3.3 scripts, 330 entities either way), e.g. the Equilibrious Beast that invades from m45_55 (45550801,
+// 90035246), the tiles' event bosses (1042360271 ...). Not the night bosses' arenas m47, m48, m49, m52_00..39 (the
+// m52_40.. maps are placed on the field by LotResultSmallBaseAndSpot, the arenas by LotResultPlayAreaParam).
+// Written as "h" lines of boss-deaths.txt, which the day clock does not read (no count changes).
+#define BAR_MAX 1024
+static u32 g_bar_ent[BAR_MAX];
+static int g_nbar;
+static int bar_arg(u32 bank, u32 id) { return bank == 2003 && id == 11 ? 4 : bank == 2003 && id == 102 ? 8 : bank == 2004 && id == 30 ? 0 : -1; }
+static void bar_add(u32 e) {
+    if (e < 1000000 || e == 10000 || e == 20000) return;
+    for (int i = 0; i < g_nbar; i++) if (g_bar_ent[i] == e) return;
+    if (g_nbar < BAR_MAX) g_bar_ent[g_nbar++] = e;
+}
+static const u8 *emevd_event(buf d, u64 id) {
+    u64 ec = rd64(d.p + 0x10), eo = rd64(d.p + 0x18);
+    for (u64 e = 0; e < ec && eo + (e + 1) * 0x30 <= d.n; e++) if (rd64(d.p + eo + e * 0x30) == id) return d.p + eo + e * 0x30;
+    return NULL;
+}
+static int night_arena_map(const char *name) {  // m47_*, m48_*, m49_*, m52_00..39
+    const char *m = strstr(name, "/m");
+    int aa = m ? atoi(m + 2) : 0, bb = m && strlen(m) > 6 ? atoi(m + 5) : 0;
+    return aa == 47 || aa == 48 || aa == 49 || (aa == 52 && bb < 40);
+}
+static void emevd_boss_bars(buf d, buf cf) {
+    if (d.n < 0x80 || memcmp(d.p, "EVD", 3)) return;
+    u64 ec = rd64(d.p + 0x10), eo = rd64(d.p + 0x18), io = rd64(d.p + 0x28), ao = rd64(d.p + 0x78);
+    for (u64 e = 0; e < ec && eo + (e + 1) * 0x30 <= d.n; e++) {
+        const u8 *ev = d.p + eo + e * 0x30;
+        u64 n = rd64(ev + 8), ioff = rd64(ev + 0x10);
+        for (u64 k = 0; k < n && io + ioff + (k + 1) * 0x20 <= d.n; k++) {
+            const u8 *in = d.p + io + ioff + k * 0x20;
+            u32 bank = rd32(in), id = rd32(in + 4);
+            u64 alen = rd64(in + 8), aoff = rd64(in + 0x10);
+            if (ao + aoff + alen > d.n) continue;
+            const u8 *a = d.p + ao + aoff;
+            int at = bar_arg(bank, id);
+            if (at >= 0 && alen >= (u64)at + 4) bar_add(rd32(a + at));  // literal
+            if (bank != 2000 || (id != 0 && id != 6) || alen < 8) continue;
+            buf t = d;  // the called event: common_func's, else the script's own
+            const u8 *te = cf.p && cf.n >= 0x80 && !memcmp(cf.p, "EVD", 3) ? emevd_event(cf, rd32(a + 4)) : NULL;
+            if (te) t = cf;
+            else te = emevd_event(d, rd32(a + 4));
+            if (!te || te == ev) continue;
+            u64 tio = rd64(t.p + 0x28), tpo = rd64(t.p + 0x58), tioff = rd64(te + 0x10), tn = rd64(te + 8), pc = rd64(te + 0x18), poff = rd64(te + 0x20);
+            for (u64 q = 0; q < pc && tpo + poff + (q + 1) * 0x20 <= t.n; q++) {
+                const u8 *pe = t.p + tpo + poff + q * 0x20;
+                u64 idx = rd64(pe), tgt = rd64(pe + 8), src = rd64(pe + 0x10);
+                if (idx >= tn || tio + tioff + (idx + 1) * 0x20 > t.n) continue;
+                const u8 *ti = t.p + tio + tioff + idx * 0x20;
+                int ta = bar_arg(rd32(ti), rd32(ti + 4));
+                if (ta >= 0 && tgt == (u64)ta && 8 + src + 4 <= alen) bar_add(rd32(a + 8 + src));
+            }
+        }
+    }
+}
 // Day flow, invader camps (owner, 2026-11-19: one invader from the start, a second after 5 bosses). How many invaders a
 // camp gets is read twice, both 1 for the caves m30_00 / m30_30 and m38_00 / m38_10 (2 for m32_* / m34_*):
 // - the generator's camp roll (0x1406bb760): per camp, SmallBaseMapVariationParam (param 0xca, 0x140e80950) row = the
@@ -3457,6 +3570,51 @@ static int build_camp_scripts(const char *game_dir, buf bhd, const char *bdt) {
     if (ok) logf_("Day flow: invader camps of 4 small maps take 2 invaders (camp scripts written)");
     return ok;
 }
+// The final boss gate (owner, 2026-11-23: the host alone is enough; a summon sometimes did not follow). m12_00, day 3's
+// antechamber: 12002001 warps each player to the targeted Nightlord's arena on 9052 and "all players in area 12002200"
+// (3[07]), then sets 7510; 12002010 (multiplayer) offers "Open" (ActionButtonParam 9292) at the gate's c1000_9001
+// (12000280) only after its P0 = 120 s (event 0, instruction 5) and then sets network flag 7523, on which common 1200
+// warps every player of the session to 12002310 (inside 12002200), so 12002001 goes on for all. 12002099 warps a player
+// entering 12002200 once 7510 is on, but ends at once when 7510 was off at its start (1003[2] END IF 7510 off). Here:
+// "Open" at once (P0 0), and 12002099 waits for 7510 (3[0] IF 7510 on, same 8-byte arguments) instead of ending.
+static int emevd_final_gate(buf d) {
+    if (d.n < 0x80 || memcmp(d.p, "EVD", 3)) return 0;
+    u64 ev = rd64(d.p + 0x18), ins = rd64(d.p + 0x28), args = rd64(d.p + 0x78);
+    u32 n = (u32)rd64(d.p + 0x10);
+    int done = 0;
+    for (u32 e = 0; e < n && ev + (u64)(e + 1) * 0x30 <= d.n; e++) {
+        const u8 *E = d.p + ev + e * 0x30;
+        u64 id = rd64(E), cnt = rd64(E + 8), off = rd64(E + 0x10);
+        for (u64 k = 0; k < cnt && ins + off + (k + 1) * 0x20 <= d.n; k++) {
+            u8 *I = d.p + ins + off + k * 0x20;
+            u64 alen = rd64(I + 8), aoff = rd64(I + 0x10);
+            if (args + aoff + alen > d.n) continue;
+            u8 *a = d.p + args + aoff;
+            if (id == 0 && rd32(I) == 2000 && rd32(I + 4) == 0 && alen == 12 && rd32(a + 4) == 12002010 && rd32(a + 8) == 0x42f00000)
+                wr32(a + 8, 0), done |= 1;  // 120.0 s -> 0
+            if (id == 12002099 && k == 0 && rd32(I) == 1003 && rd32(I + 4) == 2 && alen == 8 && rd32(a) == 0 && rd32(a + 4) == 7510)
+                wr32(I, 3), wr32(I + 4, 0), a[1] = 1, done |= 2;  // END IF 7510 off -> IF 7510 on (group 0)
+        }
+    }
+    return done == 3;
+}
+static void build_final_gate(const char *game_dir, buf bhd, const char *bdt) {
+    const char *name = "/event/m12_00_00_00.emevd.dcx";
+    char path[1300];
+    buf in = archive_read(bhd, bdt, name), out = {0};
+    if (!in.p) return (void)logf_("Final boss gate: %s not in the game archive, left as it is", name);
+    dcx_read_many(game_dir, &in, &out, 1);
+    int ok = out.p && emevd_final_gate(out);
+    if (ok) {
+        buf z = dcx_write(out);
+        snprintf(path, sizeof path, "%s" SEP "work" SEP "build" SEP "event" SEP "%s", g_app, name + 7);
+        ok = z.p && write_file(path, z.p, z.n);
+        free(z.p);
+    }
+    free(in.p), free(out.p);
+    logf_(ok ? "Final boss gate: \"Open\" at once, a player left at the gate follows (m12 script written)"
+             : "Final boss gate: the m12 script looks different than expected, left as it is");
+}
 // SmallBaseMapVariationParam rows of the four: +0x08 1 -> 2 (see above). A copy, 0 if a row is not as expected.
 static buf camp_variation_rows(buf p) {
     buf c = bnd4_copy(p);
@@ -3508,12 +3666,22 @@ static int build_boss_deaths(const char *game_dir, buf bhd, const char *bdt) {
     memset(g_boss_nent, 0, sizeof g_boss_nent);
     if (found && out[0].p && strstr(names[0], "common_func")) emevd_templates(out[0]);
     for (int i = 0; i < found; i++) if (out[i].p) emevd_boss_entities(out[i], flags, have);
+    g_nbar = 0;
+    for (int i = 1; i < found; i++)
+        if (out[i].p && !night_arena_map(names[i])) emevd_boss_bars(out[i], out[0].p && strstr(names[0], "common_func") ? out[0] : (buf){0});
+    int bars = 0;
+    for (int b = 0; b < g_nbar; b++) {  // only the ones not already under a death flag
+        int listed = 0;
+        for (int i = 0; i < have && !listed; i++)
+            for (int k = 0; k < g_boss_nent[i] && !listed; k++) listed = g_boss_ent[i][k] == g_bar_ent[b];
+        if (!listed) g_bar_ent[bars++] = g_bar_ent[b];
+    }
     for (int i = 0; i < found; i++) free(in[i].p), free(out[i].p);
     int with = 0;
     for (int i = 0; i < have; i++) with += g_boss_nent[i] > 0;
     char path[1300];
     snprintf(path, sizeof path, "%s" SEP "work" SEP "native" SEP "boss-deaths.txt", g_app);
-    size_t cap = 128 + (size_t)have * 12 * (1 + BOSS_ENT_MAX), at = 0;
+    size_t cap = 128 + (size_t)have * 12 * (1 + BOSS_ENT_MAX) + (size_t)bars * 12 + 64, at = 0;
     char *text = xalloc(cap);
     at += (size_t)snprintf(text + at, cap - at, "# boss death flags: %d (each: flag, then the boss characters' entity ids)\n", have);
     for (int i = 0; i < have; i++) {
@@ -3521,10 +3689,12 @@ static int build_boss_deaths(const char *game_dir, buf bhd, const char *bdt) {
         for (int k = 0; k < g_boss_nent[i]; k++) at += (size_t)snprintf(text + at, cap - at, " %u", g_boss_ent[i][k]);
         at += (size_t)snprintf(text + at, cap - at, "\n");
     }
+    for (int b = 0; b < bars; b++)  // 20 a line (the DLL reads lines of up to 255 characters)
+        at += (size_t)snprintf(text + at, cap - at, "%s %u%s", b % 20 ? "" : "h", g_bar_ent[b], b % 20 == 19 || b == bars - 1 ? "\n" : "");
     int ok = read == found && have > 0 && write_file(path, (const u8 *)text, at);
     free(text);
-    logf_("Boss deaths for the day clock: %d flags (%d with their boss character, %d templates) from %d of %d event scripts", have, with,
-          g_ntmpl, read, found);
+    logf_("Boss deaths for the day clock: %d flags (%d with their boss character, %d templates) from %d of %d event scripts; %d more boss "
+          "characters (health bars) for the night window", have, with, g_ntmpl, read, found, bars);
     return ok ? have : -1;
 }
 
@@ -3539,7 +3709,7 @@ static int day_tile_variant(int x, int z, int pr) {  // pr: the pattern's pair, 
     if (pr < 0) return 0;
     g_pair = pr;
     const u8 *has = g_tile_file[x - 42][z - 36];
-    if (site_added_tile(x, z)) return pair_b()->kind;
+    if (two_added_tile(x, z)) return pair_b()->kind;
     return has[pair_a()->kind] ? pair_a()->kind : has[pair_b()->kind] ? pair_b()->kind : 0;
 }
 static int write_pattern_bosses(buf bases) {
@@ -3730,6 +3900,7 @@ int core_build(const char *game_dir) {
     if (ok && !build_camp_scripts(game_dir, bhd, bdt_path))
         ok = 0, logf_("The game's camp scripts look different than expected. The game may have been updated; the mod needs an update too.");
     if (ok) build_fire_ring(game_dir, bhd, bdt_path);
+    if (ok) build_final_gate(game_dir, bhd, bdt_path);
     free(bhd.p);
     if (ok && !one_region()) ok = build_pair_halves(game_dir);
     if (!ok) return 0;

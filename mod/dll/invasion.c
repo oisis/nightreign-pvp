@@ -2322,7 +2322,8 @@ static double flog_t(void) { return (GetTickCount() - g_flog_layout_tick) / 1000
 static unsigned *g_boss_death;
 static int g_boss_deaths = -1;
 #define HIDE_MAX 1024
-static unsigned g_hide_ent[HIDE_MAX];  // every listed boss's characters
+static unsigned g_hide_ent[HIDE_MAX];  // every listed boss's characters (script ids: instance 0)
+static unsigned g_hide_flag[HIDE_MAX];  // its death flag, 0 for the "h" lines' characters (no death flag of their own)
 static int g_hide_n;  // -1: no list, the fallback rule
 static void boss_deaths_load(void) {
     char path[MAX_PATH];
@@ -2331,16 +2332,19 @@ static void boss_deaths_load(void) {
     static unsigned list[4096];
     int n = 0;
     char line[256];
+    // "h e1 e2 ...": boss characters without a death flag of their own (launcher emevd_boss_bars: the targets of the
+    // boss health bars and HP bar displays, e.g. the Equilibrious Beast that invades from m45_55, 45550801)
     while (f && fgets(line, sizeof line, f))
-        if (line[0] >= '0' && line[0] <= '9' && n < 4096) {
-            char *at = line;
-            list[n++] = (unsigned)strtoul(at, &at, 10);
+        if (((line[0] >= '0' && line[0] <= '9') || line[0] == 'h') && n < 4096) {
+            char *at = line + (line[0] == 'h');
+            unsigned flag = line[0] == 'h' ? 0 : (unsigned)strtoul(at, &at, 10);
+            if (flag) list[n++] = flag;
             for (;;) {  // then the boss's characters (entity ids, launcher: the event that sets the flag on its death)
                 unsigned e = (unsigned)strtoul(at, &at, 10);
                 if (!e) break;
                 int dup = 0;
                 for (int k = 0; k < g_hide_n; k++) dup |= g_hide_ent[k] == e;
-                if (!dup && g_hide_n < HIDE_MAX) g_hide_ent[g_hide_n++] = e;
+                if (!dup && g_hide_n < HIDE_MAX) g_hide_flag[g_hide_n] = flag, g_hide_ent[g_hide_n++] = e;
             }
         }
     if (f) fclose(f);
@@ -2362,6 +2366,8 @@ static int boss_death(unsigned id) {
 }
 static void df_kill(unsigned id);
 static void df_chr_pass_hook(char *chr);
+static unsigned long long es_enable_hook(int *ent, char disable);
+static void sb_place_hook(char *ga, unsigned *key, void *a3);
 static void df_death_restart_install(void);
 static int df_extra_life(char *me, int use);
 static void summon_at_host_install(void);
@@ -2373,6 +2379,8 @@ static void flag_note(char *man, unsigned id, int on, int before) {
     // the final boss: a boss-family flag (nnn 800..899, d 0) of its small maps m16 / m18 / m19 (ev 12002001 moves the
     // players there by the targeted Nightlord)
     if (on && before == 0 && (id == 7502 || id == 7507)) logf("day flow: the night boss of day %d is beaten (flag %u)", id == 7502 ? 1 : 2, id);
+    if (on && before == 0 && (id == 7522 || id == 7523 || id == 7510))  // m12_00 12002010 / 12002001 (launcher build_final_gate)
+        logf("final gate: flag %u on (%s)", id, id == 7522 ? "\"Open\" offered" : id == 7523 ? "\"Open\" used: every player to the gate" : "day 3: warped to the arena");
     if (on && before != 1 && id >= 16000000u && id < 20000000u && id / 1000000 != 17 && id % 1000 >= 800 && id % 1000 < 900 && id / 1000 % 10 == 0)
         logf("day flow: a boss of the final boss maps is dead: boss-family flag %u (small map m%u_%02u)", id, id / 1000000, id / 10000 % 100);
     if (!setting(S_FLAG_LOG)) {
@@ -2839,8 +2847,8 @@ static void flag_log_frame(void) {  // InGame, every frame
 // The regions of the four pairs, as data (tile sets from 0x6ab3c0: 1 Mountaintop 42-43 x 38-39, 2 Crater 43-44 x 38-39,
 // 3 Rotted Woods 44-45 x 36-37, 4 every field tile, 5 Noklateo 42-43 x 36-37 and 44_37): region flag (7601..7606),
 // variant digit, tiles. Noklateo has 44_37, which the game's table gives it and whose variant-5 file it loads once 7605
-// is in the region list (its tile scripts m60_44_37_50 need that tile's own flag space; small bases there stay the base
-// region's, launcher).
+// is in the region list (its tile scripts m60_44_37_50 need that tile's own flag space; its small bases are Noklateo's,
+// launcher two_added_tile).
 typedef struct { int flag, variant, x0, x1, z0, z1, xe, ze; const char *name; } two_region;  // xe/ze: one extra tile (-1 none)
 static const two_region TWO_BASE_REGIONS[2] = {{7601, 1, 42, 43, 38, 39, -1, -1, "Mountaintop"}, {7602, 2, 43, 44, 38, 39, -1, -1, "Crater"}};
 static const two_region TWO_ADDED_PAIRS[2] = {{7603, 3, 44, 45, 36, 37, -1, -1, "Rotted Woods"},
@@ -2919,11 +2927,13 @@ static unsigned *variant_hook(unsigned *out, unsigned *id, unsigned long long mo
     unsigned m = *id, x = m >> 16 & 0xff, z = m >> 8 & 0xff, lod = m & 0xf, top = m & 0xffffff00u;
     if (m >> 24 != 60) return out;
     if (lod == 0 && two_on_tile(&TWO_ADDED, x, z)) variant_set(out, top | (unsigned)TWO_ADDED.variant << 4, "tile", x, z);
-    // The lod1 quadrant of the added region (2x2 tiles: m60_21_18 = 42-43 x 36-37, Noklateo's; m60_22_18 = 44-45 x
-    // 36-37, the Rotted Woods'; analysis 09 §15): it took the base region's variant too, so the second region's
-    // buildings were drawn only by their own near tiles (pair 3, dev.63: Noklateo's walls cut open seen from the city's
-    // edge).
-    if (lod == 1 && x == (TWO_ADDED.variant == 5 ? 21u : 22u) && z == 18) variant_set(out, top | (unsigned)TWO_ADDED.variant << 4 | 1, "quadrant (lod1)", x, z);
+    // The lod1 quadrants of the added region (2x2 tiles: m60_21_18 = 42-43 x 36-37, Noklateo's; m60_22_18 = 44-45 x
+    // 36-37, the Rotted Woods', and Noklateo's too for its tile 44_37; analysis 09 §15, §19): they took the base region's
+    // variant too, so the second region's buildings were drawn only by their own near tiles (pair 3, dev.63: Noklateo's
+    // walls cut open seen from the city's edge). m60_22_18_51 differs from _01 only on 44_37 (75 parts out, 2 in), so
+    // 44_36 / 45_36 / 45_37 keep the base content; on pair 1 the list order already gives it variant 5 (no _11 file).
+    if (lod == 1 && z == 18 && (x == 22 || (TWO_ADDED.variant == 5 && x == 21)))
+        variant_set(out, top | (unsigned)TWO_ADDED.variant << 4 | 1, "quadrant (lod1)", x, z);
     if (lod == 2 && z == 9 && (x == 10 || x == 11) && (PAIR_HALVES[g_pair] >> (x - 10) & 1))
         variant_set(out, top | (unsigned)(6 + g_pair) << 4 | 2, "composed half (lod2)", x, z);
     return out;
@@ -3387,6 +3397,8 @@ static void hook_acceptance(void) {
         rune_install();
         flask_log_install();
         hook_call(0x5186ac, 0x3c7e50, (void *)df_chr_pass_hook, "day flow: enemy tiers (correction re-apply pass)");
+        hook_call(0x5880a0, 0x5f06e0, (void *)es_enable_hook, "night boss: the scripts' enable state (2004[5])");
+        if (g_debug_log) hook_call(0x628243, 0x642220, (void *)sb_place_hook, "small-base test: placing");
         df_death_restart_install();
         summon_at_host_install();
         pkt_guard_install();
@@ -6474,27 +6486,80 @@ static int bf_flag(unsigned id) {
     return m && flag_state_in(m, id) == 1;
 }
 // Night boss active (9019 on: common 1108 holds it from 23:59:00 until 9052, ...): every other living boss is
-// disabled on this machine, as the game's own 23:00 field-boss events do (2004[5] "Change Character Enable State"
-// = 0x608c60(chr, 0): the enable bit at [chr +0x18] +10 bit 0, the mount too; HP untouched), each machine by itself
-// (9019 is driven by the clock, which every machine has). Checked every 500 ms, so a boss loaded later in the window
-// is hidden too; when 9019 goes off the ones disabled here are enabled again. A boss = a character of
-// boss-deaths.txt (entity id -> 0x5190c0, the world character manager's lookup), alive (HP +0x140 of [chr +0x1b8] > 0)
-// and enabled. Not done: the map markers (left as they are).
+// disabled on this machine, as the game's own 23:00 field-boss events do, each machine by itself (9019 is driven by the
+// clock, which every machine has). The disabled bit: [chr +0x18] +10 bit 0 (the ChrSet entry's flags), SET = disabled.
+// 0x140608c60(chr, disable) writes it (0x1403d63d0; the mount too; HP untouched). VERIFIED: 2004[5] "Change Character
+// Enable State" is case 4 of the bank-2004 handler 0x140587xxx, which calls 0x1405f06e0(&entity, arg == 0) at
+// 0x1405880a0, and 0x1405f06e0 passes that on to 0x140608c60 for each character of the entity (0x140519030); run39:
+// the camp invader 38100050 read bit 1 while its camp script still kept it off (arrival flag 0). Up to 0.3.1 the bit
+// was read the other way round, so the window skipped every boss that was up and turned on the ones the scripts kept
+// off (m45_55's 45550800 at 19:38:40).
+// Who is hidden (owner, 2026-11-23: every field boss and every boss that invades, of every small map): the characters
+// of boss-deaths.txt (death flags' bosses, and the "h" lines: boss health bar / HP bar targets without a death flag of
+// their own), a small map's at every instance this map's pattern places it (LotResultSmallBaseAndSpot of gm +0xb48 /
+// +0xb4c: +0xc map, +0x10 instance; entity n * 10^8 + id), a tile's as it is; never those of the night bosses' arenas
+// (m47, m48, m49, m52_00..39: not in the list, the launcher leaves their scripts out), and the camp invaders. Checked
+// every 500 ms, so a boss loaded or spawned later in the window is hidden too (alive: HP +0x140 of [chr +0x1b8] > 0).
+// Not done: the map markers (left as they are).
+// Day 2 (9019 off): only the characters hidden here are enabled again, and not one whose death flag (its instance's) is
+// on, that is dead, or that the game's own scripts disabled during the window (2004[5] through 0x1405880a0, hooked:
+// e.g. the Equilibrious Beast's leaving, 90035244 -> 8110).
 // Day flow (boss-flow 4): the window starts already at the day's challenge (warp, clock to 23:00), 49 s before 9019
 // (deck-run3: the field bosses stayed up in that time), and takes in the camp invaders (df_night_window,
 // df_invader_entity_at: day_flow.h); world events are not started in it (df_events_frame).
-static unsigned g_hidden[HIDE_MAX];
+#define WIN_MAX 2048
+static unsigned g_win_ent[WIN_MAX], g_win_flag[WIN_MAX];  // this window's candidates (instances resolved)
+static int g_win_n;
+static unsigned g_hidden[HIDE_MAX], g_hidden_flag[HIDE_MAX];
+static signed char g_hidden_game[HIDE_MAX];  // the game's own last 2004[5] on it in the window: -1 none, 0 enable, 1 disable
 static int g_hidden_n, g_hide_on;
 static int df_night_window(void);
 static unsigned df_invader_entity_at(int i);
 static void df_night_events_log(const char *when);
+static char *df_param(const char *type);
 static char *boss_chr(unsigned ent) {
     char *wcm = *(char **)(g_base + RVA_WORLD_CHR_MAN);
     int e = (int)ent;
     char *c = wcm ? ((char *(*)(void *, int *))(g_base + 0x5190c0))(wcm, &e) : NULL;
     return c && !IsBadReadPtr(c, 0x1c0) && *(char **)(c + 0x18) && !IsBadReadPtr(*(char **)(c + 0x18), 0x10) ? c : NULL;
 }
-static int chr_enabled(char *c) { return *(unsigned char *)(*(char **)(c + 0x18) + 10) & 1; }
+static int chr_enabled(char *c) { return !(*(unsigned char *)(*(char **)(c + 0x18) + 10) & 1); }
+static void chr_set_enabled(char *c, int on) { ((char (*)(char *, char))(g_base + 0x608c60))(c, (char)!on); }
+static unsigned long long es_enable_hook(int *ent, char disable) {
+    unsigned long long r = ((unsigned long long (*)(int *, char))(g_base + 0x5f06e0))(ent, disable);
+    if (g_hide_on && ent && !IsBadReadPtr(ent, 4)) {
+        unsigned id = (unsigned)*ent;
+        char *c = boss_chr(id);
+        for (int k = 0; k < g_hidden_n; k++)
+            if (g_hidden[k] == id || (c && boss_chr(g_hidden[k]) == c)) {
+                if (g_hidden_game[k] != disable) logf("night boss: the game's script %s %u during the window", disable ? "disabled" : "enabled", g_hidden[k]);
+                g_hidden_game[k] = disable;
+            }
+    }
+    return r;
+}
+static void win_add(unsigned e, unsigned flag) {
+    for (int k = 0; k < g_win_n; k++) if (g_win_ent[k] == e) return;
+    if (g_win_n < WIN_MAX) g_win_flag[g_win_n] = flag, g_win_ent[g_win_n++] = e;
+}
+static void win_build(void) {
+    char *lots = df_param("LOT_RESULT_SMALLBASE_AND_SPOT_ST"), *gm = *(char **)(g_base + 0x3c13258);
+    unsigned pats[2] = {gm ? *(unsigned *)(gm + 0xb48) : ~0u, gm ? *(unsigned *)(gm + 0xb4c) : ~0u};
+    int placed = 0;
+    g_win_n = 0;
+    for (int i = 0; i < g_hide_n; i++) {
+        unsigned e = g_hide_ent[i], f = g_hide_flag[i];
+        if (e >= 1000000000u || !lots) { win_add(e, f); continue; }  // a tile's (or no param: instance 0 only)
+        for (int r = 0; r < *(unsigned short *)(lots + 0xa); r++) {
+            char *row = lots + *(unsigned long long *)(lots + 0x40 + r * 0x18 + 8);
+            unsigned p = *(unsigned *)(row + 4), map = *(unsigned *)(row + 0xc), inst = *(unsigned char *)(row + 0x10);
+            if ((p != pats[0] && p != pats[1]) || map != e / 10000 || inst > 9) continue;
+            win_add(inst * 100000000u + e, f && f < 1000000000u ? inst * 100000000u + f : f), placed++;
+        }
+    }
+    logf("night boss: %d candidate boss character(s) this night (%d small-map instance ids of patterns %d / %d, from %d listed)", g_win_n, placed,
+         (int)pats[0], (int)pats[1], g_hide_n);
+}
 static void night_hide_frame(int in_world) {
     static DWORD next;
     if ((int)(GetTickCount() - next) < 0) return;
@@ -6503,20 +6568,21 @@ static void night_hide_frame(int in_world) {
     if (on) {
         int now = 0;
         char ids[160] = "";
-        if (!g_hide_on) df_night_events_log("the night boss fight starts");
-        for (int i = 0; i < g_hide_n + 16; i++) {
-            unsigned ent = i < g_hide_n ? g_hide_ent[i] : df_invader_entity_at(i - g_hide_n);
+        if (!g_hide_on) df_night_events_log("the night boss fight starts"), win_build();
+        for (int i = 0; i < g_win_n + 16; i++) {
+            unsigned ent = i < g_win_n ? g_win_ent[i] : df_invader_entity_at(i - g_win_n);
             char *c = ent ? boss_chr(ent) : NULL;
             if (!c || !chr_enabled(c)) continue;
             char **pd = *(char ***)(c + 0x1b8);
             if (!pd || IsBadReadPtr(pd, 8) || !*pd || IsBadReadPtr(*pd, 0x148) || *(int *)(*pd + 0x140) <= 0) continue;
             int known = 0;
             for (int k = 0; k < g_hidden_n; k++) known |= g_hidden[k] == ent;
-            if (!known && g_hidden_n < HIDE_MAX) g_hidden[g_hidden_n++] = ent;
-            ((char (*)(char *, char))(g_base + 0x608c60))(c, 0);
+            if (!known && g_hidden_n < HIDE_MAX)
+                g_hidden_flag[g_hidden_n] = i < g_win_n ? g_win_flag[i] : 0, g_hidden_game[g_hidden_n] = -1, g_hidden[g_hidden_n++] = ent;
+            chr_set_enabled(c, 0);
             now++;
             size_t n = strlen(ids);
-            snprintf(ids + n, sizeof ids - n, " %u%s", ent, i < g_hide_n ? "" : " (camp invader)");
+            snprintf(ids + n, sizeof ids - n, " %u%s", ent, i < g_win_n ? "" : " (camp invader)");
         }
         if (!g_hide_on || now)
             logf("night boss: %s, %d boss(es) hidden now (%d in all this night):%s", f9019 ? "9019 on" : "the day's challenge (before 9019)", now,
@@ -6524,15 +6590,71 @@ static void night_hide_frame(int in_world) {
         g_hide_on = 1;
     } else if (g_hide_on) {
         if (in_world) df_night_events_log("the night boss fight is over");
-        int back = 0;
+        int back = 0, dead = 0, game = 0;
         for (int k = 0; k < g_hidden_n; k++) {
             char *c = in_world ? boss_chr(g_hidden[k]) : NULL;
-            if (c && !chr_enabled(c)) ((char (*)(char *, char))(g_base + 0x608c60))(c, 1), back++;
+            if (!c || chr_enabled(c)) continue;
+            if (g_hidden_game[k] == 1) { game++; continue; }
+            if ((g_hidden_flag[k] && bf_flag(g_hidden_flag[k])) || chr_hp(c) == 0) { dead++; continue; }
+            chr_set_enabled(c, 1), back++;
         }
-        logf("night boss: 9019 off / day 2%s, %d of %d hidden boss(es) enabled again (the rest not loaded)", in_world ? "" : " (out of the world)", back,
-             g_hidden_n);
+        logf("night boss: 9019 off / day 2%s, %d of %d hidden boss(es) enabled again (%d left off: dead or death flag on; %d left off: "
+             "the game disabled them in the window; the rest not loaded)", in_world ? "" : " (out of the world)", back, g_hidden_n, dead, game);
         g_hide_on = 0, g_hidden_n = 0;
     }
+}
+// debug-log: the player's block on each change (analysis 09; the fort / church holes of 44_37): a field tile's
+// m60_X_Z, its loaded variant (the block id's nibble 4..7) and the position local to that block (0x140631740), a small
+// map's mAA_BB and its attach point (id: area << 24 | BB << 16 | point / 100 << 8 | point % 100).
+static void tile_log_frame(void) {
+    static DWORD next;
+    static unsigned last;
+    if (!g_debug_log || (int)(GetTickCount() - next) < 0) return;
+    next = GetTickCount() + 250;
+    float p[3];
+    unsigned block;
+    if (!player_position(p, &block) || block == last) return;
+    last = block;
+    float w[4] = {p[0], p[1], p[2], 0}, l[4] = {0};
+    unsigned b = block;
+    int ok = ((unsigned char (*)(float *, float *, unsigned *))(g_base + 0x631740))(l, w, &b);
+    if (block >> 24 == 60)
+        logf("tile test: player on m60_%02u_%02u variant %u lod %u (block %08x), local %s%.1f %.1f %.1f", block >> 16 & 0xff, block >> 8 & 0xff,
+             block >> 4 & 0xf, block & 0xf, block, ok ? "" : "(no local frame; world) ", ok ? l[0] : p[0], ok ? l[1] : p[1], ok ? l[2] : p[2]);
+    else
+        logf("tile test: player in block %08x (m%02u_%02u, attach point %u), local %s%.1f %.1f %.1f", block, block >> 24, block >> 16 & 0xff,
+             (block >> 8 & 0xff) * 100 + (block & 0xff), ok ? "" : "(no local frame; world) ", ok ? l[0] : p[0], ok ? l[1] : p[1], ok ? l[2] : p[2]);
+}
+// debug-log: the small bases a lod-2 tile places (CS::WorldBlockResBase::Update 0x140627e60, state 9: 0x140642220(grid
+// area, &its block key +0x34, ...) at 0x140628243, which takes the multimap +0xd0 entries under that key; the entries
+// are the ones sb_insert_hook files, value +0x28 -> small base, its id at [value] +8, the small map's block id).
+static void sb_place_hook(char *ga, unsigned *key, void *a3) {
+    if (ga && key && !IsBadReadPtr(ga + 0xd0, 8) && !IsBadReadPtr(key, 4)) {
+        char *head = *(char **)(ga + 0xd0), line[700];
+        int n = 0, at = 0, guard = 0;
+        line[0] = 0;
+        for (char *x = head && !IsBadReadPtr(head, 0x30) ? *(char **)head : NULL; x && x != head && guard < 1024; guard++) {  // in order
+            if (IsBadReadPtr(x, 0x30)) break;
+            if (*(unsigned *)(x + 0x20) == *key) {
+                char *v = *(char **)(x + 0x28), *o = v && !IsBadReadPtr(v, 8) ? *(char **)v : NULL;
+                unsigned id = o && !IsBadReadPtr(o + 8, 4) ? *(unsigned *)(o + 8) : 0;
+                n++;
+                if (at < (int)sizeof line - 40)
+                    at += snprintf(line + at, sizeof line - (size_t)at, " %08x (m%02u_%02u at %u)", id, id >> 24, id >> 16 & 0xff,
+                                   (id >> 8 & 0xff) * 100 + (id & 0xff));
+            }
+            if (*(char *)(*(char **)(x + 0x10) + 0x19) == 0) {
+                x = *(char **)(x + 0x10);
+                while (*(char *)(*(char **)x + 0x19) == 0) x = *(char **)x;
+            } else {
+                char *q = *(char **)(x + 8);
+                while (*(char *)(q + 0x19) == 0 && x == *(char **)(q + 0x10)) x = q, q = *(char **)(q + 8);
+                x = q;
+            }
+        }
+        logf("small-base test: block %08x places %d small base(s) filed under its key %08x:%s", *key, n, *key, n ? line : " none");
+    }
+    ((void (*)(char *, unsigned *, void *))(g_base + 0x642220))(ga, key, a3);
 }
 static void bf4_frame(int first);
 static void boss_flow_frame(int first) {
@@ -7378,13 +7500,33 @@ static int someone_to_act_in_session(char *why, size_t cap) {
     return up;
 }
 static void lone_down_frame(void) {
-    static char *ended;
-    char *me = local_player();
-    if (!me || IsBadReadPtr(me, 0x740) || me[0x710] != 1) {
-        ended = NULL;
+    static char *ended, *final_left;
+    static unsigned area;
+    static int mp_at_load;
+    char *me = local_player(), *sm = *(char **)(g_base + RVA_SESSION_MAN_PTR);
+    int others = sm ? (int)((*(char **)(sm + SM_PLAYERS_BEGIN + 8) - *(char **)(sm + SM_PLAYERS_BEGIN)) / SM_PLAYER_SIZE) - 1 : 0;
+    int ok = me && !IsBadReadPtr(me, 0x740);
+    // 6999500 (common 1101 / 1104: a solo player at the day's start) is used only by common 1181, which ends at once
+    // unless the map loaded in single player (its first line, 1003[5] state 4). It stays on when summons join later
+    // (run 39: host alone at 18:36, ally from 18:40:51; m19 loaded with the ally, the host frozen at 15 s after the ally
+    // left), so it shields the down only when the map (block area) was entered with nobody else in the session.
+    if (ok && *(unsigned *)(me + CHR_BLOCK_ID) >> 24 != area) area = *(unsigned *)(me + CHR_BLOCK_ID) >> 24, mp_at_load = others > 0;
+    if (!ok || me[0x710] != 1) {
+        ended = final_left = NULL;
         return;
     }
-    if (!g_in_exped || (g_join == 4 && !g_as_ally) || speffect_on(me, 6999500)) return;
+    if (!g_in_exped || (g_join == 4 && !g_as_ally) || (speffect_on(me, 6999500) && !mp_at_load)) return;
+    // The final boss (owner, 2026-11-23: the game's default down for host and summons alike): left to the game while
+    // anyone else is in the session. 7510 "Day 3 Started" is set only by m12_00 12002001 at the arena warp (network
+    // flag). Alone in the session the game's down never ends (102120 holds the timer; 1180 waits for members that left),
+    // so then the rule below still ends it.
+    if (bf_flag(7510) && others > 0) {
+        if (final_left != me)
+            final_left = me, logf("lone down: final boss (7510): %d other member(s) in the session: left to the game (alive flags 7005..7007 %d%d%d, "
+                                  "7010..7012 %d%d%d, 6999500 %d)", others, bf_flag(7005), bf_flag(7006), bf_flag(7007), bf_flag(7010),
+                                  bf_flag(7011), bf_flag(7012), speffect_on(me, 6999500));
+        return;
+    }
     char why[300];
     if (someone_to_act_in_session(why, sizeof why)) {
         if (ended == me) logf("lone down: a squad member up or an invader in the session again (%s): left to the game", why);
@@ -7468,6 +7610,7 @@ static void step_hook(void *ctrl, void *time, int step) {
     g_in_exped = step == QM_STEP_INGAME || g_join_in_world();
     if (!g_in_exped) g_df_inv_dead = NULL;
     night_hide_frame(g_in_exped);
+    if (g_in_exped) tile_log_frame();
     df_sb_registry_frame(g_in_exped);
     day_flow_frame(g_in_exped);
     {  // a joiner's clock as the host's (owner, 2026-11-22): the same hold at 18:00 and jump to 23:00, from the host's day

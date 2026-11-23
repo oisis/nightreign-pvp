@@ -238,14 +238,14 @@ static void df_camp_control(char *chr) {
     int arrived = base ? two_flag(base + 200, 0, 0) : -1, dead = base && k >= 0 ? two_flag(base + 202 + k, 0, 0) : -1;
     int hp = chr_hp(chr);
     if (!open && chr_enabled(chr)) {
-        ((char (*)(char *, char))(g_base + 0x608c60))(chr, 0);
+        chr_set_enabled(chr, 0);
         if (!g_df_inv[i].vetoed) logf("day flow: invader %d (entity %d): the second of camp %d, turned on before the fifth boss: off again",
                                       i + 1, g_df_inv[i].entity, camp + 1);
         g_df_inv[i].vetoed = 1;
     } else if (open && g_df_inv[i].vetoed) {
         g_df_inv[i].vetoed = 0;
         if (arrived == 1 && dead != 1 && hp != 0 && !chr_enabled(chr)) {
-            ((char (*)(char *, char))(g_base + 0x608c60))(chr, 1);
+            chr_set_enabled(chr, 1);
             logf("day flow: invader %d (entity %d): turned on again (the camp's arrival ran before the fifth boss)", i + 1, g_df_inv[i].entity);
         }
     }
@@ -412,7 +412,7 @@ static void df_bases_check(void) {
         if (*(unsigned *)(r + 4) != pat) continue;
         int ap = *(int *)(r + 8), map = *(int *)(r + 0xc);
         char *pt = df_param_row(points, ap);
-        if (!pt || map >= 4000) continue;  // the sites (forts, churches, camps, ruins; not the spots)
+        if (!pt || (map >= 4000 && map / 100 != 41)) continue;  // the sites (forts, churches m41, camps, ruins m34; not the spots)
         all++;
         if (df_point_known(*(int *)(pt + 0x14))) continue;
         missing++;
