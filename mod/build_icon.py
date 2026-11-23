@@ -1,4 +1,5 @@
-"""Target list icon for the "Invasion" entry: a group of four player outlines, blue with a red one in front.
+"""Target list icons for the "Invasion" entry (blue players, the invader in front red) and the "Play as a
+summon" entry (orange players, the summon in front blue).
 
     python3 build_icon.py <sblytbnd raw> <tpf raw> <out sblytbnd.dcx> <out tpf.dcx> [four more ...]
     python3 build_icon.py --png <out.png>          just draw the icon
@@ -25,18 +26,30 @@ from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter
 sys.path.insert(0, str(Path(__file__).parent))
 from fsformats import bnd4_read, bnd4_replace, dcx_write_deflate
 
-ICONS = {41813: 248,     # list icon: next free id after the game's 41800-41812, Nightlord icon size
-         41814: 460}     # large icon of the description panel, same size as the Nightlords' (41820...)
+# id: (side, scheme). The list icon takes the Nightlord icon size, the large one (description panel)
+# the Nightlords' large size (41820...); ids after the game's 41800-41812.
+ICONS = {41813: (248, "invasion"), 41814: (460, "invasion"),   # "Invasion"
+         41815: (248, "summon"), 41816: (460, "summon")}       # "Play as a summon"
 ATLAS = "SB_MenuIcon_DLC01_0"
 DDS_HEADER = 148         # "DDS " + header + DX10 extension
 
 
 # --- drawing -------------------------------------------------------------------------------------
 
+# Figure colours per icon: (back outline, back glow, back fill), (front outline, front glow, front fill).
+SCHEMES = {
+    # "Invasion": three blue players behind, the invader in front filled red.
+    "invasion": (((95, 155, 235), (40, 110, 255), (8, 16, 40)), ((255, 150, 140), (255, 40, 40), (170, 22, 22))),
+    # "Play as a summon": the summon in front filled blue, the host's squad behind in orange.
+    "summon": (((245, 160, 70), (255, 120, 20), (8, 16, 40)), ((150, 200, 255), (40, 110, 255), (25, 70, 175))),
+}
+
+
 @lru_cache(maxsize=None)
-def draw_master():
-    """The icon at 4x the 248-pixel design size: dark blue medallion, four figure outlines, three blue
-    and the one in front red; toned down to sit next to the game's faded Nightlord icons."""
+def draw_master(scheme="invasion"):
+    """The icon at 4x the 248-pixel design size: dark blue medallion, four figures, three behind and
+    one filled in front (colours from SCHEMES); toned down to sit next to the game's faded Nightlord icons."""
+    back, front = SCHEMES[scheme]
     k = 4
     n = 248 * k
     c = n // 2
@@ -65,12 +78,11 @@ def draw_master():
         return m
 
     # back to front: (x, y, head radius, outline colour, glow colour); the one in front is the invader
-    blue, red = (40, 110, 255), (255, 40, 40)
-    for x, y, s, colour, halo in ((124, 62, 15, (70, 120, 210), blue), (66, 88, 18, (95, 155, 235), blue),
-                                  (182, 88, 18, (95, 155, 235), blue), (124, 112, 24, (255, 120, 110), red)):
+    for x, y, s, (colour, halo, fill) in ((124, 62, 15, back), (66, 88, 18, back), (182, 88, 18, back),
+                                          (124, 112, 24, front)):
         body = figure(x, y, s)
         edge = ImageChops.subtract(body, body.filter(ImageFilter.MinFilter(4 * k + 1)))
-        img.paste(flat((8, 16, 40, 255)), mask=body)                          # hides the ones behind
+        img.paste(flat(fill + (255,)), mask=body)                             # also hides the ones behind
         glow = edge.filter(ImageFilter.GaussianBlur(3 * k)).point(lambda v: min(255, v * 2))
         img.paste(flat(halo + (255,)), mask=ImageChops.multiply(glow, body.filter(ImageFilter.MaxFilter(8 * k + 1))))
         img.paste(flat(colour + (255,)), mask=edge)
@@ -86,8 +98,8 @@ def draw_master():
     return rgb
 
 
-def draw_icon(size):
-    return draw_master().resize((size, size), Image.LANCZOS)
+def draw_icon(size, scheme="invasion"):
+    return draw_master(scheme).resize((size, size), Image.LANCZOS)
 
 
 CHALLENGE_ICON = 21990   # item icon of "Challenge the Night" (goods 1291), 160 x 160 like the game's item icons
@@ -216,11 +228,11 @@ def main(bundle_path, tpf_path, out_bundle, out_tpf):
     assert struct.unpack_from("<II", dds, 12) == (height, width) and size == DDS_HEADER + width * height
 
     placed = {}
-    for icon_id, side in ICONS.items():
+    for icon_id, (side, scheme) in ICONS.items():
         assert f"_{icon_id}." not in layout
         x, y = placed[icon_id] = free_spot(used, side, width, height)
         used.append((x, side, y, side))
-        px = draw_icon(side).load()
+        px = draw_icon(side, scheme).load()
         for by in range(side // 4):
             for bx in range(side // 4):
                 block = tuple(px[bx * 4 + i % 4, by * 4 + i // 4] for i in range(16))
@@ -233,10 +245,10 @@ def main(bundle_path, tpf_path, out_bundle, out_tpf):
     # Check: decode the patched atlas the way a GPU would and compare with what we drew.
     atlas = Image.open(io.BytesIO(bytes(tpf[off:off + size]))).convert("RGBA")
     for icon_id, (x, y) in placed.items():
-        side = ICONS[icon_id]
+        side, scheme = ICONS[icon_id]
         black = Image.new("RGBA", (side, side), (0, 0, 0, 255))   # compare as seen on a background
         diff = ImageChops.difference(Image.alpha_composite(black, atlas.crop((x, y, x + side, y + side))),
-                                     Image.alpha_composite(black, draw_icon(side)))
+                                     Image.alpha_composite(black, draw_icon(side, scheme)))
         worst = max(hi for _, hi in diff.getextrema())
         mean = sum(n * v for v, n in enumerate(diff.convert("L").histogram())) / side ** 2
         # single pixels where the red outline crosses a blue one are the weak spot of a one-line fit
@@ -250,8 +262,8 @@ def main(bundle_path, tpf_path, out_bundle, out_tpf):
 
 if __name__ == "__main__":
     if sys.argv[1] == "--blocks":
-        for icon_id, side in ICONS.items():
-            px = draw_icon(side).load()
+        for icon_id, (side, scheme) in ICONS.items():
+            px = draw_icon(side, scheme).load()
             data = b"".join(bc7_block(tuple(px[bx * 4 + i % 4, by * 4 + i // 4] for i in range(16)))
                             for by in range(side // 4) for bx in range(side // 4))
             Path(sys.argv[2]).mkdir(parents=True, exist_ok=True)
@@ -263,7 +275,8 @@ if __name__ == "__main__":
     elif sys.argv[1] == "--png-swords":
         draw_swords().save(sys.argv[2])
     elif sys.argv[1] == "--png":
-        draw_icon(int(sys.argv[3]) if len(sys.argv) > 3 else 248).save(sys.argv[2])
+        draw_icon(int(sys.argv[3]) if len(sys.argv) > 3 else 248,
+                  sys.argv[4] if len(sys.argv) > 4 else "invasion").save(sys.argv[2])
     else:
         for i in range(1, len(sys.argv), 4):   # one process for all sets: encoded blocks are cached
             main(*sys.argv[i:i + 4])

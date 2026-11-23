@@ -39,7 +39,7 @@ typedef uint64_t u64;
 typedef struct { u8 *p; size_t n; } buf;
 
 #define TEXT_TARGET_FMG "\\CL_MenuText.fmg"
-#define BUILD_FORMAT 49
+#define BUILD_FORMAT 50
 #define BOSS_DEATHS_MIN 100  // the game (1.3.3) has 158 such flags; fewer = its event scripts changed
 
 static const char *LANGS[] = {"araae", "deude", "engus", "frafr", "itait", "jpnjp", "korkr", "polpl",
@@ -875,9 +875,9 @@ static const u8 REGULATION_KEY[32] = {
 #define SUMMON_ROW 102
 #define ROW_CHANGE_COUNT 5
 static const int ROW_CHANGES[ROW_CHANGE_COUNT][2] = {{131150, 131160}, {131151, 131161}, {41812, 41813}, {300, 5}, {130, 0}};
-static const int SUMMON_ROW_CHANGES[ROW_CHANGE_COUNT][2] = {{131150, 131175}, {131151, 131176}, {41812, 41813}, {300, 6}, {130, 0}};
+static const int SUMMON_ROW_CHANGES[ROW_CHANGE_COUNT][2] = {{131150, 131175}, {131151, 131176}, {41812, 41815}, {300, 6}, {130, 0}};
 #define FIRST_LARGE_ICON 41820  // row 0's largeBossIconId, to find the field
-#define LARGE_ICON 41814
+#define LARGE_ICON 41814         // the invasion row's large icon; the summon row's is 41816
 
 // Offset of the only place where a row holds this 32-bit value (step: 1 or 4 bytes), -1 otherwise.
 static int find_value(const u8 *row, u32 size, int value, int step) {
@@ -893,7 +893,7 @@ static int find_value(const u8 *row, u32 size, int value, int step) {
 // Param layout: 0x40 header, 24-byte row descriptors (id, pad, data offset, name offset), row data,
 // strings. Returns the param with a copy of TEMPLATE_ROW appended as new_id (above every id already there) with
 // these changes, or an empty buf if it does not look as expected.
-static buf param_add_row(buf p, int new_id, const int changes[ROW_CHANGE_COUNT][2]) {
+static buf param_add_row(buf p, int new_id, const int changes[ROW_CHANGE_COUNT][2], int large_icon) {
     buf out = {0};
     if (p.n < 0x40 + 48) return out;
     u32 strings_off = rd32(p.p), count = rd16(p.p + 0x0A);
@@ -940,7 +940,7 @@ static buf param_add_row(buf p, int new_id, const int changes[ROW_CHANGE_COUNT][
     }
     int large = find_value(p.p + data_start, (u32)size, FIRST_LARGE_ICON, 4);
     if (large < 0 || (int)rd32(row + large) != -1) ok = 0;
-    else wr32(row + large, LARGE_ICON);
+    else wr32(row + large, (u32)large_icon);
     if (!ok) { free(out.p); out.p = NULL; out.n = 0; }
     return out;
 }
@@ -2208,8 +2208,8 @@ static int build_regulation(const char *game_dir) {
     u8 *team_row = NULL, *ally_row = NULL;
     if (nr_zstd_decompress(dcx + 0x4C, csize, bundle.p, (size_t)usize + (1 << 17)) != usize) {
         logf_("regulation.bin could not be unpacked");
-    } else if ((index = bnd4_find(bundle, TARGET_PARAM)) < 0 || !(param1 = param_add_row(bnd4_file(bundle, index), INVASION_ROW, ROW_CHANGES)).p ||
-               !(param = param_add_row(param1, SUMMON_ROW, SUMMON_ROW_CHANGES)).p) {
+    } else if ((index = bnd4_find(bundle, TARGET_PARAM)) < 0 || !(param1 = param_add_row(bnd4_file(bundle, index), INVASION_ROW, ROW_CHANGES, LARGE_ICON)).p ||
+               !(param = param_add_row(param1, SUMMON_ROW, SUMMON_ROW_CHANGES, 41816)).p) {
         logf_("The game's Target list looks different than expected. The game may have been updated; the mod needs an update too.");
     } else if ((sp_index = bnd4_find(bundle, SPEFFECT_PARAM)) < 0 ||
                !(speffect = param_insert_sorted(bnd4_file(bundle, sp_index), SPEFFECT_TEMPLATE, SPEFFECT_TEAM_ROW,
@@ -2285,7 +2285,7 @@ static int build_regulation(const char *game_dir) {
 // --- menu icons ------------------------------------------------------------------------------------------------
 //
 // Menu icons are sub-rectangles of big atlas textures; a ".layout" XML file per atlas names them
-// ("MENU_MenuIcon_<id>.png"). Our two icons go into an unused corner of the DLC atlas and get one
+// ("MENU_MenuIcon_<id>.png"). Our icons go into an unused corner of the DLC atlas and get one
 // layout line each, as in mod/build_icon.py, which also produces their BC7 blocks (data/icon_<id>.bc7).
 
 // Two atlases: the Target list's icons (menu icons) and our item's icon (item icons, 160 x 160 like the game's).
@@ -2293,6 +2293,8 @@ static int build_regulation(const char *game_dir) {
 static const struct { const char *atlas, *name; int id, side; } ICONS[] = {
     {"SB_MenuIcon_DLC01_0", "MENU_MenuIcon_%d", 41813, 248},
     {"SB_MenuIcon_DLC01_0", "MENU_MenuIcon_%d", 41814, 460},
+    {"SB_MenuIcon_DLC01_0", "MENU_MenuIcon_%d", 41815, 248},  // "Play as a summon"
+    {"SB_MenuIcon_DLC01_0", "MENU_MenuIcon_%d", 41816, 460},
     {"SB_ItemIcon_DLC01_0", "MENU_ItemIcon_%05d", 21990, 160},  // CHALLENGE_ICON
 };
 #define ICON_COUNT (sizeof ICONS / sizeof *ICONS)
